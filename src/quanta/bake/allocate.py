@@ -36,6 +36,8 @@ def allocate_bits(
     experts' resident bytes. Promotion stops as soon as ``target`` is met (no wasted bytes)
     or the next-best promotion won't fit.
     """
+    if not projs:  # no routed experts in this slice (e.g. L0-only bake)
+        return {}, 0.0, 0.0
     bits = {p.key: 3 for p in projs}
     total_p = sum(p.params for p in projs)
     err_num = sum(p.params * p.loss3 for p in projs)  # all-int3 weighted error numerator
