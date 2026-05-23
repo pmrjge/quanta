@@ -99,6 +99,8 @@ def activation_weighted_error(w: mx.array, x: mx.array, bits: int, group_size: i
     """
     wf = w.astype(mx.float32)
     wd = dequantize_affine(*quantize_affine(w, bits, group_size), bits, group_size).astype(mx.float32)
+    if x.shape[0] == 0:  # cold expert (no calibration rows) → raw recon; RTN will be used
+        return (mx.linalg.norm(wd - wf) / (mx.linalg.norm(wf) + 1e-12)).item()
     xt = x.astype(mx.float32).T  # [in, n]
     wx = wf @ xt
     err = (wd - wf) @ xt
