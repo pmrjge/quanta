@@ -23,7 +23,7 @@ import mlx.nn as nn
 from quanta.bake.allocate import BPP, Projection, allocate_bits
 from quanta.bake.artifact import ArtifactWriter
 from quanta.bake.calibrate import activation_weighted_error, capture_calibration, expert_rows
-from quanta.bake.gptq import gptq_quantize
+from quanta.bake.gptq import gptq_quantize_batch
 from quanta.bake.quant import pack_affine, quantize_affine
 from quanta.compressed_int4 import dequantize_packed_int4
 from quanta.config import KimiTextConfig
@@ -39,6 +39,7 @@ NORM_SUFFIXES = frozenset({
     "self_attn.q_a_layernorm.weight", "self_attn.kv_a_layernorm.weight",
 })
 _EXPERT_PROJS = ("gate_proj", "up_proj", "down_proj")
+EXPERT_CHUNK = 16  # experts batched per GPTQ call (bounds R [chunk,in,in] memory)
 
 
 def _dequant_expert(ck: SourceCheckpoint, cfg: KimiTextConfig, layer: int, e: int, proj: str) -> mx.array:
@@ -124,22 +125,36 @@ def bake(
             else:
                 _write_int8(writer, pre + suf[: -len(".weight")], arr, group_size)  # attention int8
         ln2, idx = cap_of[i]
+        ex_w: dict[int, dict[str, mx.array]] = {}  # dequantized expert weights (one layer resident)
+        ex_x: dict[int, dict[str, mx.array]] = {}  # per-expert calibration input per projection
         for e in experts:
             xe = expert_rows(ln2, idx, e)
             g, u, d = (_dequant_expert(ck, cfg, i, e, p) for p in _EXPERT_PROJS)
-            n_e = xe.shape[0]
-            xd = _down_input(g, u, xe) if n_e > 0 else xe
-            inputs = {"gate_proj": xe, "up_proj": xe, "down_proj": xd}
-            for proj, w in (("gate_proj", g), ("up_proj", u), ("down_proj", d)):
-                key = f"{pre}mlp.experts.{e}.{proj}"
-                bits = bits_map[key]
-                if n_e == 0:  # cold expert: GPTQ needs calibration rows → RTN fallback
-                    packed, scales, biases = quantize_affine(w, bits, group_size)
-                else:
-                    _, codes, scales, biases = gptq_quantize(w, inputs[proj], bits, group_size=group_size)
-                    packed = pack_affine(codes.astype(mx.uint32), bits)
-                writer.add_quantized(key, packed, scales, biases, bits, group_size)
+            mx.eval(g, u, d, xe)  # materialize before releasing shard handles
+            ex_w[e] = {"gate_proj": g, "up_proj": u, "down_proj": d}
+            xd = _down_input(g, u, xe) if xe.shape[0] > 0 else xe
+            ex_x[e] = {"gate_proj": xe, "up_proj": xe, "down_proj": xd}
             ck.release()
+
+        for proj in _EXPERT_PROJS:
+            for e in experts:  # cold experts (no rows): RTN fallback
+                if ex_x[e][proj].shape[0] == 0:
+                    key = f"{pre}mlp.experts.{e}.{proj}"
+                    writer.add_quantized(key, *quantize_affine(ex_w[e][proj], bits_map[key], group_size),
+                                         bits_map[key], group_size)
+            for bits in (3, 4):  # GPTQ experts grouped by width, batched in chunks
+                grp = [e for e in experts if ex_x[e][proj].shape[0] > 0
+                       and bits_map[f"{pre}mlp.experts.{e}.{proj}"] == bits]
+                for c0 in range(0, len(grp), EXPERT_CHUNK):
+                    chunk = grp[c0:c0 + EXPERT_CHUNK]
+                    ws = mx.stack([ex_w[e][proj] for e in chunk])
+                    codes, scales, biases = gptq_quantize_batch(
+                        ws, [ex_x[e][proj] for e in chunk], bits, group_size=group_size)
+                    for ci, e in enumerate(chunk):
+                        key = f"{pre}mlp.experts.{e}.{proj}"
+                        writer.add_quantized(key, pack_affine(codes[ci].astype(mx.uint32), bits),
+                                             scales[ci], biases[ci], bits, group_size)
+        del ex_w, ex_x
 
     policy = {"experts": "int3/int4 gptq g128", "non_experts": "int8 g128",
               "shared": "bf16", "norms": "bf16", "target_error": target}
