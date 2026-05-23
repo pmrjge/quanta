@@ -24,6 +24,11 @@ from quanta.config import KimiTextConfig
 from quanta.loader import TEXT_PREFIX
 from quanta.modeling.decoder import DenseDecoderLayer, MoEDecoderLayer
 from quanta.modeling.quantized import QuantizedSparseMoE
+from quanta.modeling.xattention import DEFAULT_SPARSE, XAttnConfig
+
+LM_HEAD_KEY = "language_model.lm_head"
+EMBED_KEY = f"{TEXT_PREFIX}embed_tokens"
+FINAL_NORM_KEY = f"{TEXT_PREFIX}norm.weight"
 
 
 class ResidentArtifact:
@@ -117,3 +122,55 @@ def _load_expert_stacks(art: ResidentArtifact, cfg: KimiTextConfig, pre: str):
             d[f"{p}_bias"].append(art.get(f"{k}.weight_bias"))
     stacks = {bits: {k: mx.stack(v) for k, v in d.items()} for bits, d in per_width.items()}
     return stacks, mx.array(expert_bits), mx.array(slots)
+
+
+def _quant_embedding(art: ResidentArtifact, key: str) -> nn.QuantizedEmbedding:
+    m = art.manifest[key]
+    packed = art.get(f"{key}.weight_packed")
+    num, in_packed = packed.shape
+    dims = in_packed * 32 // m["bits"]
+    emb = nn.QuantizedEmbedding(num, dims, group_size=m["group_size"], bits=m["bits"])
+    emb.weight = packed
+    emb.scales = art.get(f"{key}.weight_scale")
+    emb.biases = art.get(f"{key}.weight_bias")
+    return emb
+
+
+class ResidentModel:
+    """RAM-resident quantized Kimi-K2.6 — same call signature as :class:`KimiModel`.
+
+    Builds all decoder layers once from the artifact (held resident; the deployment target is
+    the full ~427 GB pinned with ``mx.set_wired_limit``). ``generate`` / the ppl harness run on
+    it directly. ``n_layers`` builds a prefix for bounded validation.
+    """
+
+    def __init__(self, art_dir: str | Path, *, n_layers: int | None = None) -> None:
+        self.art = ResidentArtifact(art_dir)
+        self.cfg = self.art.cfg
+        n = self.cfg.num_hidden_layers if n_layers is None else n_layers
+        self.layers = [build_resident_layer(self.art, i) for i in range(n)]
+        self.embed = _quant_embedding(self.art, EMBED_KEY)
+        self.norm_w = self.art.get(FINAL_NORM_KEY)
+        self.lm_head = _quant_linear(self.art, LM_HEAD_KEY)
+
+    def __call__(
+        self, token_ids: mx.array, *, n_layers: int | None = None, use_fast: bool = True,
+        caches: list | None = None, offset: int = 0,
+        sparse: XAttnConfig | None = DEFAULT_SPARSE, absorbed: bool = False,
+    ) -> mx.array:
+        n = len(self.layers) if n_layers is None else n_layers
+        h = self.embed(token_ids)[None].astype(mx.bfloat16)
+        pos = mx.arange(offset, offset + h.shape[1])
+        for i in range(n):
+            layer = self.layers[i]
+            if sparse is not None and isinstance(layer.mlp, QuantizedSparseMoE):
+                layer.self_attn.sparse = sparse
+            layer.self_attn.absorbed = absorbed
+            cache = caches[i] if caches is not None else None
+            h = layer(h, pos, use_fast=use_fast, cache=cache)
+            if cache is not None:
+                mx.eval(h, cache.c_kv, cache.k_pe)
+            else:
+                mx.eval(h)
+        h = mx.fast.rms_norm(h, self.norm_w, self.cfg.rms_norm_eps)
+        return self.lm_head(h)
