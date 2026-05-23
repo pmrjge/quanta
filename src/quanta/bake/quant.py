@@ -36,3 +36,31 @@ def recon_error(w: mx.array, bits: int, group_size: int = GROUP_SIZE) -> float:
     num = mx.linalg.norm((w - wd).astype(mx.float32)).item()
     den = mx.linalg.norm(w.astype(mx.float32)).item() + 1e-12
     return num / den
+
+
+def pack_affine(codes: mx.array, bits: int) -> mx.array:
+    """Pack integer codes ``[out, in]`` (0..2^bits−1) into MLX's uint32 layout for GPTQ output.
+
+    LSB-first contiguous bitstream — code ``i`` occupies bit positions ``[i·bits, i·bits+bits)``
+    — matching ``mx.quantize`` so the result feeds ``mx.dequantize`` / ``gather_qmm`` directly.
+    Needed because GPTQ rounds with error feedback (not RTN), so its codes can't come from
+    ``mx.quantize``; we pack them ourselves. Requires ``in·bits`` divisible by 32 (holds for
+    group-128 weights). Vectorized — no per-code loop.
+    """
+    out, in_ = codes.shape
+    c = codes.astype(mx.uint32)
+    bit_pos = mx.arange(bits, dtype=mx.uint32)
+    expanded = (c[..., None] >> bit_pos) & 1  # [out, in, bits], LSB-first per code
+    stream = expanded.reshape(out, (in_ * bits) // 32, 32)  # 32-bit words
+    word_pos = mx.arange(32, dtype=mx.uint32)
+    return mx.sum((stream.astype(mx.uint32) << word_pos), axis=-1).astype(mx.uint32)
+
+
+def unpack_affine(words: mx.array, in_features: int, bits: int) -> mx.array:
+    """Inverse of :func:`pack_affine`: uint32 words ``[out, n_words]`` → codes ``[out, in]``."""
+    out = words.shape[0]
+    word_pos = mx.arange(32, dtype=mx.uint32)
+    stream = (words[..., None] >> word_pos) & 1  # [out, n_words, 32]
+    grouped = stream.reshape(out, in_features, bits)  # [out, in, bits]
+    bit_pos = mx.arange(bits, dtype=mx.uint32)
+    return mx.sum((grouped.astype(mx.uint32) << bit_pos), axis=-1).astype(mx.uint32)
