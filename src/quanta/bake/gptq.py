@@ -93,3 +93,56 @@ def gptq_quantize(
             work[:, i1:] = work[:, i1:] - err @ r[i0:i1, i1:]
         mx.eval(work, codes, scales, biases, w_hat)  # bound graph growth per block
     return w_hat, codes, scales, biases
+
+
+def gptq_quantize_batch(
+    ws: mx.array, xs: list[mx.array], bits: int, *, group_size: int = 128, damp: float = 0.01
+) -> tuple[mx.array, mx.array, mx.array]:
+    """Batched GPTQ over a chunk of ``E`` experts (same ``bits``) → ``(codes, scales, biases)``.
+
+    Same algorithm as :func:`gptq_quantize`, but the expensive ordered column loop runs **once**
+    for all ``E`` experts with batched ``[E,…]`` ops (and one batched trailing GEMM per block),
+    so the Python/launch overhead is shared — the cross-expert speedup that makes the full bake
+    feasible. ``ws`` is ``[E, out, in]``; ``xs`` is a per-expert list of ``[n_e, in]`` (the
+    Hessian inverse is still per-expert, but ``E`` is small and the column loop is the cost).
+    """
+    e, out, in_ = ws.shape
+    maxq = (1 << bits) - 1
+    rs = []
+    for i in range(e):  # per-expert inverse (small E); the column loop below is the shared cost
+        xf = xs[i].astype(mx.float32)
+        delta = max(damp * (mx.sum(xf * xf) / in_).item(), 1e-8)
+        with mx.stream(mx.cpu):
+            rs.append(mx.linalg.cholesky(woodbury_inverse(xf, delta)).T)
+    r = mx.stack(rs)  # [E, in, in], upper RᵀR = H⁻¹ per expert
+    mx.eval(r)
+
+    work = ws.astype(mx.float32)
+    n_groups = (in_ + group_size - 1) // group_size
+    scales = mx.zeros((e, out, n_groups))
+    biases = mx.zeros((e, out, n_groups))
+    codes = mx.zeros((e, out, in_), dtype=mx.int32)
+
+    for i0 in range(0, in_, group_size):
+        i1 = min(i0 + group_size, in_)
+        g = i0 // group_size
+        lo = mx.min(work[:, :, i0:i1], axis=2)
+        hi = mx.max(work[:, :, i0:i1], axis=2)
+        sc = mx.where(hi - lo <= 0, mx.array(1.0), (hi - lo) / maxq)  # [E,out]
+        scales[:, :, g] = sc
+        biases[:, :, g] = lo
+        err = mx.zeros((e, out, i1 - i0))
+        for j in range(i1 - i0):  # bounded shared column loop (batched across E)
+            col = i0 + j
+            wc = work[:, :, col]
+            q = mx.clip(mx.round((wc - lo) / sc), 0, maxq)
+            wq = q * sc + lo
+            de = (wc - wq) / r[:, col, col][:, None]  # [E,out]
+            if col + 1 < i1:
+                work[:, :, col + 1 : i1] = work[:, :, col + 1 : i1] - de[:, :, None] * r[:, col, col + 1 : i1][:, None, :]
+            err[:, :, j] = de
+            codes[:, :, col] = q.astype(mx.int32)
+        if i1 < in_:
+            work[:, :, i1:] = work[:, :, i1:] - err @ r[:, i0:i1, i1:]  # [E,out,blk]@[E,blk,rest]
+        mx.eval(work, codes, scales, biases)
+    return codes, scales, biases
