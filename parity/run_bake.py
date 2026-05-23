@@ -27,18 +27,20 @@ EXPERT_BUDGET = 470e9  # ~490 GiB ceiling minus int8 non-experts + bf16 shared
 CALIB_TOKENS = 8192
 
 
+def _agentic_corpus(tok: KimiTokenizer) -> mx.array:
+    """Agentic-domain calibration: the project's code + instruction docs — representative of an
+    agentic loop (reading/writing code, following instructions) — to a full 8192 tokens."""
+    files = (sorted(REPO.glob("src/quanta/**/*.py")) + sorted(REPO.glob("parity/*.py"))
+             + [REPO / "INITIAL_PROMPT.md", REPO / "CLAUDE.md"])
+    text = "\n\n".join(p.read_text() for p in files if p.exists())
+    return mx.array(tok.encode(text, add_bos=True)[:CALIB_TOKENS])
+
+
 def run() -> None:
     cfg = KimiTextConfig.from_pretrained(MODEL)
     tok = KimiTokenizer(MODEL, bos_id=cfg.bos_token_id)
-    from parity.ppl_long import LONG_TEXT  # science prose; domain-matched to the ppl eval
-
-    parts = [LONG_TEXT]
-    for f in ("INITIAL_PROMPT.md", "CLAUDE.md"):
-        p = REPO / f
-        if p.exists():
-            parts.append(p.read_text())
-    ids = mx.array(tok.encode("\n\n".join(parts), add_bos=True)[:CALIB_TOKENS])
-    print(f"calibration tokens: {ids.shape[0]}", flush=True)
+    ids = _agentic_corpus(tok)
+    print(f"calibration tokens: {ids.shape[0]} (agentic: code + docs)", flush=True)
 
     t0 = time.perf_counter()
     stats = bake(MODEL, OUT, ids, include_head=True, expert_byte_budget=EXPERT_BUDGET, target=0.08)
