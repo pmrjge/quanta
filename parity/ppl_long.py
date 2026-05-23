@@ -112,6 +112,8 @@ def run(n_layers: int | None = None, max_tokens: int = 1024) -> None:
         variants.append((f"xattn t={t}", XAttnConfig(block=128, stride=16, threshold=t, min_seq=0)))
     # gather (speed-path) variant: must match its mask-path twin (xattn t=0.9) in ppl
     variants.append(("xattn 0.9 gather", XAttnConfig(block=128, stride=16, threshold=0.9, min_seq=0, gather=True)))
+    # chunked gather (tiny max_alloc_gb forces many small chunks): must match the unchunked gather
+    variants.append(("xattn 0.9 gа/chunk", XAttnConfig(block=128, stride=16, threshold=0.9, min_seq=0, gather=True, max_alloc_gb=0.1)))
 
     h0 = ck.embed_tokens(arr)[None].astype(mx.bfloat16)
     hs = [h0 for _ in variants]  # diverge after layer 0

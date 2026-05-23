@@ -86,12 +86,17 @@ def block_scores(q: mx.array, k: mx.array, scale: float, block: int, stride: int
     return (qf @ mx.swapaxes(kf, -1, -2)) * (scale / (block * stride))  # [B,H,Tq,Tk]
 
 
-def select_blocks(scores: mx.array, threshold: float) -> mx.array:
-    """Nucleus block selection → bool keep-mask ``[B,H,Tq,Tk]`` (causal; diag+sink forced)."""
+def select_blocks(scores: mx.array, threshold: float, q_offset: int = 0) -> mx.array:
+    """Nucleus block selection → bool keep-mask ``[B,H,Tq,Tk]`` (causal; diag+sink forced).
+
+    ``q_offset`` is the global block index of the first query row — used when scoring a
+    chunk of query blocks against all keys, so causality and the forced diagonal use the
+    query's *global* position. ``q_offset=0`` is the whole-sequence case.
+    """
     tq, tk = scores.shape[-2], scores.shape[-1]
-    i = mx.arange(tq)[:, None]
+    i = mx.arange(q_offset, q_offset + tq)[:, None]
     j = mx.arange(tk)[None, :]
-    causal = j <= i  # block-level causality
+    causal = j <= i  # block-level causality (global query index)
 
     masked = mx.where(causal, scores, NEG_INF)
     probs = mx.softmax(masked.astype(mx.float32), axis=-1)
@@ -144,30 +149,33 @@ def sparse_prefill_mask(
     return additive_mask(keep, t, s, cfg.block, q.dtype)
 
 
-def _guard_alloc(bsz: int, h: int, nb: int, blk: int, max_k: int, t: int, max_gb: float) -> None:
-    """Refuse (loudly) to build a block mask larger than ``max_gb`` — never OOM the host."""
-    # peak ≈ [bsz,h,nb,blk,max_k*blk]: bool `allowed` (1B) + bf16 mask (2B) ≈ 3 bytes/elem
-    gb = bsz * h * nb * blk * (max_k * blk) * 3 / 1e9
-    if gb > max_gb:
+def _chunk_blocks(bsz: int, h: int, blk: int, d: int, vd: int, cap: int, max_gb: float) -> int:
+    """Largest #query-blocks whose per-chunk peak (mask + gathered K/V) fits in ``max_gb``.
+
+    Conservative (1.5×): if even a single query block can't fit, raise — fail loud, no OOM.
+    """
+    per_block = 1.5 * bsz * h * cap * blk * (blk * 3 + d * 2 + vd * 2)  # mask + k_sel + v_sel bytes
+    if per_block > max_gb * 1e9:
         raise MemoryError(
-            f"gather_sparse_attention block mask ~= {gb:.1f} GB "
-            f"(T={t}, heads={h}, max_kept={max_k} blocks x {blk}) exceeds max_alloc_gb={max_gb}. "
-            f"Set XAttnConfig.budget to cap kept blocks, shorten the context, or add chunked "
-            f"execution. Refusing to allocate."
+            f"one query block needs ~{per_block / 1e9:.1f} GB (heads={h}, max_kept={cap} x {blk}) "
+            f"> max_alloc_gb={max_gb}. Lower XAttnConfig.budget. Refusing to allocate."
         )
+    return max(1, int(max_gb * 1e9 // per_block))
 
 
 def gather_sparse_attention(
     q: mx.array, k: mx.array, v: mx.array, scale: float, cfg: XAttnConfig
 ) -> mx.array:
-    """Block-gathered sparse prefill attention → ``[B,H,T,Vd]`` (the speed path).
+    """Block-gathered sparse prefill attention → ``[B,H,T,Vd]`` (the long-context speed path).
 
-    Same nucleus selection as the mask path, but instead of masking a full ``[T,S]``
-    matrix it gathers each query block's selected K/V blocks and attends only over
-    those — O(T·max_kept·block) FLOPs/memory. Output-equivalent to ``sparse_prefill_mask``
-    + dense SDPA (the dropped blocks contribute zero either way). All variable-count
-    bookkeeping is padded to a per-call ``max_kept`` so shapes stay regular (no
-    per-block Python loop); padded slots are masked out, preserving equivalence.
+    For each query block, gather only its selected K/V blocks and attend over those —
+    O(T·max_kept·block), not O(T²). Output-equivalent to ``sparse_prefill_mask`` + dense
+    SDPA (dropped blocks contribute zero either way). Query blocks are processed in chunks
+    sized to fit ``cfg.max_alloc_gb``, and **each chunk is materialized + evaluated on its
+    own**, so peak memory is one chunk — never the whole O(T²) mask. The selection is also
+    chunked (each chunk scores only its query blocks against keys up to its causal horizon),
+    so nothing global is O((T/blk)²) either. The chunk loop is the sanctioned coarse,
+    bounded chunked-prefill loop — not a per-token/per-block hot loop.
     """
     bsz, h, t, d = q.shape
     vd = v.shape[-1]
@@ -176,48 +184,54 @@ def gather_sparse_attention(
     tp = qp.shape[2]
     nb = tp // blk  # number of blocks (query == key, prefill)
 
-    scores = block_scores(qp, kp, scale, blk, cfg.stride)  # [B,H,nb,nb]
-    keep = select_blocks(scores, cfg.threshold)
-    counts = mx.sum(keep.astype(mx.int32), axis=-1)  # [B,H,nb]
-    cap = nb if cfg.budget is None else min(cfg.budget, nb)
-    max_k = min(int(mx.max(counts).item()), cap)
-    _guard_alloc(bsz, h, nb, blk, max_k, t, cfg.max_alloc_gb)  # fail loud before allocating
-    capped = mx.minimum(counts, max_k)  # [B,H,nb] real kept per query after the cap
-
-    # order kept blocks by score so a budget cap drops the lowest-score kept; force diag+sink first
-    jj = mx.arange(nb)
-    forced = (jj[None, :] == jj[:, None]) | (jj[None, :] == 0)  # [nb,nb]
-    inf = mx.array(float("inf"))
-    ord_score = mx.where(forced, inf, mx.where(keep, scores, -inf))  # [B,H,nb,nb]
-    idx = mx.argsort(-ord_score, axis=-1)[..., :max_k].astype(mx.int32)  # [B,H,nb,max_k]
-    valid = mx.arange(max_k)[None, None, None, :] < capped[..., None]  # [B,H,nb,max_k]
-
     kb = kp.reshape(bsz, h, nb, blk, d)
     vb = vp.reshape(bsz, h, nb, blk, vd)
+    cap = nb if cfg.budget is None else min(cfg.budget, nb)
+    cb = _chunk_blocks(bsz, h, blk, d, vd, cap, cfg.max_alloc_gb)  # query blocks per chunk
+    inf = mx.array(float("inf"))
 
-    def _gather(xb: mx.array, feat: int) -> mx.array:
-        gi = mx.broadcast_to(idx.reshape(bsz, h, nb * max_k)[..., None, None],
-                             (bsz, h, nb * max_k, blk, feat))
-        g = mx.take_along_axis(xb, gi, axis=2)  # [B,H,nb*max_k,blk,feat]
-        return g.reshape(bsz, h, nb, max_k * blk, feat)
+    outs: list[mx.array] = []
+    for c0 in range(0, nb, cb):
+        c1 = min(c0 + cb, nb)  # query blocks [c0,c1); causal horizon = key blocks [0,c1)
+        m = c1 - c0
+        q_chunk = qp[:, :, c0 * blk : c1 * blk, :]  # [B,H,m*blk,d]
 
-    k_sel = _gather(kb, d)
-    v_sel = _gather(vb, vd)
-    q_blk = qp.reshape(bsz, h, nb, blk, d)
+        scores = block_scores(q_chunk, kp[:, :, : c1 * blk, :], scale, blk, cfg.stride)  # [B,H,m,c1]
+        keep = select_blocks(scores, cfg.threshold, q_offset=c0)  # [B,H,m,c1]
+        counts = mx.sum(keep.astype(mx.int32), axis=-1)  # [B,H,m]
+        max_k = min(int(mx.max(counts).item()), cap)
+        capped = mx.minimum(counts, max_k)  # [B,H,m]
 
-    kc = mx.arange(blk)
-    abs_k = (idx[..., None] * blk + kc[None, None, None, None, :]).reshape(bsz, h, nb, max_k * blk)
-    valid_k = mx.broadcast_to(valid[..., None], (bsz, h, nb, max_k, blk)).reshape(bsz, h, nb, max_k * blk)
-    abs_q = mx.arange(nb)[:, None] * blk + mx.arange(blk)[None, :]  # [nb,blk]
-    allowed = valid_k[:, :, :, None, :] & (abs_k[:, :, :, None, :] <= abs_q[None, None, :, :, None])
-    mask = mx.where(allowed, mx.array(0.0, q.dtype), mx.array(NEG_INF, q.dtype))  # [B,H,nb,blk,max_k*blk]
+        ig = mx.arange(c0, c1)[:, None]
+        jg = mx.arange(c1)[None, :]
+        forced = (jg == ig) | (jg == 0)  # [m,c1] diagonal (global) + sink
+        ord_score = mx.where(forced, inf, mx.where(keep, scores, -inf))
+        idx = mx.argsort(-ord_score, axis=-1)[..., :max_k].astype(mx.int32)  # [B,H,m,max_k]
+        valid = mx.arange(max_k)[None, None, None, :] < capped[..., None]  # [B,H,m,max_k]
 
-    b2 = bsz * h * nb
-    out = mx.fast.scaled_dot_product_attention(
-        q_blk.reshape(b2, 1, blk, d),
-        k_sel.reshape(b2, 1, max_k * blk, d),
-        v_sel.reshape(b2, 1, max_k * blk, vd),
-        scale=scale,
-        mask=mask.reshape(b2, 1, blk, max_k * blk),
-    )
+        # gather selected blocks from the first c1 key/value blocks
+        gi = mx.broadcast_to(idx.reshape(bsz, h, m * max_k)[..., None, None], (bsz, h, m * max_k, blk, d))
+        k_sel = mx.take_along_axis(kb[:, :, :c1], gi, axis=2).reshape(bsz, h, m, max_k * blk, d)
+        gi_v = mx.broadcast_to(idx.reshape(bsz, h, m * max_k)[..., None, None], (bsz, h, m * max_k, blk, vd))
+        v_sel = mx.take_along_axis(vb[:, :, :c1], gi_v, axis=2).reshape(bsz, h, m, max_k * blk, vd)
+
+        kc = mx.arange(blk)
+        abs_k = (idx[..., None] * blk + kc[None, None, None, None, :]).reshape(bsz, h, m, max_k * blk)
+        valid_k = mx.broadcast_to(valid[..., None], (bsz, h, m, max_k, blk)).reshape(bsz, h, m, max_k * blk)
+        abs_q = mx.arange(c0, c1)[:, None] * blk + mx.arange(blk)[None, :]  # [m,blk] global positions
+        allowed = valid_k[:, :, :, None, :] & (abs_k[:, :, :, None, :] <= abs_q[None, None, :, :, None])
+        mask = mx.where(allowed, mx.array(0.0, q.dtype), mx.array(NEG_INF, q.dtype))
+
+        b2 = bsz * h * m
+        out_c = mx.fast.scaled_dot_product_attention(
+            q_chunk.reshape(b2, 1, blk, d),
+            k_sel.reshape(b2, 1, max_k * blk, d),
+            v_sel.reshape(b2, 1, max_k * blk, vd),
+            scale=scale,
+            mask=mask.reshape(b2, 1, blk, max_k * blk),
+        ).reshape(bsz, h, m, blk, vd)
+        mx.eval(out_c)  # materialize + free this chunk's mask / gathered K/V before the next
+        outs.append(out_c)
+
+    out = outs[0] if len(outs) == 1 else mx.concatenate(outs, axis=2)  # [B,H,nb,blk,vd]
     return out.reshape(bsz, h, tp, vd)[:, :, :t, :]

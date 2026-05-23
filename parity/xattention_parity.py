@@ -76,6 +76,11 @@ def run() -> None:
     g_budget = gather_sparse_attention(q, k, v, SCALE, XAttnConfig(threshold=1.0, gather=True, budget=2))
     budget_ok = g_budget.shape == (BSZ, H, T, VHD)
 
+    # chunked execution (tiny max_alloc_gb → many 1-block chunks) must match single-chunk
+    g_single = gather_sparse_attention(q, k, v, SCALE, XAttnConfig(threshold=0.8, gather=True))
+    g_chunked = gather_sparse_attention(q, k, v, SCALE, XAttnConfig(threshold=0.8, gather=True, max_alloc_gb=0.004))
+    chunk_vs_single = mx.max(mx.abs(g_single - g_chunked)).item()
+
     print("\n=== XAttention sanity ===")
     print(f"keep-all vs dense    : max_abs {max_abs:.3e}   (expect ~0)")
     print(f"future keys allowed  : {future_allowed}        (expect 0)")
@@ -85,6 +90,7 @@ def run() -> None:
     print(f"gather vs mask (0.5) : max_abs {g_vs_mask:.3e}   (expect ~0, same selection)")
     print(f"alloc guard fires    : {guard_fires}   (expect True — fails loud, no OOM)")
     print(f"budget=2 cap runs    : {budget_ok}   (bounded; shape {tuple(g_budget.shape)})")
+    print(f"chunked vs 1-chunk   : max_abs {chunk_vs_single:.3e}   (expect ~0, chunking exact)")
 
 
 if __name__ == "__main__":
