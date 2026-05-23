@@ -149,6 +149,7 @@ class ResidentModel:
         self.cfg = self.art.cfg
         n = self.cfg.num_hidden_layers if n_layers is None else n_layers
         self.layers = [build_resident_layer(self.art, i) for i in range(n)]
+        self.num_layers = n  # for KV-cache sizing by the omlx engine / generate
         self.embed = _quant_embedding(self.art, EMBED_KEY)
         self.norm_w = self.art.get(FINAL_NORM_KEY)
         self.lm_head = _quant_linear(self.art, LM_HEAD_KEY)

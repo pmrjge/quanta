@@ -26,6 +26,11 @@ omlx = [
     "omlx[grammar] @ git+https://github.com/jundot/omlx.git",
 ]
 
+# Console script: arms the oMLX autopatch (registers the quanta engine + routes quanta
+# artifacts to it), then hands off to oMLX's CLI. Run `quanta-omlx serve ...` in place of omlx.
+[project.scripts]
+quanta-omlx = "quanta.omlx_patch:main"
+
 [build-system]
 requires = ["uv_build>=0.11.13,<0.12.0"]
 build-backend = "uv_build"
