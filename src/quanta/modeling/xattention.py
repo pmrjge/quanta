@@ -33,20 +33,25 @@ NEG_INF = float("-inf")
 class XAttnConfig:
     """Block-sparse prefill config. ``threshold`` is the nucleus mass to retain.
 
-    ``gather`` selects the execution path (both output-equivalent given the same
-    selection): False builds an additive ``[B,H,T,S]`` mask and runs full SDPA —
-    correct but O(T²) (quality-measurement / parity path); True gathers only the
-    selected K/V blocks per query block and attends over those — O(T·max_kept·block)
-    in FLOPs and memory, the path that actually makes long-context prefill cheaper.
+    Defaults are the **runtime** config: the bounded block-gather path with a kept-block
+    budget. ``gather`` selects the execution path (both output-equivalent given the same
+    selection): True (default) gathers only the selected K/V blocks per query block and
+    attends over those — O(T·max_kept·block), chunked to fit ``max_alloc_gb``, the path
+    that makes long-context prefill cheap and can't OOM; False builds an additive
+    ``[B,H,T,S]`` mask and runs full SDPA — correct but O(T²), only for the
+    quality-measurement / parity path at moderate context.
     """
 
     block: int = 128
     stride: int = 16
     threshold: float = 0.9
     min_seq: int = 256  # below this, prefill runs dense (sparsity not worth it)
-    gather: bool = False
-    budget: int | None = None  # hard cap on kept blocks/query (None = nucleus, data-bounded)
-    max_alloc_gb: float = 8.0  # gather refuses to allocate a bigger block mask (fail loud, no OOM)
+    gather: bool = True
+    # cap on kept blocks/query → at most budget*block keys attended; bounds long-context
+    # gather memory and only binds beyond ~budget*block tokens (so it never touches the
+    # moderate-context quality results). 64 → ≤8192 keys/query. None = uncapped nucleus.
+    budget: int | None = 64
+    max_alloc_gb: float = 8.0  # chunks sized to fit this; gather fails loud rather than exceed it
 
     def __post_init__(self) -> None:
         if self.block % self.stride != 0:

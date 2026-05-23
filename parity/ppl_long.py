@@ -108,8 +108,8 @@ def run(n_layers: int | None = None, max_tokens: int = 1024) -> None:
     pos = mx.arange(0, arr.shape[0])
 
     variants: list[tuple[str, XAttnConfig | None]] = [("dense", None)]
-    for t in THRESHOLDS:
-        variants.append((f"xattn t={t}", XAttnConfig(block=128, stride=16, threshold=t, min_seq=0)))
+    for t in THRESHOLDS:  # mask path (gather=False) for the dense-vs-mask quality comparison
+        variants.append((f"xattn t={t}", XAttnConfig(block=128, stride=16, threshold=t, min_seq=0, gather=False)))
     # gather (speed-path) variant: must match its mask-path twin (xattn t=0.9) in ppl
     variants.append(("xattn 0.9 gather", XAttnConfig(block=128, stride=16, threshold=0.9, min_seq=0, gather=True)))
     # chunked gather (tiny max_alloc_gb forces many small chunks): must match the unchunked gather

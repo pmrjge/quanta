@@ -51,7 +51,7 @@ def run() -> None:
     # future-leak check: wherever a future key (b>a) is allowed (mask > -inf) → fail
     future_allowed = mx.sum((m_full > NEG_INF) & (b > a)[None, None]).item()
 
-    cfg_sp = XAttnConfig(block=128, stride=16, threshold=0.5)
+    cfg_sp = XAttnConfig(block=128, stride=16, threshold=0.5, budget=None)  # uncapped: pure nucleus
     keep = select_blocks(block_scores(q, k, SCALE, 128, 16), 0.5)
     tq = keep.shape[-1]
     n_valid = (tq * (tq + 1)) // 2  # causal block pairs
