@@ -60,6 +60,14 @@ class XAttnConfig:
             raise ValueError(f"budget must be >= 1, got {self.budget}")
 
 
+# Runtime default sparse config: bounded block-gather XAttention prefill (gather=True,
+# budget=64, chunked). Wired as the default for KimiModel.__call__ / generate so prefill
+# is sparse by default — pass sparse=None for the exact dense path. Frozen ⇒ safe to share
+# as a default argument. Only engages at prefills >= min_seq (256 tokens); shorter
+# sequences (e.g. the parity/ppl harnesses) run dense via the min_seq gate.
+DEFAULT_SPARSE = XAttnConfig()
+
+
 def _pad_to(x: mx.array, mult: int, axis: int) -> mx.array:
     """Zero-pad ``x`` along ``axis`` up to a multiple of ``mult``."""
     n = x.shape[axis]
