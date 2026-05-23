@@ -25,6 +25,7 @@ from quanta.modeling.rope import (
     build_yarn_inv_freq,
     yarn_cos_sin,
 )
+from quanta.modeling.xattention import XAttnConfig, gather_sparse_attention, sparse_prefill_mask
 
 _SUBNORM_EPS = 1e-6  # HF DeepseekV3RMSNorm default for q_a / kv_a layernorms
 
@@ -57,6 +58,10 @@ class MLAAttention(nn.Module):
         # with W_UV. Output-equivalent to the expanded path; cheaper only at decode
         # (Sq=1) — at prefill it is more FLOPs. Off until parity-proven (a CLAUDE.md suspect).
         self.absorbed = False
+
+        # XAttention block-sparse prefill (lossy; ppl-gated, not parity). None = dense.
+        # Applies only to from-scratch prefill (t == kv_len) at/above cfg.min_seq.
+        self.sparse: XAttnConfig | None = None
 
     def __call__(
         self,
@@ -104,14 +109,23 @@ class MLAAttention(nn.Module):
         query = mx.concatenate([q_nope, q_pe], axis=-1)  # [B,H,m,qhd]
         key = mx.concatenate([k_nope, k_pe], axis=-1)  # [B,H,S,qhd]
 
+        is_sparse_prefill = self.sparse is not None and t == kv_len and t >= self.sparse.min_seq
+        if is_sparse_prefill and self.sparse.gather:  # block-gathered execution (the speed path)
+            out = gather_sparse_attention(query, key, value, self.scale, self.sparse)
+            out = mx.transpose(out, (0, 2, 1, 3)).reshape(b, t, h * vhd)
+            return self.o_proj(out)
+
+        sparse_mask = sparse_prefill_mask(query, key, self.scale, self.sparse) if is_sparse_prefill else None
+
         if use_fast:
             v_pad = mx.concatenate([value, mx.zeros((b, h, kv_len, self.q_head_dim - vhd), value.dtype)], -1)
-            out = mx.fast.scaled_dot_product_attention(query, key, v_pad, scale=self.scale, mask="causal")
+            mask = sparse_mask if sparse_mask is not None else "causal"
+            out = mx.fast.scaled_dot_product_attention(query, key, v_pad, scale=self.scale, mask=mask)
             out = out[..., :vhd]
         else:
             scores = (query @ mx.transpose(key, (0, 1, 3, 2))) * self.scale  # [B,H,m,S]
-            scores = scores + _causal_additive_mask(t, kv_len, scores.dtype)
-            weights = mx.softmax(scores.astype(mx.float32), axis=-1).astype(query.dtype)
+            mask = sparse_mask if sparse_mask is not None else _causal_additive_mask(t, kv_len, scores.dtype)
+            weights = mx.softmax((scores + mask).astype(mx.float32), axis=-1).astype(query.dtype)
             out = weights @ value  # [B,H,m,vhd]
 
         out = mx.transpose(out, (0, 2, 1, 3)).reshape(b, t, h * vhd)

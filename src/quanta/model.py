@@ -16,6 +16,7 @@ from quanta.cache import MLACache
 from quanta.config import KimiTextConfig
 from quanta.loader import TEXT_PREFIX, SourceCheckpoint
 from quanta.modeling.decoder import DenseDecoderLayer, MoEDecoderLayer
+from quanta.modeling.xattention import XAttnConfig
 
 LM_HEAD_KEY = "language_model.lm_head.weight"
 FINAL_NORM_KEY = TEXT_PREFIX + "norm.weight"
@@ -70,10 +71,12 @@ class KimiModel:
         use_fast: bool = False,
         caches: list | None = None,
         offset: int = 0,
+        sparse: XAttnConfig | None = None,
     ) -> mx.array:
         """Forward (logits) for ``token_ids``. With ``caches`` (one MLACache per layer)
         and ``offset`` (positions already cached) this is the incremental path used for
-        chunked prefill / prefix reuse."""
+        chunked prefill / prefix reuse. ``sparse`` enables XAttention block-sparse prefill
+        (lossy; ppl-gated) on every layer's attention."""
         cfg = self.cfg
         n = cfg.num_hidden_layers if n_layers is None else n_layers
         h = self.ckpt.embed_tokens(token_ids)[None].astype(self.dtype)
@@ -81,6 +84,8 @@ class KimiModel:
         for i in range(n):
             raw = load_layer_raw(self.ckpt, cfg, i, self.dtype)
             layer = build_runtime_layer(cfg, raw)
+            if sparse is not None:
+                layer.self_attn.sparse = sparse
             cache = caches[i] if caches is not None else None
             h = layer(h, pos, use_fast=use_fast, cache=cache)
             if cache is not None:
