@@ -44,7 +44,8 @@ def run() -> None:
 
     t0 = time.perf_counter()
     stats = bake(MODEL, OUT, ids, include_head=True, expert_byte_budget=EXPERT_BUDGET, target=0.08)
-    shutil.copy(Path(MODEL) / "tiktoken.model", Path(OUT) / "tiktoken.model")  # self-contained tokenizer
+    for fn in ("tiktoken.model", "tokenizer_config.json", "chat_template.jinja"):  # self-contained tokenizer + chat
+        shutil.copy(Path(MODEL) / fn, Path(OUT) / fn)
     print(f"BAKE DONE in {(time.perf_counter() - t0) / 3600:.2f}h\n{stats}", flush=True)
 
 

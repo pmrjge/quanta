@@ -172,6 +172,8 @@ class QuantaOmlxEngine(_OmlxBaseEngine):
         eos = getattr(self._tokenizer, "eos_id", None) or getattr(self._tokenizer, "eos_token_id", None)
         if isinstance(eos, int):
             self._eos.add(eos)
+        # widen with the tokenizer's full stop set ([EOS], <|im_end|>, [EOT] for Kimi)
+        self._eos |= {int(i) for i in getattr(self._tokenizer, "stop_ids", ()) if isinstance(i, int)}
         self._loaded = True
 
     async def stop(self) -> None:
@@ -196,7 +198,9 @@ class QuantaOmlxEngine(_OmlxBaseEngine):
                               repetition_penalty: float = 1.0, presence_penalty: float = 0.0,
                               stop: list[str] | None = None, **kwargs: Any) -> AsyncIterator[Any]:
         await self.start()
-        prompt_ids = self._encode(prompt)
+        add_bos = bool(kwargs.pop("add_bos", True))
+        allow_special = bool(kwargs.pop("allow_special", False))
+        prompt_ids = self._encode(prompt, add_bos=add_bos, allow_special=allow_special)
         caches = [MLACache() for _ in range(self._runtime.num_layers)]
         logits = self._runtime(mx.array(prompt_ids), caches=caches, sparse=DEFAULT_SPARSE)  # prefill
         generated: list[int] = []
@@ -218,24 +222,32 @@ class QuantaOmlxEngine(_OmlxBaseEngine):
             self._active -= 1
 
     async def chat(self, messages: list[dict[str, Any]], **kwargs: Any) -> Any:
-        return await self.generate(self._format(messages, kwargs.pop("tools", None)), **kwargs)
+        prompt, templated = self._format(messages, kwargs.pop("tools", None))
+        kwargs.setdefault("add_bos", not templated)  # the chat template carries its own structure
+        kwargs.setdefault("allow_special", templated)  # map its control tokens to special ids
+        return await self.generate(prompt, **kwargs)
 
     async def stream_chat(self, messages: list[dict[str, Any]], **kwargs: Any) -> AsyncIterator[Any]:
-        async for out in self.stream_generate(self._format(messages, kwargs.pop("tools", None)), **kwargs):
+        prompt, templated = self._format(messages, kwargs.pop("tools", None))
+        kwargs.setdefault("add_bos", not templated)
+        kwargs.setdefault("allow_special", templated)
+        async for out in self.stream_generate(prompt, **kwargs):
             yield out
 
     # --- internals -------------------------------------------------------------
-    def _format(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None) -> str:
+    def _format(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None) -> tuple[str, bool]:
+        """Return (prompt, templated): templated=True when the tokenizer's chat template was used."""
         tk = self._tokenizer
         if tk is not None and hasattr(tk, "apply_chat_template"):
-            return tk.apply_chat_template(messages, tokenize=False, add_generation_prompt=True, tools=tools or None)
+            text = tk.apply_chat_template(messages, tokenize=False, add_generation_prompt=True, tools=tools or None)
+            return str(text), True
         body = "\n".join(f"{m.get('role', 'user')}: {m.get('content', '')}" for m in messages)
-        return body + "\nassistant:"
+        return body + "\nassistant:", False
 
-    def _encode(self, text: str) -> list[int]:
+    def _encode(self, text: str, *, add_bos: bool = True, allow_special: bool = False) -> list[int]:
         if self._tokenizer is None:
             raise OmlxShimError("engine has no tokenizer")
-        return [int(t) for t in self._tokenizer.encode(text)]
+        return [int(t) for t in self._tokenizer.encode(text, add_bos=add_bos, allow_special=allow_special)]
 
     def _decode(self, ids: Sequence[int]) -> str:
         if self._tokenizer is None:

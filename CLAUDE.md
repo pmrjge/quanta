@@ -102,7 +102,10 @@ against it. Order of operations for any new model or layer:
   attention scale is `softmax_scale = (128+64)^-0.5 · mscale²` where
   `mscale = 0.1·ln(64)+1 ≈ 1.4159` (so `mscale² ≈ 2.005`). **factor is 64, not
   96** — a wrong factor uniformly degrades every token.
-- Tokens: `bos=163584`, `eos=163585`.
+- Tokens: `bos=163584`. **Two distinct eos**: the tokenizer's nominal `[EOS]=163585`
+  vs the model's *generation* eos `<|im_end|>=163586` (config.json / generation_config.json
+  `eos_token_id`); plus end-of-turn `[EOT]=163593`. Generation/serving must stop on the set
+  `{163585, 163586, 163593}` (`<|im_end|>` is the one the model actually emits to end a turn).
 - Source checkpoint ships **int4** routed experts. Param split: routed gate+up
   ≈ 676.5B, routed down ≈ 338.2B (gate/up dominate ~2:1).
 
