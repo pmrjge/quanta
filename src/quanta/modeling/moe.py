@@ -8,6 +8,10 @@
   Python loop over experts). bf16 here for forward-path parity; the post-bake
   runtime swaps in :func:`mx.gather_qmm`.
 * Output: ``Σ_topk w·expert(x) + shared(x)``.
+* Long context: tokens are run through the experts in bounded chunks (``token_chunk``)
+  so the routed intermediate ``[chunk·topk, hidden]`` (the dominant prefill transient)
+  never scales with the full prompt; MoE is per-token independent ⇒ chunking is
+  output-equivalent to processing all tokens at once.
 """
 
 from __future__ import annotations
@@ -55,42 +59,69 @@ class SparseMoE(nn.Module):
         # Output-equivalent to the unsorted path; the real throughput win lands on the
         # post-bake gather_qmm path (mlx PR #2078). Off by default until parity-proven.
         self.sort_dispatch = False
+        # Run tokens through the experts in chunks of this many so the routed intermediate
+        # ([chunk*topk, hidden]) stays bounded at long-context prefill. Per-token independent
+        # ⇒ output-equivalent; a no-op (single chunk) when n <= token_chunk (decode / short
+        # prefill), so decode latency and small-batch parity are unchanged.
+        self.token_chunk = 8192
 
     def set_experts(self, gate: mx.array, up: mx.array, down: mx.array) -> None:
         self.gate_stack, self.up_stack, self.down_stack = gate, up, down
 
-    def __call__(self, x: mx.array, *, return_parts: bool = False):
-        b, t, hd = x.shape
-        n = b * t
+    def _routed_chunk(self, xc: mx.array, idx_c: mx.array, w_c: mx.array) -> mx.array:
+        """Routed top-k expert output for one token chunk ``xc`` ``[nc, hidden]`` → ``[nc, hidden]``."""
+        nc = xc.shape[0]
         topk = self.cfg.num_experts_per_tok
-        xf = x.reshape(n, hd)
-
-        idx, weights = self.gate(xf)  # [n,topk] int32, [n,topk] fp32
-        x_col = xf[:, :, None]  # [n, hidden, 1]
-        m = n * topk
-        exp = idx.reshape(-1)  # [m] expert per (token, slot) row
-        tok = mx.repeat(mx.arange(n, dtype=mx.int32), topk)  # [m] token per row
-
-        if self.sort_dispatch:
+        x_col = xc[:, :, None]  # [nc, hidden, 1]
+        mc = nc * topk
+        exp = idx_c.reshape(-1)  # [mc] expert per (token, slot)
+        tok = mx.repeat(mx.arange(nc, dtype=mx.int32), topk)  # [mc] LOCAL token index within the chunk
+        srt = self.sort_dispatch
+        if srt:
             order = mx.argsort(exp)
             inv = mx.argsort(order)
             exp, tok = exp[order], tok[order]
-        srt = self.sort_dispatch
-
         g = mx.gather_mm(self.gate_stack, x_col, lhs_indices=exp, rhs_indices=tok, sorted_indices=srt)
         u = mx.gather_mm(self.up_stack, x_col, lhs_indices=exp, rhs_indices=tok, sorted_indices=srt)
-        h = nn.silu(g) * u  # [m, inter, 1] (rows in dispatch order)
+        h = nn.silu(g) * u  # [mc, inter, 1]
         d = mx.gather_mm(
-            self.down_stack, h, lhs_indices=exp, rhs_indices=mx.arange(m, dtype=mx.int32),
+            self.down_stack, h, lhs_indices=exp, rhs_indices=mx.arange(mc, dtype=mx.int32),
             sorted_indices=srt,
         )
         d = d[:, :, 0]
-        if self.sort_dispatch:
-            d = d[inv]  # restore original (token, slot) order
-        d = d.reshape(n, topk, hd)
-        routed = mx.sum(d.astype(mx.float32) * weights[:, :, None], axis=1).astype(x.dtype)
-        routed = routed.reshape(b, t, hd)
-        shared = self.shared_experts(xf).reshape(b, t, hd)
+        if srt:
+            d = d[inv]  # restore (token, slot) order
+        d = d.reshape(nc, topk, self.cfg.hidden_size)
+        return mx.sum(d.astype(mx.float32) * w_c[:, :, None], axis=1).astype(xc.dtype)
+
+    def __call__(self, x: mx.array, *, return_parts: bool = False):
+        b, t, hd = x.shape
+        n = b * t
+        xf = x.reshape(n, hd)
+        idx, weights = self.gate(xf)  # [n,topk] int32, [n,topk] fp32
+
+        chunk = self.token_chunk if self.token_chunk and self.token_chunk > 0 else n
+        multi = n > chunk  # only split (and eval per chunk) when it actually chunks
+        routed_parts, shared_parts, out_parts = [], [], []
+        for c0 in range(0, n, chunk):  # coarse chunked-prefill loop; experts stay vectorized
+            c1 = min(c0 + chunk, n)
+            xc = xf[c0:c1]
+            rc = self._routed_chunk(xc, idx[c0:c1], weights[c0:c1])  # [nc, hidden]
+            sc = self.shared_experts(xc)  # [nc, hidden]
+            if return_parts:
+                routed_parts.append(rc)
+                shared_parts.append(sc)
+                if multi:
+                    mx.eval(rc, sc)
+            else:
+                oc = rc + sc
+                out_parts.append(oc)
+                if multi:
+                    mx.eval(oc)  # bound peak: free this chunk's expert intermediates
+
         if return_parts:
+            routed = (routed_parts[0] if not multi else mx.concatenate(routed_parts, axis=0)).reshape(b, t, hd)
+            shared = (shared_parts[0] if not multi else mx.concatenate(shared_parts, axis=0)).reshape(b, t, hd)
             return routed + shared, routed, shared
-        return routed + shared
+        out = out_parts[0] if not multi else mx.concatenate(out_parts, axis=0)
+        return out.reshape(b, t, hd)
