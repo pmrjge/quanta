@@ -1,0 +1,39 @@
+[project]
+name = "quanta"
+version = "0.1.0"
+description = "Parity-first MLX quantization + sparse-MoE inference runtime (Kimi-K2.6, then GLM/DeepSeek)"
+authors = [
+    { name = "Pedro Jorge", email = "pmrjge@gmail.com" }
+]
+requires-python = ">=3.13"
+dependencies = [
+    "mlx>=0.31.2",
+    "numpy>=2.4.6",
+    "torch>=2.12.0",
+    "tqdm>=4.67.3",
+]
+
+[project.optional-dependencies]
+# Offline-only tooling: parity references (HF), tokenizers, and source-checkpoint
+# loading during bake/calibration. NEVER imported on the runtime hot path.
+reference = [
+    "transformers>=5.9.0",
+    "safetensors>=0.7.0",
+    "sentencepiece>=0.2.1",
+]
+# oMLX integration (added later, mirrors the previous project's extra).
+omlx = [
+    "omlx[grammar] @ git+https://github.com/jundot/omlx.git",
+]
+
+[build-system]
+requires = ["uv_build>=0.11.13,<0.12.0"]
+build-backend = "uv_build"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+src = ["src", "tests"]

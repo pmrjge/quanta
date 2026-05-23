@@ -1,0 +1,57 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+wheels/
+*.egg-info/
+.eggs/
+
+# ---- uv / virtualenv ----
+.venv/
+venv/
+env/
+# NOTE: uv.lock is intentionally NOT ignored — it is committed for reproducible installs.
+
+# ---- Test / type / lint caches ----
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.dmypy.json
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+
+# ---- Jupyter ----
+.ipynb_checkpoints/
+
+# ---- Model weights, baked artifacts, runtime caches (NEVER commit) ----
+# Source checkpoints, baked artifacts, and their sibling *_offload caches live
+# OUTSIDE the repo (under ~/models). These globs are a backstop in case any land
+# inside the tree by mistake. The baked artifact is an immutable bundle; the
+# runtime offload state belongs in a sibling <artifact>_offload dir.
+*.safetensors
+*.gguf
+*.bin
+*.pt
+*.npz
+*.npy
+models/
+artifacts/
+*_offload/
+calibration/
+*.calib
+scratch/
+
+# ---- macOS / editors ----
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.idea/
+.vscode/
+*.swp
