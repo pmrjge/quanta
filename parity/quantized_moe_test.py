@@ -1,8 +1,10 @@
 """Validate dynamic mixed int3/int4 QuantizedSparseMoE == bf16 SparseMoE on dequant weights.
 
-Experts 0-2 int3, 3-5 int4. The gather_qmm path (per-width stacks, remapped indices, select
-by expert width) must equal running the same dequantized experts through the bf16 SparseMoE
-(isolating gather_qmm correctness from quant error). Router + shared shared between the two.
+Widths are assigned **per (expert, projection)** — experts are deliberately mixed *within*
+themselves (e.g. expert 0 is gate=int3, up=int3, down=int4), the real-artifact case the old
+per-expert assumption missed. The gather_qmm path (per-(proj,width) stacks, remapped indices,
+select by the row-expert's width for that projection) must equal running the same dequantized
+experts through the bf16 SparseMoE. Router + shared shared between the two.
 
     uv run python -m parity.quantized_moe_test
 """
@@ -16,7 +18,12 @@ from quanta.modeling.moe import SparseMoE
 from quanta.modeling.quantized import QuantizedSparseMoE
 
 HID, INTER, E, TOPK, N, GS = 256, 128, 6, 2, 8, 128
-INT3, INT4 = [0, 1, 2], [3, 4, 5]
+# per-(expert, projection) widths — mixed within experts so no expert is uniform across projs
+PBITS = {
+    "gate": [3, 3, 4, 4, 3, 4],
+    "up":   [3, 4, 3, 4, 4, 3],
+    "down": [4, 3, 3, 4, 3, 4],
+}
 
 
 def _cfg() -> KimiTextConfig:
@@ -35,27 +42,26 @@ def _cfg() -> KimiTextConfig:
 def run() -> None:
     mx.random.seed(0)
     cfg = _cfg()
-    shapes = {"gate": (E, INTER, HID), "up": (E, INTER, HID), "down": (E, HID, INTER)}
-    W = {p: mx.random.normal(s) for p, s in shapes.items()}
-    bits_of = {e: (3 if e in INT3 else 4) for e in range(E)}
+    shapes = {"gate": (INTER, HID), "up": (INTER, HID), "down": (HID, INTER)}
+    W = {p: mx.random.normal((E,) + s) for p, s in shapes.items()}
 
-    # per-width packed stacks + dequantized stacks (global-indexed) for the bf16 reference
-    stacks = {3: {}, 4: {}}
-    deq = {p: [None] * E for p in W}
-    for bits, elist in ((3, INT3), (4, INT4)):
-        for p in W:
-            pk, sc, bi = [], [], []
-            for e in elist:
-                q, s, b = mx.quantize(W[p][e], group_size=GS, bits=bits)
-                pk.append(q)
-                sc.append(s)
-                bi.append(b)
-                deq[p][e] = mx.dequantize(q, s, b, group_size=GS, bits=bits)
-            stacks[bits][f"{p}_packed"] = mx.stack(pk)
-            stacks[bits][f"{p}_scale"] = mx.stack(sc)
-            stacks[bits][f"{p}_bias"] = mx.stack(bi)
-    expert_bits = mx.array([bits_of[e] for e in range(E)])
-    slots = mx.array([INT3.index(e) if e in INT3 else INT4.index(e) for e in range(E)])
+    # per-(proj, width) packed stacks + per-(expert,proj) dequant for the bf16 reference
+    stacks: dict[str, dict[int, dict[str, mx.array]]] = {p: {} for p in W}
+    deq: dict[str, list] = {p: [None] * E for p in W}
+    pslot = {p: [0] * E for p in W}
+    for p in W:
+        by = {b: {"packed": [], "scale": [], "bias": []} for b in (3, 4)}
+        for e in range(E):
+            bits = PBITS[p][e]
+            qd, s, b = mx.quantize(W[p][e], group_size=GS, bits=bits)
+            pslot[p][e] = len(by[bits]["packed"])
+            by[bits]["packed"].append(qd)
+            by[bits]["scale"].append(s)
+            by[bits]["bias"].append(b)
+            deq[p][e] = mx.dequantize(qd, s, b, group_size=GS, bits=bits)
+        stacks[p] = {bits: {k: mx.stack(v) for k, v in d.items()} for bits, d in by.items() if d["packed"]}
+    pbits = {p: mx.array(PBITS[p], mx.int32) for p in W}
+    pslot = {p: mx.array(pslot[p], mx.int32) for p in W}
 
     ref = SparseMoE(cfg)
     ref.gate.weight = mx.random.normal((E, HID))
@@ -65,14 +71,14 @@ def run() -> None:
     q.gate.weight = ref.gate.weight
     q.gate.e_score_correction_bias = ref.gate.e_score_correction_bias
     q.shared_experts = ref.shared_experts  # identical router + shared isolate the expert path
-    q.set_experts(stacks, expert_bits, slots)
+    q.set_experts(stacks, pbits, pslot)
 
     x = mx.random.normal((1, N, HID)).astype(mx.bfloat16)
     err = mx.max(mx.abs(ref(x) - q(x))).item()
-    print("\n=== dynamic mixed int3/int4 QuantizedSparseMoE ===")
-    print(f"experts 0-2 int3, 3-5 int4;  gather_qmm vs bf16(dequant): max_abs {err:.3e}")
+    print("\n=== dynamic mixed int3/int4 QuantizedSparseMoE (per-projection widths) ===")
+    print(f"widths mixed within experts;  gather_qmm vs bf16(dequant): max_abs {err:.3e}")
     # bf16-level (gather_qmm's fused dequant+matmul vs explicit dequant->gather_mm); a logic
-    # bug (wrong expert/width select) would be O(1), not sub-percent.
+    # bug (wrong expert/width/projection select) would be O(1), not sub-percent.
     assert err < 2e-2, "quantized MoE must match the dequant path (bf16 tol)"
     print("dynamic mixed quantized MoE matches dequant path (bf16 precision)")
 

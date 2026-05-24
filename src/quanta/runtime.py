@@ -19,6 +19,7 @@ from pathlib import Path
 
 import mlx.core as mx
 import mlx.nn as nn
+from mlx.utils import tree_flatten
 
 from quanta.config import KimiTextConfig
 from quanta.loader import TEXT_PREFIX
@@ -105,23 +106,32 @@ def _quant_linear_or_dense(art, module, proj, pre):
 
 
 def _load_expert_stacks(art: ResidentArtifact, cfg: KimiTextConfig, pre: str):
-    """Group routed experts by quant width into per-width packed stacks for gather_qmm."""
-    per_width: dict[int, dict[str, list]] = {}
-    expert_bits = [0] * cfg.n_routed_experts
-    slots = [0] * cfg.n_routed_experts
+    """Group routed experts by ``(projection, quant width)`` into packed stacks for gather_qmm.
+
+    The bake's DP allocates bits per ``(expert, projection)`` — an expert may be ``gate=int3``
+    yet ``down=int4`` — so each projection is stacked per width independently. Returns
+    ``(stacks, pbits, pslot)``: ``stacks[proj][bits]`` the packed stack, and per projection each
+    expert's width (``pbits[proj][e]``) and its slot within that width's stack (``pslot[proj][e]``).
+    """
+    projs = ("gate", "up", "down")
+    by: dict[str, dict[int, dict[str, list]]] = {p: {} for p in projs}
+    pbits = {p: [0] * cfg.n_routed_experts for p in projs}
+    pslot = {p: [0] * cfg.n_routed_experts for p in projs}
     for e in range(cfg.n_routed_experts):
-        bits = art.manifest[f"{pre}mlp.experts.{e}.gate_proj"]["bits"]
-        expert_bits[e] = bits
-        d = per_width.setdefault(bits, {f"{p}_{c}": [] for p in ("gate", "up", "down")
-                                        for c in ("packed", "scale", "bias")})
-        slots[e] = len(d["gate_packed"])
-        for p in ("gate", "up", "down"):
+        for p in projs:
             k = f"{pre}mlp.experts.{e}.{p}_proj"
-            d[f"{p}_packed"].append(art.get(f"{k}.weight_packed"))
-            d[f"{p}_scale"].append(art.get(f"{k}.weight_scale"))
-            d[f"{p}_bias"].append(art.get(f"{k}.weight_bias"))
-    stacks = {bits: {k: mx.stack(v) for k, v in d.items()} for bits, d in per_width.items()}
-    return stacks, mx.array(expert_bits), mx.array(slots)
+            bits = art.manifest[k]["bits"]
+            d = by[p].setdefault(bits, {"packed": [], "scale": [], "bias": []})
+            pbits[p][e] = bits
+            pslot[p][e] = len(d["packed"])
+            d["packed"].append(art.get(f"{k}.weight_packed"))
+            d["scale"].append(art.get(f"{k}.weight_scale"))
+            d["bias"].append(art.get(f"{k}.weight_bias"))
+    stacks = {p: {bits: {kk: mx.stack(vv) for kk, vv in d.items()} for bits, d in by[p].items()}
+              for p in projs}
+    pbits = {p: mx.array(pbits[p], mx.int32) for p in projs}
+    pslot = {p: mx.array(pslot[p], mx.int32) for p in projs}
+    return stacks, pbits, pslot
 
 
 def _quant_embedding(art: ResidentArtifact, key: str) -> nn.QuantizedEmbedding:
@@ -136,23 +146,46 @@ def _quant_embedding(art: ResidentArtifact, key: str) -> nn.QuantizedEmbedding:
     return emb
 
 
+def _layer_arrays(layer) -> list[mx.array]:
+    """Every resident array of a built layer — nn params **and** the MoE expert stacks (which are
+    plain dict attributes, not nn parameters), so we can materialize a layer before dropping the
+    source shard mmaps."""
+    arrs = [v for _, v in tree_flatten(layer.parameters())]
+    mlp = getattr(layer, "mlp", None)
+    if isinstance(mlp, QuantizedSparseMoE):
+        arrs += [a for bw in mlp._stacks.values() for s in bw.values() for a in s.values()]
+        arrs += list(mlp._pbits.values()) + list(mlp._pslot.values())
+        arrs += [a for bw in mlp._rmap.values() for a in bw.values()]
+    return arrs
+
+
 class ResidentModel:
     """RAM-resident quantized Kimi-K2.6 — same call signature as :class:`KimiModel`.
 
-    Builds all decoder layers once from the artifact (held resident; the deployment target is
-    the full ~427 GB pinned with ``mx.set_wired_limit``). ``generate`` / the ppl harness run on
-    it directly. ``n_layers`` builds a prefix for bounded validation.
+    Built one layer at a time (materialize its weights, then drop the source shard mmaps) so peak
+    load residency is ~one layer, not the whole shard set — the deployment target is the full
+    quantized model pinned with ``mx.set_wired_limit``. ``generate`` / the ppl harness run on it
+    directly. ``n_layers`` builds a prefix for bounded validation.
     """
 
     def __init__(self, art_dir: str | Path, *, n_layers: int | None = None) -> None:
         self.art = ResidentArtifact(art_dir)
         self.cfg = self.art.cfg
         n = self.cfg.num_hidden_layers if n_layers is None else n_layers
-        self.layers = [build_resident_layer(self.art, i) for i in range(n)]
+        self.layers = []
+        for i in range(n):  # memory discipline: materialize each layer, then release its shard mmaps
+            layer = build_resident_layer(self.art, i)
+            mx.eval(_layer_arrays(layer))
+            self.layers.append(layer)
+            self.art.release()
+            mx.clear_cache()
         self.num_layers = n  # for KV-cache sizing by the omlx engine / generate
         self.embed = _quant_embedding(self.art, EMBED_KEY)
         self.norm_w = self.art.get(FINAL_NORM_KEY)
         self.lm_head = _quant_linear(self.art, LM_HEAD_KEY)
+        mx.eval([v for _, v in tree_flatten(self.embed.parameters())], self.norm_w,
+                [v for _, v in tree_flatten(self.lm_head.parameters())])
+        self.art.release()
 
     def __call__(
         self, token_ids: mx.array, *, n_layers: int | None = None, use_fast: bool = True,
