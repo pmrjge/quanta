@@ -7,8 +7,19 @@ heads, 2 KV heads, head_dim 128. Two equivalent paths (gated in the test):
 * naive: explicit rotate-half RoPE + manual softmax — the parity reference.
 
 KV heads are repeated to query-head count before attention (so it works regardless of the
-SDPA kernel's GQA support). Only the 8 attention layers carry a growing KV cache — at 256K
-that's ~2 GB total (2 KV heads), which is why long context is cheap on this architecture.
+SDPA kernel's GQA support). Only the 8 ``*`` attention layers carry a growing KV cache — at
+the model's 1M context that's ~8 GB total bf16 / ~4 GB int8 (2 KV heads × 128 head_dim × 8
+layers); the 40 Mamba layers keep an O(1) recurrent state regardless of length, which is why
+1M context is cheap on this architecture (~8 GB KV on top of the ~68 GB int4 weights). This
+runtime operates at the model's full **1M context by default**. ``max_position_embeddings=262144``
+(256K) is the *trained* RoPE window, **not** a runtime cap — RoPE here is built from
+``rope_theta=10000`` alone (``mx.fast.rope`` never consumes max_position_embeddings), so positions
+extend past 262144 by **plain extrapolation** with **no** ``rope_scaling`` (identical numerics to
+the long-context guard-bypass upstream exposes: same theta, no rescale). The fast path uses tiled
+``mx.fast.scaled_dot_product_attention`` (never materializes a TxT score matrix), so a 1M prefill
+is memory-safe; the naive softmax path (TxT) is the short-sequence parity reference only.
+Long-context validation confirms the 8 global-attention layers stay coherent under that 4x RoPE
+extrapolation (the Mamba pathway is length-agnostic).
 """
 
 from __future__ import annotations

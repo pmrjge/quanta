@@ -72,6 +72,60 @@ def ssd_step(x_t, dt_t, A, B_t, C_t, D, state):
     return y.astype(out_dtype), state
 
 
+_SSD_STEP_SRC = r"""
+    uint pp = thread_position_in_grid.x;   // head_dim index p
+    uint hh = thread_position_in_grid.y;   // head index h
+    uint bb = thread_position_in_grid.z;   // batch index
+    const int H = dims[0], P = dims[1], N = dims[2], rep = dims[3], BN = dims[4];
+    if ((int)pp >= P || (int)hh >= H || (int)bb >= BN) return;
+    const int G = H / rep;
+    const int g = (int)hh / rep;
+    const float dtv = dt[bb * H + hh];
+    const float da = exp(dtv * A[hh]);
+    const float xv = x[(bb * H + hh) * P + (int)pp];
+    const int sbase = ((bb * H + hh) * N) * P + (int)pp;  // state[bb,hh,0,pp], stride P over n
+    const int bc = (bb * G + g) * N;                       // B/C[bb,g,0]
+    float acc = 0.0f;
+    for (int n = 0; n < N; ++n) {
+        const float s = da * state[sbase + n * P] + dtv * B[bc + n] * xv;
+        new_state[sbase + n * P] = s;
+        acc += C[bc + n] * s;
+    }
+    y[(bb * H + hh) * P + (int)pp] = acc + D[hh] * xv;
+"""
+
+_ssd_step_kernel = mx.fast.metal_kernel(
+    name="ssd_step",
+    input_names=["x", "dt", "A", "B", "C", "D", "state", "dims"],
+    output_names=["y", "new_state"],
+    source=_SSD_STEP_SRC,
+)
+
+
+def ssd_step_fused(x_t, dt_t, A, B_t, C_t, D, state):
+    """Fused single-kernel decode step — output-equivalent to :func:`ssd_step`, one Metal launch.
+
+    Same signature/semantics; one thread per ``(batch, head, head_dim)`` loops over the state
+    dim ``N`` (updates ``state[.,h,:,p]`` and accumulates ``y[.,h,p]``). fp32 scan (the recurrence
+    is bf16-unstable); inputs upcast, output cast back. Replaces ~8 composed ops × 40 mamba layers
+    with one launch — the decode op-launch-bound fix (#41)."""
+    out_dtype = x_t.dtype
+    x_t, dt_t, A = x_t.astype(mx.float32), dt_t.astype(mx.float32), A.astype(mx.float32)
+    B_t, C_t = B_t.astype(mx.float32), C_t.astype(mx.float32)
+    D, state = D.astype(mx.float32), state.astype(mx.float32)
+    bn, h, p = x_t.shape
+    g, n = B_t.shape[-2], B_t.shape[-1]
+    dims = mx.array([h, p, n, h // g, bn], dtype=mx.int32)
+    y, new_state = _ssd_step_kernel(
+        inputs=[x_t, dt_t, A, B_t, C_t, D, state, dims],
+        grid=(p, h, bn),
+        threadgroup=(min(p, 256), 1, 1),
+        output_shapes=[(bn, h, p), (bn, h, n, p)],
+        output_dtypes=[mx.float32, mx.float32],
+    )
+    return y.astype(out_dtype), new_state
+
+
 def ssd_chunked(x, dt, A, B, C, D, chunk_size, state_in=None):
     """SSD prefill via matmuls — output-equivalent to :func:`ssd_sequential`. Returns (y, state).
 

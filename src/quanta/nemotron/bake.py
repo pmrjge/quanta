@@ -57,12 +57,15 @@ def _write_by_policy(writer: ArtifactWriter, name: str, arr: mx.array, gs: int,
 
 
 def _bake_expert(writer: ArtifactWriter, base: str, w_up: mx.array, w_down: mx.array,
-                 latent: mx.array | None, idx: mx.array | None, gs: int, method: str) -> int:
-    """AWQ (or RTN-fallback) int4 the two relu^2 expert matrices. Returns rows used (0 = cold/RTN).
+                 latent: mx.array | None, idx: mx.array | None, gs: int, method: str,
+                 scale_dtype: mx.Dtype | None = None) -> int:
+    """AWQ (or RTN) int4 the two relu^2 expert matrices. Returns rows used (0 = cold/RTN).
 
     ``up`` calibrates on the expert's routed latent rows; ``down`` on ``relu2(up·latent)`` of
-    those rows. Cold experts (no routed rows) and ``method='rtn'`` fall back to plain int4 with
-    ``s=1`` so the runtime always divides by a stored scale (one path)."""
+    those rows. Cold experts (no routed rows) and ``method='rtn'`` use plain int4 with ``s=1``
+    so the runtime always divides by a stored scale (one path). NB: AWQ misfires on the relu^2
+    down-proj (degenerate per-channel scales → +75% e2e ppl); plain int4 (``method='rtn'``) is
+    lossless e2e (+0.1%) at the same 4-bit footprint — prefer it for Nemotron (see #38)."""
     xe = expert_rows(latent, idx, _expert_id(base)) if (method == "awq" and latent is not None) else None
     if xe is not None and xe.shape[0] > 0:
         s_up, p, sc, b = awq_quantize(w_up, xe, _EXPERT_BITS, gs)
@@ -71,8 +74,8 @@ def _bake_expert(writer: ArtifactWriter, base: str, w_up: mx.array, w_down: mx.a
         s_dn, p, sc, b = awq_quantize(w_down, up_out, _EXPERT_BITS, gs)
         writer.add_awq_quantized(f"{base}.down_proj", p, sc, b, s_dn.astype(mx.bfloat16), _EXPERT_BITS, gs)
         return int(xe.shape[0])
-    for proj, w in (("up_proj", w_up), ("down_proj", w_down)):  # cold / RTN → s=1 identity
-        p, sc, b = quantize_affine(w, _EXPERT_BITS, gs)
+    for proj, w in (("up_proj", w_up), ("down_proj", w_down)):  # RTN / cold → s=1 identity (plain int4)
+        p, sc, b = quantize_affine(w, _EXPERT_BITS, gs, scale_dtype=scale_dtype)
         ones = mx.ones((w.shape[1],), dtype=mx.bfloat16)
         writer.add_awq_quantized(f"{base}.{proj}", p, sc, b, ones, _EXPERT_BITS, gs)
     return 0
@@ -131,7 +134,7 @@ def bake_nemotron(
             for e in experts:
                 base = f"backbone.layers.{i}.mixer.experts.{e}"
                 warm += int(_bake_expert(writer, base, up_st[e], down_st[e], latent, idx,
-                                         group_size, expert_method) > 0)
+                                         group_size, expert_method, scale_dtype) > 0)
             del es, up_st, down_st
         ck.release()
         mx.clear_cache()

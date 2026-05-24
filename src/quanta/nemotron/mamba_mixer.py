@@ -15,7 +15,18 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from quanta.nemotron.config import NemotronHConfig
-from quanta.nemotron.mamba_ssd import causal_conv1d, causal_conv1d_step, ssd_chunked, ssd_step
+from quanta.nemotron.mamba_ssd import (
+    causal_conv1d,
+    causal_conv1d_step,
+    ssd_chunked,
+    ssd_step,
+    ssd_step_fused,
+)
+
+# Opt-in fused one-launch decode kernel. Parity-exact (== ssd_step, ~2e-7), BUT measured NOT a
+# win in the compiled decode path (mx.compile already fuses the composed SSD ops: ~34 vs ~35
+# tok/s), so default off per rule-4 (optimizations default to the proven path until a measured win).
+FUSED_SSD_STEP = False
 
 
 def _silu(x: mx.array) -> mx.array:
@@ -73,7 +84,8 @@ class MambaMixer(nn.Module):
             dt = _softplus(dt + self.dt_bias)
             if state is None:
                 state = mx.zeros((b, self.h, self.n, self.p), dtype=x.dtype)
-            y, state = ssd_step(xs[:, 0], dt[:, 0], a, bm[:, 0], cm[:, 0], self.D, state)
+            step_fn = ssd_step_fused if FUSED_SSD_STEP else ssd_step
+            y, state = step_fn(xs[:, 0], dt[:, 0], a, bm[:, 0], cm[:, 0], self.D, state)
             y = y[:, None]
         y = y.reshape(b, t, self.d_inner)
         y = self.norm(y * _silu(z))  # gated RMSNorm: gate before norm+weight
