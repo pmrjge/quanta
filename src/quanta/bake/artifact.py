@@ -56,6 +56,16 @@ class ArtifactWriter:
         self._put(f"{key}.weight_bias", biases)
         self.manifest[key] = {"format": "affine_packed", "bits": bits, "group_size": group_size}
 
+    def add_awq_quantized(self, key: str, packed: mx.array, scales: mx.array, biases: mx.array,
+                          awq_scale: mx.array, bits: int, group_size: int) -> None:
+        """Add an AWQ int weight: affine codes of ``W·diag(s)`` + the per-input-channel scale ``s``.
+        The runtime applies ``x·diag(1/s)`` before the matmul (folded per expert in the gather)."""
+        self._put(f"{key}.weight_packed", packed)
+        self._put(f"{key}.weight_scale", scales)
+        self._put(f"{key}.weight_bias", biases)
+        self._put(f"{key}.awq_scale", awq_scale)
+        self.manifest[key] = {"format": "awq_packed", "bits": bits, "group_size": group_size}
+
     def add_dense(self, name: str, arr: mx.array) -> None:
         """Add an unquantized tensor verbatim (norms, router, shared expert, biases)."""
         self._put(name, arr)
