@@ -53,7 +53,13 @@ def ssd_step(x_t, dt_t, A, B_t, C_t, D, state):
     """One decode step (O(1) state), vectorized over heads. Returns (y_t, state).
 
     x_t: (Bn,H,P)  dt_t: (Bn,H)  B_t,C_t: (Bn,G,N)  state: (Bn,H,N,P)
+
+    Scan in fp32 (bf16 is unstable for the recurrence); inputs upcast, output cast back.
     """
+    out_dtype = x_t.dtype
+    x_t, dt_t, A = x_t.astype(mx.float32), dt_t.astype(mx.float32), A.astype(mx.float32)
+    B_t, C_t, D, state = (B_t.astype(mx.float32), C_t.astype(mx.float32),
+                          D.astype(mx.float32), state.astype(mx.float32))
     h = x_t.shape[1]
     g = B_t.shape[-2]
     rep = h // g
@@ -63,7 +69,7 @@ def ssd_step(x_t, dt_t, A, B_t, C_t, D, state):
     upd = dt_t[:, :, None, None] * (bf[:, :, :, None] * x_t[:, :, None, :])  # (Bn,H,N,P)
     state = da[:, :, None, None] * state + upd
     y = mx.sum(cf[:, :, :, None] * state, axis=2) + D[None, :, None] * x_t  # (Bn,H,P)
-    return y, state
+    return y.astype(out_dtype), state
 
 
 def ssd_chunked(x, dt, A, B, C, D, chunk_size, state_in=None):
@@ -72,7 +78,15 @@ def ssd_chunked(x, dt, A, B, C, D, chunk_size, state_in=None):
     Splits the sequence into ``chunk_size`` chunks: intra-chunk via a segment-sum decay matrix
     (the attention dual), inter-chunk via a bounded scan over the carried state (the SSM dual).
     ``state_in`` carries across token-blocks so long-context prefill stays bounded-memory.
+
+    The scan (cumsum / exp / state recurrence) runs in fp32 — bf16 is numerically unstable for
+    the SSM duality (standard for Mamba); inputs are upcast and the output cast back.
     """
+    out_dtype = x.dtype
+    x, dt, A = x.astype(mx.float32), dt.astype(mx.float32), A.astype(mx.float32)
+    B, C, D = B.astype(mx.float32), C.astype(mx.float32), D.astype(mx.float32)
+    if state_in is not None:
+        state_in = state_in.astype(mx.float32)
     bn, length, h, p = x.shape
     g, n = B.shape[-2], B.shape[-1]
     rep = h // g
@@ -95,9 +109,10 @@ def ssd_chunked(x, dt, A, B, C, D, chunk_size, state_in=None):
 
     # intra-chunk (diagonal) block
     cb = ct @ mx.swapaxes(bt, -1, -2)          # (Bn,nc,H,Q,Q): C_i . B_j
-    decay = mx.exp(acum[..., :, None] - acum[..., None, :])  # exp(ā_i - ā_j)
-    tri = mx.tril(mx.ones((q, q), dtype=x.dtype))
-    m = cb * decay * tri * dtc[..., None, :]    # dt_j on columns, masked i>=j
+    diff = acum[..., :, None] - acum[..., None, :]  # ā_i - ā_j
+    tri = mx.tril(mx.ones((q, q), dtype=mx.bool_))   # keep i>=j (causal, intra-chunk)
+    decay = mx.exp(mx.where(tri, diff, -mx.inf))     # mask BEFORE exp: upper triangle -> 0, no overflow
+    m = cb * decay * dtc[..., None, :]          # dt_j on columns (mask already folded into decay)
     y_diag = m @ xt                             # (Bn,nc,H,Q,P)
 
     # per-chunk end state and total chunk decay
@@ -116,7 +131,7 @@ def ssd_chunked(x, dt, A, B, C, D, chunk_size, state_in=None):
 
     y = y_diag + y_off + D.reshape(1, 1, h, 1, 1) * xt
     y = mx.transpose(y, (0, 1, 3, 2, 4)).reshape(bn, length, h, p)
-    return y, s
+    return y.astype(out_dtype), s
 
 
 def causal_conv1d(u, weight, bias=None):

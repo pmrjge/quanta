@@ -70,13 +70,35 @@ def run() -> None:
         cys.append(y_t)
     conv_ok = _maxdiff(y_pf, mx.stack(cys, axis=1)) < 1e-4
 
+    # --- regressions for two SSD bugs the short fp32 cases above missed ---
+    # A long chunk with large dt·|A|: the cumulative decay makes exp(ā_i−ā_j) overflow in the
+    # (masked) upper triangle. sum(dt·|A|) ≈ 0.8·1.2·128 ≈ 123 ≫ 88, so exp overflows fp32 →
+    # the old mask-after-exp code hit inf·0 = nan. Also the scan must run in fp32 (bf16 unstable).
+    mx.random.seed(1)
+    lo = 128
+    xo = mx.random.normal((bn, lo, h, p)) * 0.1
+    bo = mx.random.normal((bn, lo, g, n)) * 0.1
+    co = mx.random.normal((bn, lo, g, n)) * 0.1
+    dto = mx.ones((bn, lo, h)) * 0.8
+    ao = -mx.ones((h,)) * 1.2
+    do = mx.random.normal((h,)) * 0.1
+    yo_seq, _ = ssd_sequential(xo, dto, ao, bo, co, do)
+    yo_ch, _ = ssd_chunked(xo, dto, ao, bo, co, do, lo)
+    overflow_ok = bool(mx.all(mx.isfinite(yo_ch)).item()) and _maxdiff(yo_seq, yo_ch) < 1e-3
+
+    xb, dtb, ab, bb, cbf, db = (t.astype(mx.bfloat16) for t in (xo, dto, ao, bo, co, do))
+    yb_ch, _ = ssd_chunked(xb, dtb, ab, bb, cbf, db, lo)
+    bf16_ok = bool(mx.all(mx.isfinite(yb_ch)).item()) and _maxdiff(yo_seq, yb_ch.astype(mx.float32)) < 1e-1
+
     print("\n=== Mamba-2 SSD parity (synthetic) ===")
     print(f"chunked prefill == sequential        : {chunk_ok}  maxdiff_y={_maxdiff(y_seq, y_ch):.2e}")
     print(f"decode step-loop == sequential       : {step_ok}")
     print(f"block-split + carried state == full  : {carry_ok}")
     print(f"causal conv prefill == stepwise      : {conv_ok}")
-    assert all([chunk_ok, step_ok, carry_ok, conv_ok])
-    print("Mamba-2 SSD OK (chunked == sequential == decode; conv prefill == step)")
+    print(f"overflow guard (finite + == seq)     : {overflow_ok}")
+    print(f"bf16 scan (finite + ~fp32 oracle)    : {bf16_ok}")
+    assert all([chunk_ok, step_ok, carry_ok, conv_ok, overflow_ok, bf16_ok])
+    print("Mamba-2 SSD OK (chunked==sequential==decode; conv; overflow+bf16 guarded)")
 
 
 if __name__ == "__main__":
