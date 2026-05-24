@@ -1,7 +1,7 @@
 """DeepSeek-V4 source-quant dequant gate — fp8-e4m3, packed fp4-e2m1, and e8m0/MX scales.
 
 This is the "bug we faced before" gate, in DSV4's *new* formats. The checkpoint ships two quant
-schemes, **both with OCP-Microscaling e8m0 (power-of-two) scales** (not fp32 like Kimi/MiMo):
+schemes, **both with OCP-Microscaling e8m0 (power-of-two) scales** (not fp32 like Kimi):
 
 * **non-experts** — weight ``F8_E4M3`` ``[out,in]`` + scale ``F8_E8M0`` ``[ceil(out/128),ceil(in/128)]``
   (one scale per ``[128,128]`` block). :func:`dequant_block_fp8`.
