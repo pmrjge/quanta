@@ -82,8 +82,10 @@ def run() -> None:
     ok = True
 
     def engine_for(text: str) -> QuantaOmlxEngine:
+        # model_name = the real artifact path so model_type ("kimi_k2") is detected and the engine
+        # picks the MLA stepper; the stub runtime means no model is loaded (still model-free).
         scripted = tk.encode(text, add_bos=False, allow_special=True) + [im_end]
-        return QuantaOmlxEngine("stub", runtime=_StubRuntime(scripted, vocab, im_end),
+        return QuantaOmlxEngine(ART, runtime=_StubRuntime(scripted, vocab, im_end),
                                 tokenizer=tk, eos_token_ids=set(tk.stop_ids))
 
     # --- (a) reasoning + content: raw text keeps </think>; oMLX splits it correctly ---

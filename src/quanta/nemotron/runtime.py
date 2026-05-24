@@ -108,6 +108,10 @@ class NemotronResidentModel:
         self.art.release()
         self._cmix: dict[int, object] | None = None  # lazy per-block compiled decode mixers
 
+    @property
+    def num_layers(self) -> int:
+        return len(self.layers)
+
     def _decode_mixers(self) -> dict[int, object]:
         """Compile each mamba/moe mixer's decode step once (static [1,1,H] shapes) — fuses the
         per-layer op sequence so decode launches far fewer kernels (the step is op-launch bound).

@@ -2,10 +2,11 @@
 
 Importable without oMLX: subclasses oMLX's ``BaseEngine`` when present (so it passes the
 server's ``isinstance(engine, BaseEngine)`` gate and is dispatched by the engine pool) and
-falls back to a plain class otherwise (standalone / tests). The engine owns the quanta
-runtime — it loads :class:`ResidentModel` + :class:`KimiTokenizer` from the artifact and
-decodes with the KV-cached, absorbed-MLA path — while oMLX provides the OpenAI/Anthropic
-server surface. mlx-lm is never imported.
+falls back to a plain class otherwise (standalone / tests). The engine owns the quanta runtime —
+it loads the model's resident runtime + tokenizer from the artifact (dispatched on ``model_type``)
+and decodes through a model-specific **stepper**: the KV-cached absorbed-MLA path for Kimi/DeepSeek,
+or the threaded ``(ssm, conv)`` recurrence for the Nemotron-H hybrid — while oMLX provides the
+OpenAI/Anthropic server surface. mlx-lm is never imported.
 
 Every generation kwarg from oMLX (temperature, top_p, top_k, min_p, repetition/presence
 penalties, stop) is applied; sparse XAttention prefill is on by default via the runtime.
@@ -101,9 +102,13 @@ def _default_runtime_loader(root: Path) -> tuple[RuntimeLike, TokenizerLike]:
 
         rm = ResidentModel(root)
         return rm, KimiTokenizer(root, bos_id=rm.cfg.bos_token_id)
+    if mt.startswith("nemotron"):
+        from quanta.nemotron.runtime import NemotronResidentModel
+        from quanta.nemotron.tokenizer import NemotronTokenizer
+
+        return NemotronResidentModel(root), NemotronTokenizer(root)
     raise OmlxShimError(
-        f"no resident runtime for quanta artifact model_type={mt!r} "
-        "(supported: kimi/deepseek; nemotron runtime pending)"
+        f"no resident runtime for quanta artifact model_type={mt!r} (supported: kimi/deepseek/nemotron)"
     )
 
 
@@ -194,8 +199,58 @@ class _Detok:
         return piece
 
 
+class _DecodeStepper(Protocol):
+    """Per-request decode session. ``prefill`` runs the prompt, ``step`` runs one token; both return
+    the **last-position** logits row ``[vocab]``. This is the only model-specific seam in generation —
+    it hides the call convention (MLA KV cache + absorbed decode vs. the Nemotron hybrid's threaded
+    ``(ssm, conv)`` state) so the sampling / detok / stop loop below is shared across model classes."""
+
+    def prefill(self, prompt_ids: list[int]) -> mx.array: ...
+    def step(self, tok: int) -> mx.array: ...
+
+
+class _MLAStepper:
+    """Kimi / DeepSeek (MLA): one :class:`MLACache` per layer, sparse prefill, absorbed single-token
+    decode. The caches are mutated in place; the offset is read back from cache 0 each step."""
+
+    def __init__(self, runtime: RuntimeLike, *, quantized_kv: bool, sparse: Any) -> None:
+        self._rt = runtime
+        self._sparse = sparse
+        self._caches = [MLACache(quantized=quantized_kv) for _ in range(runtime.num_layers)]
+
+    def prefill(self, prompt_ids: list[int]) -> mx.array:
+        return self._rt(mx.array(prompt_ids), caches=self._caches, sparse=self._sparse)[0, -1]
+
+    def step(self, tok: int) -> mx.array:
+        return self._rt(mx.array([tok]), caches=self._caches,
+                        offset=self._caches[0].offset, absorbed=True)[0, -1]
+
+
+class _NemotronStepper:
+    """Nemotron-H hybrid: thread per-layer state — a growing ``KVCache`` on attention layers, the
+    ``(ssm, conv)`` recurrence on mamba layers, nothing on MoE. The runtime returns
+    ``(logits, ssm, conv)``; prefill runs the chunked SSD, each step the O(1) recurrence."""
+
+    def __init__(self, runtime: Any) -> None:
+        from quanta.nemotron.generate import attn_caches
+
+        self._rt = runtime
+        self._caches = attn_caches(runtime)  # KVCache per attention layer, None elsewhere
+        self._ssm: list[Any] | None = None
+        self._conv: list[Any] | None = None
+
+    def prefill(self, prompt_ids: list[int]) -> mx.array:
+        logits, self._ssm, self._conv = self._rt(mx.array(prompt_ids), caches=self._caches)
+        return logits[0, -1]
+
+    def step(self, tok: int) -> mx.array:
+        logits, self._ssm, self._conv = self._rt(
+            mx.array([tok]), caches=self._caches, ssm=self._ssm, conv=self._conv)
+        return logits[0, -1]
+
+
 class QuantaOmlxEngine(_OmlxBaseEngine):
-    """oMLX ``BaseEngine`` backed by the quanta resident runtime (KV-cached absorbed decode)."""
+    """oMLX ``BaseEngine`` backed by the quanta resident runtime (model-specific decode stepper)."""
 
     def __init__(self, model_name: str, *, runtime: RuntimeLike | None = None,
                  tokenizer: TokenizerLike | None = None, runtime_loader=None,
@@ -280,14 +335,14 @@ class QuantaOmlxEngine(_OmlxBaseEngine):
         allow_special = bool(kwargs.pop("allow_special", False))
         quantized_kv = bool(kwargs.pop("quantized_kv", True))  # int8 latent KV by default (ppl-gated)
         prompt_ids = self._encode(prompt, add_bos=add_bos, allow_special=allow_special)
-        caches = [MLACache(quantized=quantized_kv) for _ in range(self._runtime.num_layers)]
-        logits = self._runtime(mx.array(prompt_ids), caches=caches, sparse=DEFAULT_SPARSE)  # prefill
+        stepper = self._make_stepper(quantized_kv=quantized_kv)
+        logits_row = stepper.prefill(prompt_ids)  # [vocab] at the last prompt position
         detok = _Detok(self._tokenizer)
         generated: list[int] = []
         self._active += 1
         try:
             for step in range(max_tokens):
-                tok = self._sample(logits[0, -1], temperature, top_k, top_p, min_p,
+                tok = self._sample(logits_row, temperature, top_k, top_p, min_p,
                                    repetition_penalty, presence_penalty, generated)
                 generated.append(tok)
                 finished, reason, new_text = False, None, ""
@@ -310,7 +365,7 @@ class QuantaOmlxEngine(_OmlxBaseEngine):
                     finish_reason=reason, finished=finished)
                 if finished:
                     break
-                logits = self._runtime(mx.array([tok]), caches=caches, offset=caches[0].offset, absorbed=True)
+                logits_row = stepper.step(tok)
         finally:
             self._active -= 1
 
@@ -346,6 +401,18 @@ class QuantaOmlxEngine(_OmlxBaseEngine):
         if self._tokenizer is None:
             raise OmlxShimError("engine has no tokenizer")
         return [int(t) for t in self._tokenizer.encode(text, add_bos=add_bos, allow_special=allow_special)]
+
+    def _make_stepper(self, *, quantized_kv: bool) -> _DecodeStepper:
+        """Build the per-request decode session for this artifact's model class (``model_type``).
+
+        Refuses an unknown model class loudly rather than guessing a decode convention (CLAUDE.md #6).
+        """
+        mt = self.model_type or ""
+        if mt.startswith("kimi") or mt.startswith("deepseek"):
+            return _MLAStepper(self._runtime, quantized_kv=quantized_kv, sparse=DEFAULT_SPARSE)
+        if mt.startswith("nemotron"):
+            return _NemotronStepper(self._runtime)
+        raise OmlxShimError(f"no decode stepper for quanta artifact model_type={mt!r}")
 
     def _sample(self, logits: mx.array, temperature: float, top_k: int, top_p: float, min_p: float,
                 rep: float, pres: float, prev: Sequence[int]) -> int:
