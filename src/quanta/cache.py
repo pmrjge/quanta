@@ -37,6 +37,19 @@ class MLACache:
         """Number of positions already cached (the seq axis is preserved by per-token quant)."""
         return 0 if self.c_kv is None else self.c_kv.shape[1]
 
+    def truncate(self, length: int) -> None:
+        """Drop cached positions past ``length`` (speculative-decode rollback of rejected drafts).
+
+        Per-token storage keeps the seq axis intact, so slicing is exact: the kept prefix is
+        bit-identical to having only ever appended those positions."""
+        if self.c_kv is None or length >= self.offset:
+            return
+        self.k_pe = self.k_pe[:, :, :length]
+        self.c_kv = self.c_kv[:, :length]
+        if self.quantized:
+            self.c_scales = self.c_scales[:, :length]
+            self.c_biases = self.c_biases[:, :length]
+
     def _dequant(self) -> mx.array:
         return mx.dequantize(self.c_kv, self.c_scales, self.c_biases,
                              group_size=self.group_size, bits=_BITS)

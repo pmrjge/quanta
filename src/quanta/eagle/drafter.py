@@ -61,6 +61,8 @@ class EagleDrafter(nn.Module):
         self.hidden, self.n_heads, self.head_dim = hidden, n_heads, head_dim
         self.rope_base = rope_base
         self.scale = head_dim ** -0.5
+        self.n_feature_layers = n_feature_layers
+        self.feat_norm = nn.RMSNorm(hidden, eps=eps)  # normalize each target hidden before fusing (per component)
         self.feat_proj = nn.Linear(n_feature_layers * hidden, hidden, bias=False)  # fuse low/mid/high
         self.in_proj = nn.Linear(2 * hidden, hidden, bias=False)                   # combine [embed, feature]
         self.input_norm = nn.RMSNorm(hidden, eps=eps)
@@ -74,8 +76,12 @@ class EagleDrafter(nn.Module):
 
     def reduce_target_features(self, feat3: mx.array) -> mx.array:
         """Fuse the concatenated low/mid/high target hidden states ``[B,T,3H]`` → ``[B,T,H]``.
-        Applied once (to the target features); the recurrent feature thereafter is the layer's ``x``."""
-        return self.feat_proj(feat3)
+        Each component is RMS-normalized first (deep residual-stream magnitudes vary widely by depth,
+        so raw fusion is poorly conditioned). Applied once to the target features; the recurrent
+        feature thereafter is the layer's ``x``."""
+        b, t, _ = feat3.shape
+        f = self.feat_norm(feat3.reshape(b, t, self.n_feature_layers, self.hidden))  # norm over H per component
+        return self.feat_proj(f.reshape(b, t, self.n_feature_layers * self.hidden))
 
     def _attn(self, x: mx.array, offset: int, mask, cache: DraftCache | None) -> mx.array:
         b, t, _ = x.shape
