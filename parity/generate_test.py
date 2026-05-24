@@ -35,7 +35,7 @@ def run() -> None:
 
     for absorbed in (False, True):  # expanded isolates loop mechanics; absorbed is the decode path
         gen = generate(model, prompt, max_new_tokens=K, n_layers=N_LAYERS, temperature=0.0,
-                       sparse=None, decode_absorbed=absorbed)
+                       sparse=None, decode_absorbed=absorbed, quantized_kv=False)  # bf16 KV: this gates exactness
         lf = model(mx.array(prompt + gen), n_layers=N_LAYERS, sparse=None)[0].astype(mx.float32)
         agree, max_gap = 0, 0.0
         for i, tid in enumerate(gen):

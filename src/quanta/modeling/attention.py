@@ -143,7 +143,10 @@ class MLAAttention(nn.Module):
     ) -> mx.array:
         """MLA attending over the compressed latent (decode-optimal). Explicit softmax."""
         h, nope, vhd, kv_lora = self.num_heads, self.nope, self.v_head_dim, self.cfg.kv_lora_rank
-        w = self.kv_b_proj.weight.reshape(h, nope + vhd, kv_lora)
+        kvb = self.kv_b_proj
+        wd = (mx.dequantize(kvb.weight, kvb.scales, kvb.biases, group_size=kvb.group_size, bits=kvb.bits)
+              if isinstance(kvb, nn.QuantizedLinear) else kvb.weight)  # absorb needs the dense W_UK/W_UV
+        w = wd.reshape(h, nope + vhd, kv_lora)
         w_uk, w_uv = w[:, :nope, :], w[:, nope:, :]  # [H,nope,kv_lora], [H,vhd,kv_lora]
 
         q_absorb = q_nope @ w_uk[None]  # [B,H,m,kv_lora] = q_nope folded through W_UK

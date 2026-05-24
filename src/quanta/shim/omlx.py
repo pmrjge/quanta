@@ -258,8 +258,9 @@ class QuantaOmlxEngine(_OmlxBaseEngine):
         await self.start()
         add_bos = bool(kwargs.pop("add_bos", True))
         allow_special = bool(kwargs.pop("allow_special", False))
+        quantized_kv = bool(kwargs.pop("quantized_kv", True))  # int8 latent KV by default (ppl-gated)
         prompt_ids = self._encode(prompt, add_bos=add_bos, allow_special=allow_special)
-        caches = [MLACache() for _ in range(self._runtime.num_layers)]
+        caches = [MLACache(quantized=quantized_kv) for _ in range(self._runtime.num_layers)]
         logits = self._runtime(mx.array(prompt_ids), caches=caches, sparse=DEFAULT_SPARSE)  # prefill
         detok = _Detok(self._tokenizer)
         generated: list[int] = []

@@ -16,9 +16,16 @@ GROUP_SIZE = 128
 
 
 def quantize_affine(
-    w: mx.array, bits: int, group_size: int = GROUP_SIZE
+    w: mx.array, bits: int, group_size: int = GROUP_SIZE, *, scale_dtype: mx.Dtype | None = None
 ) -> tuple[mx.array, mx.array, mx.array]:
-    """RTN affine-quantize a 2-D weight ``[out, in]`` → ``(w_q, scales, biases)`` (MLX packed)."""
+    """RTN affine-quantize a 2-D weight ``[out, in]`` → ``(w_q, scales, biases)`` (MLX packed).
+
+    ``scale_dtype`` (e.g. ``mx.bfloat16``) downcasts the weight before quantizing so MLX returns
+    scales/biases in that dtype — halving the per-group overhead vs fp32 scales (e.g. int2-g64
+    drops 3.0→2.5 bpp), and the integer codes stay consistent with the stored bf16 scales. ``None``
+    keeps the input dtype (fp32 here)."""
+    if scale_dtype is not None:
+        w = w.astype(scale_dtype)
     return mx.quantize(w, group_size=group_size, bits=bits)
 
 

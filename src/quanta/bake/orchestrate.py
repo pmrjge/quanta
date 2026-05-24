@@ -56,8 +56,9 @@ def _down_input(g: mx.array, u: mx.array, xe: mx.array) -> mx.array:
     return (nn.silu(g @ xe.T) * (u @ xe.T)).T
 
 
-def _write_int8(writer: ArtifactWriter, key: str, w: mx.array, gs: int) -> None:
-    packed, scales, biases = quantize_affine(w, 8, gs)
+def _write_int8(writer: ArtifactWriter, key: str, w: mx.array, gs: int,
+                scale_dtype: mx.Dtype | None = None) -> None:
+    packed, scales, biases = quantize_affine(w, 8, gs, scale_dtype=scale_dtype)
     writer.add_quantized(key, packed, scales, biases, 8, gs)
 
 
@@ -73,6 +74,8 @@ def bake(
     target: float = 0.08,
     group_size: int = 128,
     expert_method: str = "gptq",
+    fixed_expert_bits: dict[str, int] | None = None,
+    scale_dtype: mx.Dtype | None = None,
 ) -> dict:
     assert expert_method in ("gptq", "rtn"), f"expert_method must be 'gptq'|'rtn', got {expert_method!r}"
     cfg = KimiTextConfig.from_pretrained(source)
@@ -84,29 +87,34 @@ def bake(
     caps = capture_calibration(ck, cfg, calib_ids, n_layers=n)
     cap_of = dict(zip(moe_layers, caps))
 
-    # PASS 1 — sensitivities (cheap RTN proxy) → global DP allocation
-    projs: list[Projection] = []
-    for li in moe_layers:
-        ln2, idx = cap_of[li]
-        for e in experts:
-            xe = expert_rows(ln2, idx, e)
-            g, u, d = (_dequant_expert(ck, cfg, li, e, p) for p in _EXPERT_PROJS)
-            xd = _down_input(g, u, xe) if xe.shape[0] > 0 else xe  # cold: skip empty matmul
-            for proj, w, x in (("gate_proj", g, xe), ("up_proj", u, xe), ("down_proj", d, xd)):
-                key = f"{TEXT_PREFIX}layers.{li}.mlp.experts.{e}.{proj}"
-                projs.append(Projection(key, w.size,
-                                        activation_weighted_error(w, x, 3, group_size),
-                                        activation_weighted_error(w, x, 4, group_size)))
-            ck.release()
-    budget = expert_byte_budget if expert_byte_budget is not None else sum(p.params for p in projs) * BPP[4] / 8
-    bits_map, total_err, used = allocate_bits(projs, budget, target)
+    if fixed_expert_bits is not None:  # explicit per-projection widths — skip the sensitivity DP
+        bits_map = {f"{TEXT_PREFIX}layers.{li}.mlp.experts.{e}.{proj}": fixed_expert_bits[proj]
+                    for li in moe_layers for e in experts for proj in _EXPERT_PROJS}
+        total_err, used = 0.0, 0.0
+    else:
+        # PASS 1 — sensitivities (cheap RTN proxy) → global DP allocation
+        projs: list[Projection] = []
+        for li in moe_layers:
+            ln2, idx = cap_of[li]
+            for e in experts:
+                xe = expert_rows(ln2, idx, e)
+                g, u, d = (_dequant_expert(ck, cfg, li, e, p) for p in _EXPERT_PROJS)
+                xd = _down_input(g, u, xe) if xe.shape[0] > 0 else xe  # cold: skip empty matmul
+                for proj, w, x in (("gate_proj", g, xe), ("up_proj", u, xe), ("down_proj", d, xd)):
+                    key = f"{TEXT_PREFIX}layers.{li}.mlp.experts.{e}.{proj}"
+                    projs.append(Projection(key, w.size,
+                                            activation_weighted_error(w, x, 3, group_size),
+                                            activation_weighted_error(w, x, 4, group_size)))
+                ck.release()
+        budget = expert_byte_budget if expert_byte_budget is not None else sum(p.params for p in projs) * BPP[4] / 8
+        bits_map, total_err, used = allocate_bits(projs, budget, target)
 
     # PASS 2 — write the artifact
     writer = ArtifactWriter(out_dir, Path(source) / "config.json")
     if include_head:
-        _write_int8(writer, f"{TEXT_PREFIX}embed_tokens", ck.read(f"{TEXT_PREFIX}embed_tokens.weight"), group_size)
+        _write_int8(writer, f"{TEXT_PREFIX}embed_tokens", ck.read(f"{TEXT_PREFIX}embed_tokens.weight"), group_size, scale_dtype)
         writer.add_dense(f"{TEXT_PREFIX}norm.weight", ck.read(f"{TEXT_PREFIX}norm.weight"))
-        _write_int8(writer, "language_model.lm_head", ck.read("language_model.lm_head.weight"), group_size)
+        _write_int8(writer, "language_model.lm_head", ck.read("language_model.lm_head.weight"), group_size, scale_dtype)
         ck.release()
 
     for i in range(n):
@@ -117,7 +125,7 @@ def bake(
                 if suf in NORM_SUFFIXES:
                     writer.add_dense(pre + suf, w[suf])
                 else:
-                    _write_int8(writer, pre + suf[: -len(".weight")], w[suf], group_size)
+                    _write_int8(writer, pre + suf[: -len(".weight")], w[suf], group_size, scale_dtype)
             ck.release()
             mx.clear_cache()  # drop the MLX buffer-cache high-water between layers
             continue
@@ -127,7 +135,7 @@ def bake(
             if suf in NORM_SUFFIXES or suf.startswith("mlp.gate.") or suf.startswith("mlp.shared_experts."):
                 writer.add_dense(pre + suf, arr)  # router + shared + norms stay bf16
             else:
-                _write_int8(writer, pre + suf[: -len(".weight")], arr, group_size)  # attention int8
+                _write_int8(writer, pre + suf[: -len(".weight")], arr, group_size, scale_dtype)  # attention int8
         ln2, idx = cap_of[i]
         ex_w: dict[int, dict[str, mx.array]] = {}  # dequantized expert weights (one layer resident)
         ex_x: dict[int, dict[str, mx.array]] = {}  # per-expert calibration input (GPTQ only)
@@ -145,14 +153,16 @@ def bake(
             for e in experts:
                 for proj in _EXPERT_PROJS:
                     key = f"{pre}mlp.experts.{e}.{proj}"
-                    writer.add_quantized(key, *quantize_affine(ex_w[e][proj], bits_map[key], group_size),
+                    writer.add_quantized(key, *quantize_affine(ex_w[e][proj], bits_map[key], group_size,
+                                                               scale_dtype=scale_dtype),
                                          bits_map[key], group_size)
         else:  # GPTQ error-feedback per width, batched in chunks; cold experts fall back to RTN
             for proj in _EXPERT_PROJS:
                 for e in experts:
                     if ex_x[e][proj].shape[0] == 0:
                         key = f"{pre}mlp.experts.{e}.{proj}"
-                        writer.add_quantized(key, *quantize_affine(ex_w[e][proj], bits_map[key], group_size),
+                        writer.add_quantized(key, *quantize_affine(ex_w[e][proj], bits_map[key], group_size,
+                                                                   scale_dtype=scale_dtype),
                                              bits_map[key], group_size)
                 for bits in (3, 4):
                     grp = [e for e in experts if ex_x[e][proj].shape[0] > 0
@@ -162,6 +172,8 @@ def bake(
                         ws = mx.stack([ex_w[e][proj] for e in chunk])
                         codes, scales, biases = gptq_quantize_batch(
                             ws, [ex_x[e][proj] for e in chunk], bits, group_size=group_size)
+                        if scale_dtype is not None:  # keep warm/cold expert scales one dtype (mx.stack at load)
+                            scales, biases = scales.astype(scale_dtype), biases.astype(scale_dtype)
                         for ci, e in enumerate(chunk):
                             key = f"{pre}mlp.experts.{e}.{proj}"
                             writer.add_quantized(key, pack_affine(codes[ci].astype(mx.uint32), bits),
@@ -169,8 +181,9 @@ def bake(
         del ex_w, ex_x
         mx.clear_cache()  # drop the MLX buffer-cache high-water between layers
 
-    policy = {"experts": f"int3/int4 {expert_method} g128", "non_experts": "int8 g128",
-              "shared": "bf16", "norms": "bf16", "target_error": target}
+    scale_tag = "bf16" if scale_dtype == mx.bfloat16 else "fp32"
+    policy = {"experts": f"int3/int4 {expert_method} g{group_size}", "non_experts": f"int8 g{group_size}",
+              "shared": "bf16", "norms": "bf16", "scales": scale_tag, "target_error": target}
     writer.finalize(policy)
     return {"layers": n, "experts": len(experts), "alloc_error": total_err, "expert_bytes": used,
             "int4_projections": sum(v == 4 for v in bits_map.values()), "projections": len(bits_map)}

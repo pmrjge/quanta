@@ -77,6 +77,7 @@ def generate(
     seed: int = 0,
     sparse: XAttnConfig | None = DEFAULT_SPARSE,
     decode_absorbed: bool = True,
+    quantized_kv: bool = True,
 ) -> list[int]:
     """Greedily/with-sampling generate up to ``max_new_tokens`` token ids after ``prompt_ids``.
 
@@ -89,9 +90,12 @@ def generate(
     memory-light at long context (attends the compressed latent, no per-head K/V), bf16-close to
     expanded. The loop+cache itself is bit-exact vs one-shot recompute — pass
     ``decode_absorbed=False`` for an exact (heavier) decode.
+
+    ``quantized_kv=True`` (default) stores the MLA latent as int8 (per-token, ppl-gated — the
+    teacher-forced Δppl is <1%); pass ``quantized_kv=False`` for a bf16 (exact) cache.
     """
     n = model.cfg.num_hidden_layers if n_layers is None else n_layers
-    caches = [MLACache() for _ in range(n)]
+    caches = [MLACache(quantized=quantized_kv) for _ in range(n)]  # int8 latent KV (ppl-gated default)
 
     # prefill: expanded MLA (+ optional sparse), fills the per-layer latent caches
     logits = model(

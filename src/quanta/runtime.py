@@ -88,7 +88,8 @@ def build_resident_layer(art: ResidentArtifact, layer_idx: int):
 
     layer = MoEDecoderLayer(cfg)
     _load_quant_attention(layer, art, pre)
-    qmoe = QuantizedSparseMoE(cfg)
+    egs = art.manifest[f"{pre}mlp.experts.0.gate_proj"]["group_size"]  # bake-wide uniform; gather_qmm takes one
+    qmoe = QuantizedSparseMoE(cfg, group_size=egs)
     qmoe.gate.weight = art.get(f"{pre}mlp.gate.weight")
     qmoe.gate.e_score_correction_bias = art.get(f"{pre}mlp.gate.e_score_correction_bias")
     for proj in ("gate_proj", "up_proj", "down_proj"):
