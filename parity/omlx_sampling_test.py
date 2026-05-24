@@ -6,7 +6,8 @@ covers Kimi and Nemotron. Checks:
   (a) ``_apply_penalties`` math — repetition (CTRL/HF multiplicative), frequency (count-scaled
       subtraction), presence (flat subtraction), and the no-op fast paths;
   (b) end-to-end through the engine: an eos-less degenerate runtime is bounded by ``max_tokens``
-      (a loop can never run unbounded), and ``frequency_penalty`` breaks a single-token loop.
+      (a loop can never run unbounded), and ``frequency_penalty`` breaks a single-token loop;
+  (c) ``seed`` makes temperature sampling reproducible (same seed identical, different seed differs).
 
     uv run python -m parity.omlx_sampling_test
 """
@@ -35,6 +36,19 @@ class _FixedRuntime:
     def __call__(self, token_ids, *, caches=None, ssm=None, conv=None, **kw):
         t = int(token_ids.shape[0])
         row = mx.full((V,), -50.0).at[A].add(60.0).at[B].add(59.0)  # logit[A]=10, logit[B]=9
+        return mx.broadcast_to(row, (1, t, V)), [mx.zeros((1,))], [mx.zeros((1,))]
+
+
+class _UniformRuntime:
+    """Broad fixed logits (tokens 0..9 equal, rest ~-inf), never eos — entropy for the seed checks."""
+
+    def __init__(self) -> None:
+        self.cfg = SimpleNamespace(layers_block_type=["mamba"])
+        self.num_layers = 1
+
+    def __call__(self, token_ids, *, caches=None, ssm=None, conv=None, **kw):
+        t = int(token_ids.shape[0])
+        row = mx.where(mx.arange(V) < 10, 0.0, -50.0)
         return mx.broadcast_to(row, (1, t, V)), [mx.zeros((1,))], [mx.zeros((1,))]
 
 
@@ -96,6 +110,18 @@ def run() -> None:
     good = B in last.tokens and last.finish_reason == "length"
     ok = ok and good
     print(f"  [{'OK' if good else 'FAIL'}] frequency_penalty breaks loop: tokens={last.tokens}")
+
+    # (c) seed -> reproducible sampling: same seed identical, different seed differs (temp>0)
+    def _gen(seed: int) -> list[int]:
+        eng = QuantaOmlxEngine(NEM_ART, runtime=_UniformRuntime(), tokenizer=_Tok(), eos_token_ids={11})
+        return asyncio.run(_collect(eng, max_tokens=16, temperature=1.0, top_p=1.0, seed=seed))[-1].tokens
+
+    s1, s1b, s2 = _gen(123), _gen(123), _gen(456)
+    good = s1 == s1b and s1 != s2 and all(t < 10 for t in s1)
+    ok = ok and good
+    print(f"  [{'OK' if good else 'FAIL'}] seed: same-seed identical={s1 == s1b} diff-seed differs={s1 != s2}")
+    print(f"             seed123={s1}")
+    print(f"             seed456={s2}")
 
     print("PASS" if ok else "FAIL")
 

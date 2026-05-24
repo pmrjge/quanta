@@ -9,9 +9,10 @@ or the threaded ``(ssm, conv)`` recurrence for the Nemotron-H hybrid — while o
 OpenAI/Anthropic server surface. mlx-lm is never imported.
 
 Every generation kwarg from oMLX (temperature, top_p, top_k, min_p, repetition/frequency/presence
-penalties, stop strings) is applied — for both model classes, since only the decode stepper differs
-and the sampling/stop loop is shared. Generation always stops on the model's eos/stop token ids and
-the ``max_tokens`` cap, so it can never run unbounded. Sparse XAttention prefill is on by default.
+penalties, stop strings, and a per-request ``seed`` for reproducible sampling) is applied — for both
+model classes, since only the decode stepper differs and the sampling/stop loop is shared. Generation
+always stops on the model's eos/stop token ids and the ``max_tokens`` cap, so it can never run
+unbounded. Sparse XAttention prefill is on by default.
 
 The engine is a thin **raw-output** token producer: it decodes ordinary text byte-accurately and
 renders special-token markers (``</think>``, ``<|tool_calls_section_begin|>`` …) as their literal
@@ -337,21 +338,22 @@ class QuantaOmlxEngine(_OmlxBaseEngine):
     async def generate(self, prompt: str, max_tokens: int = 256, temperature: float = 0.0,
                        top_p: float = 0.9, top_k: int = 0, min_p: float = 0.0,
                        repetition_penalty: float = 1.0, frequency_penalty: float = 0.0,
-                       presence_penalty: float = 0.0,
+                       presence_penalty: float = 0.0, seed: int | None = None,
                        stop: list[str] | None = None, **kwargs: Any) -> Any:
         last = None
         async for chunk in self.stream_generate(prompt, max_tokens=max_tokens, temperature=temperature,
                                                 top_p=top_p, top_k=top_k, min_p=min_p,
                                                 repetition_penalty=repetition_penalty,
                                                 frequency_penalty=frequency_penalty,
-                                                presence_penalty=presence_penalty, stop=stop, **kwargs):
+                                                presence_penalty=presence_penalty, seed=seed,
+                                                stop=stop, **kwargs):
             last = chunk
         return last or self._output_cls(text="", finish_reason="length")
 
     async def stream_generate(self, prompt: str, max_tokens: int = 256, temperature: float = 0.0,
                               top_p: float = 0.9, top_k: int = 0, min_p: float = 0.0,
                               repetition_penalty: float = 1.0, frequency_penalty: float = 0.0,
-                              presence_penalty: float = 0.0,
+                              presence_penalty: float = 0.0, seed: int | None = None,
                               stop: list[str] | None = None, **kwargs: Any) -> AsyncIterator[Any]:
         await self.start()
         add_bos = bool(kwargs.pop("add_bos", True))
@@ -360,13 +362,18 @@ class QuantaOmlxEngine(_OmlxBaseEngine):
         prompt_ids = self._encode(prompt, add_bos=add_bos, allow_special=allow_special)
         stepper = self._make_stepper(quantized_kv=quantized_kv)
         logits_row = stepper.prefill(prompt_ids)  # [vocab] at the last prompt position
+        rng = mx.random.key(seed) if seed is not None else None  # per-request PRNG -> reproducible sampling
         detok = _Detok(self._tokenizer)
         generated: list[int] = []
         self._active += 1
         try:
             for step in range(max_tokens):
+                if rng is not None:
+                    rng, sub = mx.random.split(rng)  # one fresh subkey per step (deterministic from seed)
+                else:
+                    sub = None
                 tok = self._sample(logits_row, temperature, top_k, top_p, min_p,
-                                   repetition_penalty, frequency_penalty, presence_penalty, generated)
+                                   repetition_penalty, frequency_penalty, presence_penalty, generated, sub)
                 generated.append(tok)
                 finished, reason, new_text = False, None, ""
                 if tok in self._eos:
@@ -455,7 +462,8 @@ class QuantaOmlxEngine(_OmlxBaseEngine):
         raise OmlxShimError(f"no decode stepper for quanta artifact model_type={mt!r}")
 
     def _sample(self, logits: mx.array, temperature: float, top_k: int, top_p: float, min_p: float,
-                rep: float, freq: float, pres: float, prev: Sequence[int]) -> int:
+                rep: float, freq: float, pres: float, prev: Sequence[int],
+                key: mx.array | None = None) -> int:
         lg = _apply_penalties(logits.astype(mx.float32), prev, rep, freq, pres)
         if temperature <= 0.0:
             tok = mx.argmax(lg)
@@ -465,7 +473,7 @@ class QuantaOmlxEngine(_OmlxBaseEngine):
                 kth = mx.sort(lg)[lg.shape[0] - top_k]
                 lg = mx.where(lg < kth, mx.array(-mx.inf), lg)
             lg = _apply_min_p(_apply_top_p(lg, top_p), min_p)
-            tok = mx.random.categorical(lg)
+            tok = mx.random.categorical(lg, key=key)  # key=None -> global RNG; a key -> reproducible
         mx.eval(tok)
         return int(tok.item())
 
