@@ -192,10 +192,15 @@ class ResidentModel:
         self, token_ids: mx.array, *, n_layers: int | None = None, use_fast: bool = True,
         caches: list | None = None, offset: int = 0,
         sparse: XAttnConfig | None = DEFAULT_SPARSE, absorbed: bool = False,
-    ) -> mx.array:
+        capture_layers: tuple[int, ...] | None = None,
+    ):
+        """Returns logits, or ``(logits, {i: hidden_i [T,H]})`` when ``capture_layers`` is set —
+        the residual stream after the listed decoder layers, for EAGLE-3 feature capture."""
         n = len(self.layers) if n_layers is None else n_layers
         h = self.embed(token_ids)[None].astype(mx.bfloat16)
         pos = mx.arange(offset, offset + h.shape[1])
+        caps: dict[int, mx.array] = {}
+        cap_set = set(capture_layers) if capture_layers else set()
         for i in range(n):
             layer = self.layers[i]
             if sparse is not None and isinstance(layer.mlp, QuantizedSparseMoE):
@@ -203,9 +208,13 @@ class ResidentModel:
             layer.self_attn.absorbed = absorbed
             cache = caches[i] if caches is not None else None
             h = layer(h, pos, use_fast=use_fast, cache=cache)
+            if i in cap_set:
+                caps[i] = h[0]  # [T, H] residual stream after layer i
             if cache is not None:
                 mx.eval(h, cache.c_kv, cache.k_pe)
             else:
                 mx.eval(h)
+        if cap_set:
+            return self.lm_head(mx.fast.rms_norm(h, self.norm_w, self.cfg.rms_norm_eps)), caps
         h = mx.fast.rms_norm(h, self.norm_w, self.cfg.rms_norm_eps)
         return self.lm_head(h)
