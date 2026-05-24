@@ -9,6 +9,7 @@ requires-python = ">=3.13"
 dependencies = [
     "mlx>=0.31.2",
     "numpy>=2.4.6",
+    "regex>=2026.5.9",
     "torch>=2.12.0",
     "tqdm>=4.67.3",
 ]
@@ -42,3 +43,8 @@ testpaths = ["tests"]
 line-length = 100
 target-version = "py313"
 src = ["src", "tests"]
+
+[tool.ruff.lint.per-file-ignores]
+# Byte-faithful vendored copy of the DeepSeek-V4 reference encoder (checkpoint encoding_dsv4.py);
+# its body is intentionally left unmodified, so its style is not linted.
+"src/quanta/dsv4/encoding.py" = ["E722", "F841"]
