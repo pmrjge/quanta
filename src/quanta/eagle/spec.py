@@ -6,12 +6,12 @@ bonus (the target's correct token at the first mismatch). Output is therefore **
 plain greedy decode** regardless of drafter quality — the drafter only changes *speed* (tokens
 accepted per target forward), never correctness.
 
-Feature flow (matches how the drafter was trained: ``drafter(hidden[t], embed[token[t]]) →
-token[t+1]``): each round warms up the drafter on the last *real* target feature + token (producing
-its recurrent hidden ``x`` ≈ the next target hidden), then self-feeds ``x`` for the ``k`` draft
-steps. After verify, the target's captured hidden at the last accepted position becomes the next
-round's real feature. The MLA cache is rolled back (``truncate``) to drop rejected drafts so it
-stays bit-exact.
+Feature flow (matches training, :func:`quanta.eagle.train._ce_multistep`): each draft step feeds the
+previous reduced feature ``f`` (the real target feature on step 0, the drafter's own **normalized**
+output ``normed`` thereafter) plus the *next* token's embedding, and the frozen head maps the output
+to the next draft token. After verify, the target's captured hidden at the last accepted position
+becomes the next round's real feature. The MLA cache is rolled back (``truncate``) to drop rejected
+drafts so it stays bit-exact.
 """
 
 from __future__ import annotations
@@ -48,23 +48,23 @@ def spec_generate(
 
     q = len(prompt_ids) - 1                        # last position with a real target hidden
     feat3 = _feat3(caps, layers, -1)               # target feature at position q
-    tok_prev = int(prompt_ids[-1])                 # token at position q
     cur = int(mx.argmax(logits[0, -1]).item())     # verified token at position q+1
     out = [cur]
     accept_lens: list[int] = []
     stop = eos_id is not None and cur == eos_id
 
     while len(out) < max_new and not stop:
-        # --- draft k tokens: warm up on the real feature, then self-feed x ---
+        # --- draft k tokens canonically: step(f_{q+j}, e_{q+1+j}) -> f_{q+1+j} -> token_{q+2+j};
+        #     the recurrent feature is the normalized output (matches training + the reduced feature) ---
         dc = DraftCache()
-        xf, _ = drafter.step(drafter.reduce_target_features(feat3), embed[tok_prev][None, None],
-                             offset=q, cache=dc, mask=None)
+        feat = drafter.reduce_target_features(feat3)   # real reduced target feature f_q
         drafts: list[int] = []
         tok = cur
         for j in range(k):
-            xf, normed = drafter.step(xf, embed[tok][None, None], offset=q + 1 + j, cache=dc, mask=None)
+            _, normed = drafter.step(feat, embed[tok][None, None], offset=q + 1 + j, cache=dc, mask=None)
             tok = int(mx.argmax(normed[0, 0] @ head_t).item())
             drafts.append(tok)
+            feat = normed                              # self-feed the normalized recurrent feature
 
         # --- verify: one target forward over [cur, d1..dk] at offset q+1 ---
         vin = [cur] + drafts
@@ -85,7 +85,6 @@ def spec_generate(
         for c in caches:                            # keep [cur] + j accepted drafts; drop rejected
             c.truncate((q + 1) + (j + 1))
         feat3 = _feat3(vcaps, layers, j)            # real target hidden at the last accepted position
-        tok_prev = vin[j]
         q = q + 1 + j
         cur = bonus
         if eos_id is not None and (bonus == eos_id or eos_id in drafts[:j]):
