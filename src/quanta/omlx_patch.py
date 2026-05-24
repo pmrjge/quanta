@@ -23,7 +23,7 @@ from typing import Any
 PATCH_VERSION = "0.1.0"
 PATCH_MARKER = "__quanta_omlx_autopatch__"
 _ENV_FLAG = "QUANTA_OMLX_AUTOPATCH"
-_TARGETS = frozenset({"omlx.model_discovery", "omlx.engine_pool"})
+_TARGETS = frozenset({"omlx.model_discovery", "omlx.engine_pool", "omlx.api.tool_calling"})
 
 # engine registry: engine_type -> (detect(path)->bool, factory(model_path)->BaseEngine)
 EngineFactory = Callable[[str], Any]
@@ -94,7 +94,8 @@ def _patch_loaded() -> None:
 
 def _patch_module(name: str, module: ModuleType) -> None:
     {"omlx.model_discovery": _patch_model_discovery,
-     "omlx.engine_pool": _patch_engine_pool}[name](module)
+     "omlx.engine_pool": _patch_engine_pool,
+     "omlx.api.tool_calling": _patch_tool_calling}[name](module)
     setattr(module, PATCH_MARKER, PATCH_VERSION)
 
 
@@ -173,3 +174,29 @@ def _patch_engine_pool(module: ModuleType) -> None:
             self._current_model_memory += getattr(entry, "estimated_size", 0)
 
     module.EnginePool._load_engine = _load_engine
+
+
+def _patch_tool_calling(module: ModuleType) -> None:
+    """Teach oMLX's ``parse_tool_calls`` the Kimi-K2.6 tool-call format.
+
+    oMLX's built-in registry has no Kimi parser, and our custom tokenizer exposes no mlx-lm tool
+    hooks, so Kimi tool markup falls through unparsed. The raw-output engine surfaces the markers as
+    literal text (``clean_special_tokens`` keeps them), so we wrap ``parse_tool_calls`` to extract
+    Kimi calls first and delegate everything else to the original parser."""
+    from quanta.shim.kimi_tools import parse_kimi_tool_calls
+
+    orig = module.parse_tool_calls
+
+    def parse_tool_calls(text: str, tokenizer: Any = None, tools: Any = None):
+        parsed = parse_kimi_tool_calls(text)
+        if parsed is None:  # not Kimi markup → original registry (xml/json/gemma/glm/qwen/...)
+            return orig(text, tokenizer, tools)
+        from omlx.api.openai_models import FunctionCall, ToolCall
+
+        cleaned, calls = parsed
+        tcs = [ToolCall(id=c["id"], type="function",
+                        function=FunctionCall(name=c["name"], arguments=c["arguments"]))
+               for c in calls] or None
+        return cleaned, tcs
+
+    module.parse_tool_calls = parse_tool_calls

@@ -9,6 +9,12 @@ server surface. mlx-lm is never imported.
 
 Every generation kwarg from oMLX (temperature, top_p, top_k, min_p, repetition/presence
 penalties, stop) is applied; sparse XAttention prefill is on by default via the runtime.
+
+The engine is a thin **raw-output** token producer: it decodes ordinary text byte-accurately and
+renders special-token markers (``</think>``, ``<|tool_calls_section_begin|>`` …) as their literal
+strings, but does **not** parse the model output itself. Reasoning and tool-call extraction are
+oMLX's responsibility — its server splits ``<think>…</think>`` with its own thinking parser and reads
+tool calls via its own parsers — so we conform to oMLX's contract rather than pre-parsing here.
 """
 
 from __future__ import annotations
@@ -135,17 +141,22 @@ def _earliest_stop(text: str, stops: Sequence[str]) -> int | None:
 
 
 class _Detok:
-    """Incremental detokenizer for streaming.
+    """Incremental **raw-output** detokenizer for streaming.
 
-    Byte-accurate when the tokenizer exposes ``decode_bytes`` (the real path): accumulate
-    raw bytes and flush only complete UTF-8, so a multi-byte token split across steps never
-    surfaces as a replacement char. Falls back to delta-on-decoded-string for tokenizers
-    that only expose ``decode`` (test stubs). ``text`` is the cumulative decoded output.
+    Special tokens (``</think>``, ``<|tool_calls_section_begin|>`` …) are emitted as their literal
+    marker strings (via the tokenizer's ``id_to_special`` map) so the oMLX server's reasoning/tool
+    parsers can act on them — the eos tokens are handled by the caller and never reach here. Ordinary
+    tokens use the byte-accurate UTF-8 path (``decode_bytes``): accumulate raw bytes and flush only
+    complete UTF-8, so a multi-byte token split across steps never surfaces as a replacement char.
+    Falls back to delta-on-decoded-string for tokenizers that expose only ``decode`` (test stubs).
+    ``text`` is the cumulative decoded output.
     """
 
     def __init__(self, tokenizer: TokenizerLike | None) -> None:
         self._tk = tokenizer
         self._bytes_ok = tokenizer is not None and hasattr(tokenizer, "decode_bytes")
+        self._n_base = getattr(tokenizer, "n_base", None)
+        self._id2sp = getattr(tokenizer, "id_to_special", None) or {}
         self._buf = b""
         self._ids: list[int] = []
         self.text = ""
@@ -153,6 +164,15 @@ class _Detok:
     def add(self, tid: int) -> str:
         if self._tk is None:
             raise OmlxShimError("detokenizer has no tokenizer")
+        tid = int(tid)
+        if self._n_base is not None and tid >= self._n_base:  # special token → literal marker (raw)
+            piece = ""
+            if self._buf:  # a partial ordinary byte can't complete across a special; flush it
+                piece += self._buf.decode("utf-8", "replace")
+                self._buf = b""
+            piece += self._id2sp.get(tid, "")
+            self.text += piece
+            return piece
         if self._bytes_ok:
             self._buf += bytes(self._tk.decode_bytes([tid]))
             try:
@@ -274,7 +294,7 @@ class QuantaOmlxEngine(_OmlxBaseEngine):
                 if tok in self._eos:
                     finished, reason = True, "stop"  # eos itself has no visible text
                 else:
-                    new_text = detok.add(tok)
+                    new_text = detok.add(tok)  # raw output incl. </think> and tool-section markers
                 text = detok.text
                 if not finished and stop:  # stop string: cut it (and anything after) from the output
                     cut = _earliest_stop(text, stop)
@@ -309,10 +329,15 @@ class QuantaOmlxEngine(_OmlxBaseEngine):
 
     # --- internals -------------------------------------------------------------
     def _format(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None) -> tuple[str, bool]:
-        """Return (prompt, templated): templated=True when the tokenizer's chat template was used."""
+        """Return (prompt, templated): templated=True when the tokenizer's chat template was used.
+
+        The tokenizer's ``apply_chat_template`` renders the OpenAI messages + tools into the model's
+        native prompt; the engine does not pre-parse output, so reasoning/tool extraction is left to
+        the oMLX server (which owns the OpenAI/Anthropic response shaping)."""
         tk = self._tokenizer
         if tk is not None and hasattr(tk, "apply_chat_template"):
-            text = tk.apply_chat_template(messages, tokenize=False, add_generation_prompt=True, tools=tools or None)
+            text = tk.apply_chat_template(messages, tokenize=False, add_generation_prompt=True,
+                                          tools=tools or None)
             return str(text), True
         body = "\n".join(f"{m.get('role', 'user')}: {m.get('content', '')}" for m in messages)
         return body + "\nassistant:", False

@@ -67,6 +67,7 @@ class KimiTokenizer:
         self.encoding = tiktoken.Encoding(
             name="kimi", pat_str=_PAT_STR, mergeable_ranks=ranks, special_tokens=self.special_tokens
         )
+        self.id_to_special: dict[int, str] = {v: k for k, v in self.special_tokens.items()}
         self.bos_id = bos_id
         # Generation eos = <|im_end|> (config.json / generation_config.json eos_token_id == 163586),
         # which differs from the tokenizer's nominal [EOS]=163585. Stop on both, plus end-of-turn [EOT].
