@@ -17,10 +17,43 @@ import mlx.nn as nn
 
 from quanta.nemotron.attention import NemotronAttention
 from quanta.nemotron.config import NemotronHConfig
+from quanta.nemotron.loader import NemotronSourceCheckpoint
 from quanta.nemotron.mamba_mixer import MambaMixer
 from quanta.nemotron.moe import NemotronLatentMoE
 
 _MIXER = {"mamba": MambaMixer, "attention": NemotronAttention, "moe": NemotronLatentMoE}
+
+
+def load_block(block: "NemotronBlock", ck: NemotronSourceCheckpoint, cfg: NemotronHConfig, i: int) -> None:
+    """Load one layer's real bf16 weights from the source checkpoint into a built block.
+
+    Direct attribute assignment (the modules mix ``nn.Linear``/``nn.RMSNorm`` with raw-array
+    params); ``ck.read`` already materializes each tensor, so the shard mmaps can be released
+    after. The per-layer pre-norm is ``layer_norm``; the mamba mixer's own gated norm is
+    ``norm.weight``.
+    """
+    m = block.mixer
+    if block.kind == "mamba":
+        t = ck.mamba_tensors(i)
+        m.in_proj.weight, m.out_proj.weight = t["in_proj.weight"], t["out_proj.weight"]
+        m.norm.weight = t["norm.weight"]
+        m.conv_weight, m.conv_bias = t["conv1d.weight"], t["conv1d.bias"]
+        m.A_log, m.D, m.dt_bias = t["A_log"], t["D"], t["dt_bias"]
+    elif block.kind == "attention":
+        t = ck.attention_tensors(i)
+        m.q_proj.weight, m.k_proj.weight = t["q_proj.weight"], t["k_proj.weight"]
+        m.v_proj.weight, m.o_proj.weight = t["v_proj.weight"], t["o_proj.weight"]
+    else:  # moe
+        t = ck.moe_nonexpert_tensors(i)
+        m.gate_weight = t["gate.weight"]
+        m.e_score_correction_bias = t["gate.e_score_correction_bias"]
+        m.fc1_latent_proj.weight = t["fc1_latent_proj.weight"]
+        m.fc2_latent_proj.weight = t["fc2_latent_proj.weight"]
+        m.shared_up.weight = t["shared_experts.up_proj.weight"]
+        m.shared_down.weight = t["shared_experts.down_proj.weight"]
+        es = ck.expert_stacks(i, cfg.n_routed_experts)
+        m.set_experts(es["up"], es["down"])
+    block.norm.weight = t["layer_norm"]
 
 
 class NemotronBlock(nn.Module):
