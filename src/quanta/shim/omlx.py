@@ -8,8 +8,10 @@ and decodes through a model-specific **stepper**: the KV-cached absorbed-MLA pat
 or the threaded ``(ssm, conv)`` recurrence for the Nemotron-H hybrid — while oMLX provides the
 OpenAI/Anthropic server surface. mlx-lm is never imported.
 
-Every generation kwarg from oMLX (temperature, top_p, top_k, min_p, repetition/presence
-penalties, stop) is applied; sparse XAttention prefill is on by default via the runtime.
+Every generation kwarg from oMLX (temperature, top_p, top_k, min_p, repetition/frequency/presence
+penalties, stop strings) is applied — for both model classes, since only the decode stepper differs
+and the sampling/stop loop is shared. Generation always stops on the model's eos/stop token ids and
+the ``max_tokens`` cap, so it can never run unbounded. Sparse XAttention prefill is on by default.
 
 The engine is a thin **raw-output** token producer: it decodes ordinary text byte-accurately and
 renders special-token markers (``</think>``, ``<|tool_calls_section_begin|>`` …) as their literal
@@ -35,6 +37,12 @@ try:  # subclass oMLX's engine ABC when the host is present; stay importable wit
     from omlx.engine.base import BaseEngine as _OmlxBaseEngine
 except Exception:  # pragma: no cover - standalone use
     _OmlxBaseEngine = object
+
+# Request kwargs that drive the chat TEMPLATE (not sampling) — forwarded to apply_chat_template.
+# Kimi's template reads ``thinking``/``preserve_thinking``; Nemotron's reads ``enable_thinking``
+# (+ ``truncate_history_thinking`` via chat_template_kwargs); ``reasoning_effort`` is forwarded for
+# templates that use it (e.g. DSV4) and harmlessly ignored by templates that don't.
+_TEMPLATE_KEYS = ("thinking", "enable_thinking", "preserve_thinking", "reasoning_effort")
 
 
 class OmlxShimError(RuntimeError):
@@ -112,14 +120,26 @@ def _default_runtime_loader(root: Path) -> tuple[RuntimeLike, TokenizerLike]:
     )
 
 
-def _apply_penalties(logits: mx.array, prev: Sequence[int] | None, rep: float, pres: float) -> mx.array:
-    if not prev or (rep == 1.0 and pres == 0.0):
+def _apply_penalties(logits: mx.array, prev: Sequence[int] | None, rep: float, freq: float,
+                     pres: float) -> mx.array:
+    """Repetition (CTRL/HF multiplicative) + frequency/presence (OpenAI additive) penalties.
+
+    ``rep`` divides (logit>0) / multiplies (logit<0) the logit of any previously-emitted token; ``freq``
+    subtracts ``count(token)·freq`` (scales with how often it was emitted); ``pres`` subtracts a flat
+    ``pres`` for any token emitted at least once. All three touch only tokens that already appeared, so
+    unseen tokens are unchanged. ``freq``/``pres`` discourage the repetition that makes models loop.
+    """
+    if not prev or (rep == 1.0 and freq == 0.0 and pres == 0.0):
         return logits
-    idx = mx.array(sorted({int(t) for t in prev}), dtype=mx.int32)
-    seen = mx.zeros(logits.shape[0]).at[idx].add(1.0) > 0
-    pen = mx.where(logits > 0, logits / rep, logits * rep) if rep != 1.0 else logits
-    pen = pen - pres if pres != 0.0 else pen
-    return mx.where(seen, pen, logits)
+    toks = mx.array([int(t) for t in prev], dtype=mx.int32)
+    counts = mx.zeros(logits.shape[0]).at[toks].add(1.0)  # per-token emission count (repeats accumulate)
+    seen = counts > 0
+    out = logits
+    if rep != 1.0:
+        out = mx.where(seen, mx.where(out > 0, out / rep, out * rep), out)
+    if freq != 0.0 or pres != 0.0:
+        out = out - counts * freq - seen.astype(out.dtype) * pres
+    return out
 
 
 def _apply_top_p(logits: mx.array, top_p: float) -> mx.array:
@@ -316,19 +336,22 @@ class QuantaOmlxEngine(_OmlxBaseEngine):
     # --- generation ------------------------------------------------------------
     async def generate(self, prompt: str, max_tokens: int = 256, temperature: float = 0.0,
                        top_p: float = 0.9, top_k: int = 0, min_p: float = 0.0,
-                       repetition_penalty: float = 1.0, presence_penalty: float = 0.0,
+                       repetition_penalty: float = 1.0, frequency_penalty: float = 0.0,
+                       presence_penalty: float = 0.0,
                        stop: list[str] | None = None, **kwargs: Any) -> Any:
         last = None
         async for chunk in self.stream_generate(prompt, max_tokens=max_tokens, temperature=temperature,
                                                 top_p=top_p, top_k=top_k, min_p=min_p,
                                                 repetition_penalty=repetition_penalty,
+                                                frequency_penalty=frequency_penalty,
                                                 presence_penalty=presence_penalty, stop=stop, **kwargs):
             last = chunk
         return last or self._output_cls(text="", finish_reason="length")
 
     async def stream_generate(self, prompt: str, max_tokens: int = 256, temperature: float = 0.0,
                               top_p: float = 0.9, top_k: int = 0, min_p: float = 0.0,
-                              repetition_penalty: float = 1.0, presence_penalty: float = 0.0,
+                              repetition_penalty: float = 1.0, frequency_penalty: float = 0.0,
+                              presence_penalty: float = 0.0,
                               stop: list[str] | None = None, **kwargs: Any) -> AsyncIterator[Any]:
         await self.start()
         add_bos = bool(kwargs.pop("add_bos", True))
@@ -343,7 +366,7 @@ class QuantaOmlxEngine(_OmlxBaseEngine):
         try:
             for step in range(max_tokens):
                 tok = self._sample(logits_row, temperature, top_k, top_p, min_p,
-                                   repetition_penalty, presence_penalty, generated)
+                                   repetition_penalty, frequency_penalty, presence_penalty, generated)
                 generated.append(tok)
                 finished, reason, new_text = False, None, ""
                 if tok in self._eos:
@@ -370,29 +393,46 @@ class QuantaOmlxEngine(_OmlxBaseEngine):
             self._active -= 1
 
     async def chat(self, messages: list[dict[str, Any]], **kwargs: Any) -> Any:
-        prompt, templated = self._format(messages, kwargs.pop("tools", None))
+        tmpl_kw = self._pop_template_kwargs(kwargs)  # thinking/enable_thinking/... -> template, not sampler
+        prompt, templated = self._format(messages, kwargs.pop("tools", None), tmpl_kw)
         kwargs.setdefault("add_bos", not templated)  # the chat template carries its own structure
         kwargs.setdefault("allow_special", templated)  # map its control tokens to special ids
         return await self.generate(prompt, **kwargs)
 
     async def stream_chat(self, messages: list[dict[str, Any]], **kwargs: Any) -> AsyncIterator[Any]:
-        prompt, templated = self._format(messages, kwargs.pop("tools", None))
+        tmpl_kw = self._pop_template_kwargs(kwargs)
+        prompt, templated = self._format(messages, kwargs.pop("tools", None), tmpl_kw)
         kwargs.setdefault("add_bos", not templated)
         kwargs.setdefault("allow_special", templated)
         async for out in self.stream_generate(prompt, **kwargs):
             yield out
 
     # --- internals -------------------------------------------------------------
-    def _format(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None) -> tuple[str, bool]:
+    @staticmethod
+    def _pop_template_kwargs(kwargs: dict[str, Any]) -> dict[str, Any]:
+        """Split chat-template controls out of the request kwargs so they reach ``apply_chat_template``
+        instead of the sampler: a ``chat_template_kwargs`` dict, plus any well-known flags in
+        ``_TEMPLATE_KEYS`` (``thinking`` / ``enable_thinking`` / ``preserve_thinking`` /
+        ``reasoning_effort``). Forwarding a superset is safe — both tokenizers accept ``**kwargs`` and
+        ignore vars their template never references."""
+        tmpl = dict(kwargs.pop("chat_template_kwargs", None) or {})
+        for k in _TEMPLATE_KEYS:
+            if k in kwargs:
+                tmpl[k] = kwargs.pop(k)
+        return tmpl
+
+    def _format(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None,
+                template_kwargs: dict[str, Any] | None = None) -> tuple[str, bool]:
         """Return (prompt, templated): templated=True when the tokenizer's chat template was used.
 
         The tokenizer's ``apply_chat_template`` renders the OpenAI messages + tools into the model's
-        native prompt; the engine does not pre-parse output, so reasoning/tool extraction is left to
-        the oMLX server (which owns the OpenAI/Anthropic response shaping)."""
+        native prompt; ``template_kwargs`` (thinking / enable_thinking / reasoning_effort) are forwarded
+        so reasoning can be toggled per request. The engine does not pre-parse output, so reasoning/tool
+        extraction is left to the oMLX server (which owns the OpenAI/Anthropic response shaping)."""
         tk = self._tokenizer
         if tk is not None and hasattr(tk, "apply_chat_template"):
             text = tk.apply_chat_template(messages, tokenize=False, add_generation_prompt=True,
-                                          tools=tools or None)
+                                          tools=tools or None, **(template_kwargs or {}))
             return str(text), True
         body = "\n".join(f"{m.get('role', 'user')}: {m.get('content', '')}" for m in messages)
         return body + "\nassistant:", False
@@ -415,8 +455,8 @@ class QuantaOmlxEngine(_OmlxBaseEngine):
         raise OmlxShimError(f"no decode stepper for quanta artifact model_type={mt!r}")
 
     def _sample(self, logits: mx.array, temperature: float, top_k: int, top_p: float, min_p: float,
-                rep: float, pres: float, prev: Sequence[int]) -> int:
-        lg = _apply_penalties(logits.astype(mx.float32), prev, rep, pres)
+                rep: float, freq: float, pres: float, prev: Sequence[int]) -> int:
+        lg = _apply_penalties(logits.astype(mx.float32), prev, rep, freq, pres)
         if temperature <= 0.0:
             tok = mx.argmax(lg)
         else:
