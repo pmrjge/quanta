@@ -37,13 +37,15 @@ def _agentic_corpus(tok: KimiTokenizer) -> mx.array:
 
 
 def run() -> None:
+    mx.set_cache_limit(32 * 1024**3)  # cap the MLX buffer cache so the resident set can't balloon
     cfg = KimiTextConfig.from_pretrained(MODEL)
     tok = KimiTokenizer(MODEL, bos_id=cfg.bos_token_id)
     ids = _agentic_corpus(tok)
     print(f"calibration tokens: {ids.shape[0]} (agentic: code + docs)", flush=True)
 
     t0 = time.perf_counter()
-    stats = bake(MODEL, OUT, ids, include_head=True, expert_byte_budget=EXPERT_BUDGET, target=0.08)
+    stats = bake(MODEL, OUT, ids, include_head=True, expert_byte_budget=EXPERT_BUDGET, target=0.08,
+                 expert_method="rtn")  # scale-only RTN: e2e-equivalent to GPTQ on the int4 source, ~10x faster
     for fn in ("tiktoken.model", "tokenizer_config.json", "chat_template.jinja"):  # self-contained tokenizer + chat
         shutil.copy(Path(MODEL) / fn, Path(OUT) / fn)
     print(f"BAKE DONE in {(time.perf_counter() - t0) / 3600:.2f}h\n{stats}", flush=True)

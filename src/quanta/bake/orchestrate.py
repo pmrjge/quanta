@@ -39,7 +39,8 @@ NORM_SUFFIXES = frozenset({
     "self_attn.q_a_layernorm.weight", "self_attn.kv_a_layernorm.weight",
 })
 _EXPERT_PROJS = ("gate_proj", "up_proj", "down_proj")
-EXPERT_CHUNK = 16  # experts batched per GPTQ call (bounds R [chunk,in,in] memory)
+EXPERT_CHUNK = 16  # experts batched per GPTQ call (bounds R [chunk,in,in] memory). Chunk size is
+                   # throughput-neutral — the column loop is compute-bound — so keep it memory-cheap.
 
 
 def _dequant_expert(ck: SourceCheckpoint, cfg: KimiTextConfig, layer: int, e: int, proj: str) -> mx.array:
@@ -71,7 +72,9 @@ def bake(
     expert_byte_budget: float | None = None,
     target: float = 0.08,
     group_size: int = 128,
+    expert_method: str = "gptq",
 ) -> dict:
+    assert expert_method in ("gptq", "rtn"), f"expert_method must be 'gptq'|'rtn', got {expert_method!r}"
     cfg = KimiTextConfig.from_pretrained(source)
     ck = SourceCheckpoint(source)
     n = cfg.num_hidden_layers if n_layers is None else n_layers
@@ -116,6 +119,7 @@ def bake(
                 else:
                     _write_int8(writer, pre + suf[: -len(".weight")], w[suf], group_size)
             ck.release()
+            mx.clear_cache()  # drop the MLX buffer-cache high-water between layers
             continue
 
         ne = ck.load_moe_nonexpert(i)
@@ -126,37 +130,46 @@ def bake(
                 _write_int8(writer, pre + suf[: -len(".weight")], arr, group_size)  # attention int8
         ln2, idx = cap_of[i]
         ex_w: dict[int, dict[str, mx.array]] = {}  # dequantized expert weights (one layer resident)
-        ex_x: dict[int, dict[str, mx.array]] = {}  # per-expert calibration input per projection
+        ex_x: dict[int, dict[str, mx.array]] = {}  # per-expert calibration input (GPTQ only)
         for e in experts:
             xe = expert_rows(ln2, idx, e)
             g, u, d = (_dequant_expert(ck, cfg, i, e, p) for p in _EXPERT_PROJS)
             mx.eval(g, u, d, xe)  # materialize before releasing shard handles
             ex_w[e] = {"gate_proj": g, "up_proj": u, "down_proj": d}
-            xd = _down_input(g, u, xe) if xe.shape[0] > 0 else xe
-            ex_x[e] = {"gate_proj": xe, "up_proj": xe, "down_proj": xd}
+            if expert_method == "gptq":  # RTN needs no activation input → skip the down-input matmuls
+                xd = _down_input(g, u, xe) if xe.shape[0] > 0 else xe
+                ex_x[e] = {"gate_proj": xe, "up_proj": xe, "down_proj": xd}
             ck.release()
 
-        for proj in _EXPERT_PROJS:
-            for e in experts:  # cold experts (no rows): RTN fallback
-                if ex_x[e][proj].shape[0] == 0:
+        if expert_method == "rtn":  # scale-only affine RTN: no calibration solve, all-GPU, I/O-bound
+            for e in experts:
+                for proj in _EXPERT_PROJS:
                     key = f"{pre}mlp.experts.{e}.{proj}"
                     writer.add_quantized(key, *quantize_affine(ex_w[e][proj], bits_map[key], group_size),
                                          bits_map[key], group_size)
-            for bits in (3, 4):  # GPTQ experts grouped by width, batched in chunks
-                grp = [e for e in experts if ex_x[e][proj].shape[0] > 0
-                       and bits_map[f"{pre}mlp.experts.{e}.{proj}"] == bits]
-                for c0 in range(0, len(grp), EXPERT_CHUNK):
-                    chunk = grp[c0:c0 + EXPERT_CHUNK]
-                    ws = mx.stack([ex_w[e][proj] for e in chunk])
-                    codes, scales, biases = gptq_quantize_batch(
-                        ws, [ex_x[e][proj] for e in chunk], bits, group_size=group_size)
-                    for ci, e in enumerate(chunk):
+        else:  # GPTQ error-feedback per width, batched in chunks; cold experts fall back to RTN
+            for proj in _EXPERT_PROJS:
+                for e in experts:
+                    if ex_x[e][proj].shape[0] == 0:
                         key = f"{pre}mlp.experts.{e}.{proj}"
-                        writer.add_quantized(key, pack_affine(codes[ci].astype(mx.uint32), bits),
-                                             scales[ci], biases[ci], bits, group_size)
+                        writer.add_quantized(key, *quantize_affine(ex_w[e][proj], bits_map[key], group_size),
+                                             bits_map[key], group_size)
+                for bits in (3, 4):
+                    grp = [e for e in experts if ex_x[e][proj].shape[0] > 0
+                           and bits_map[f"{pre}mlp.experts.{e}.{proj}"] == bits]
+                    for c0 in range(0, len(grp), EXPERT_CHUNK):
+                        chunk = grp[c0:c0 + EXPERT_CHUNK]
+                        ws = mx.stack([ex_w[e][proj] for e in chunk])
+                        codes, scales, biases = gptq_quantize_batch(
+                            ws, [ex_x[e][proj] for e in chunk], bits, group_size=group_size)
+                        for ci, e in enumerate(chunk):
+                            key = f"{pre}mlp.experts.{e}.{proj}"
+                            writer.add_quantized(key, pack_affine(codes[ci].astype(mx.uint32), bits),
+                                                 scales[ci], biases[ci], bits, group_size)
         del ex_w, ex_x
+        mx.clear_cache()  # drop the MLX buffer-cache high-water between layers
 
-    policy = {"experts": "int3/int4 gptq g128", "non_experts": "int8 g128",
+    policy = {"experts": f"int3/int4 {expert_method} g128", "non_experts": "int8 g128",
               "shared": "bf16", "norms": "bf16", "target_error": target}
     writer.finalize(policy)
     return {"layers": n, "experts": len(experts), "alloc_error": total_err, "expert_bytes": used,
