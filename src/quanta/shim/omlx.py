@@ -82,11 +82,23 @@ def detect_quanta_artifact(path: str | Path) -> QuantaArtifactInfo | None:
 
 
 def _default_runtime_loader(root: Path) -> tuple[RuntimeLike, TokenizerLike]:
-    from quanta.runtime import ResidentModel
-    from quanta.tokenizer import KimiTokenizer
+    """Build the resident runtime + tokenizer for an artifact, dispatched on ``model_type``.
 
-    rm = ResidentModel(root)
-    return rm, KimiTokenizer(root, bos_id=rm.cfg.bos_token_id)
+    Refuses to load an artifact whose model class has no resident runtime rather than
+    silently building the wrong one (e.g. a Nemotron bake through the Kimi path).
+    """
+    info = detect_quanta_artifact(root)
+    mt = (info.model_type if info else None) or ""
+    if mt.startswith("kimi") or mt.startswith("deepseek"):
+        from quanta.runtime import ResidentModel
+        from quanta.tokenizer import KimiTokenizer
+
+        rm = ResidentModel(root)
+        return rm, KimiTokenizer(root, bos_id=rm.cfg.bos_token_id)
+    raise OmlxShimError(
+        f"no resident runtime for quanta artifact model_type={mt!r} "
+        "(supported: kimi/deepseek; nemotron runtime pending)"
+    )
 
 
 def _apply_penalties(logits: mx.array, prev: Sequence[int] | None, rep: float, pres: float) -> mx.array:
@@ -114,6 +126,52 @@ def _apply_min_p(logits: mx.array, min_p: float) -> mx.array:
         return logits
     probs = mx.softmax(logits)
     return mx.where(probs < min_p * mx.max(probs), mx.array(-mx.inf), logits)
+
+
+def _earliest_stop(text: str, stops: Sequence[str]) -> int | None:
+    """Index of the earliest occurrence of any non-empty stop string in ``text``, else None."""
+    hits = [i for i in (text.find(s) for s in stops if s) if i >= 0]
+    return min(hits) if hits else None
+
+
+class _Detok:
+    """Incremental detokenizer for streaming.
+
+    Byte-accurate when the tokenizer exposes ``decode_bytes`` (the real path): accumulate
+    raw bytes and flush only complete UTF-8, so a multi-byte token split across steps never
+    surfaces as a replacement char. Falls back to delta-on-decoded-string for tokenizers
+    that only expose ``decode`` (test stubs). ``text`` is the cumulative decoded output.
+    """
+
+    def __init__(self, tokenizer: TokenizerLike | None) -> None:
+        self._tk = tokenizer
+        self._bytes_ok = tokenizer is not None and hasattr(tokenizer, "decode_bytes")
+        self._buf = b""
+        self._ids: list[int] = []
+        self.text = ""
+
+    def add(self, tid: int) -> str:
+        if self._tk is None:
+            raise OmlxShimError("detokenizer has no tokenizer")
+        if self._bytes_ok:
+            self._buf += bytes(self._tk.decode_bytes([tid]))
+            try:
+                piece = self._buf.decode("utf-8")
+                self._buf = b""
+            except UnicodeDecodeError as e:  # keep the incomplete tail buffered for next token
+                piece = self._buf[: e.start].decode("utf-8")
+                rest = self._buf[e.start :]
+                if len(rest) >= 4:  # longer than any valid incomplete tail ⇒ genuinely invalid
+                    piece += rest.decode("utf-8", "replace")
+                    rest = b""
+                self._buf = rest
+            self.text += piece
+            return piece
+        self._ids.append(tid)  # string fallback: re-decode, emit the delta
+        full = str(self._tk.decode(self._ids))
+        piece = full[len(self.text) :]
+        self.text = full
+        return piece
 
 
 class QuantaOmlxEngine(_OmlxBaseEngine):
@@ -203,18 +261,32 @@ class QuantaOmlxEngine(_OmlxBaseEngine):
         prompt_ids = self._encode(prompt, add_bos=add_bos, allow_special=allow_special)
         caches = [MLACache() for _ in range(self._runtime.num_layers)]
         logits = self._runtime(mx.array(prompt_ids), caches=caches, sparse=DEFAULT_SPARSE)  # prefill
+        detok = _Detok(self._tokenizer)
         generated: list[int] = []
         self._active += 1
         try:
-            for _ in range(max_tokens):
+            for step in range(max_tokens):
                 tok = self._sample(logits[0, -1], temperature, top_k, top_p, min_p,
                                    repetition_penalty, presence_penalty, generated)
                 generated.append(tok)
-                text = self._decode(generated)
-                finished = tok in self._eos or bool(stop and any(s in text for s in stop))
-                yield self._output_cls(text=text, tokens=list(generated), prompt_tokens=len(prompt_ids),
-                                       completion_tokens=len(generated), new_text=self._decode([tok]),
-                                       finish_reason="stop" if finished else None, finished=finished)
+                finished, reason, new_text = False, None, ""
+                if tok in self._eos:
+                    finished, reason = True, "stop"  # eos itself has no visible text
+                else:
+                    new_text = detok.add(tok)
+                text = detok.text
+                if not finished and stop:  # stop string: cut it (and anything after) from the output
+                    cut = _earliest_stop(text, stop)
+                    if cut is not None:
+                        start = len(text) - len(new_text)
+                        new_text = text[start:cut] if cut > start else ""
+                        text, finished, reason = text[:cut], True, "stop"
+                if not finished and step == max_tokens - 1:
+                    finished, reason = True, "length"
+                yield self._output_cls(
+                    text=text, tokens=list(generated), prompt_tokens=len(prompt_ids),
+                    completion_tokens=len(generated), new_text=new_text,
+                    finish_reason=reason, finished=finished)
                 if finished:
                     break
                 logits = self._runtime(mx.array([tok]), caches=caches, offset=caches[0].offset, absorbed=True)
@@ -248,11 +320,6 @@ class QuantaOmlxEngine(_OmlxBaseEngine):
         if self._tokenizer is None:
             raise OmlxShimError("engine has no tokenizer")
         return [int(t) for t in self._tokenizer.encode(text, add_bos=add_bos, allow_special=allow_special)]
-
-    def _decode(self, ids: Sequence[int]) -> str:
-        if self._tokenizer is None:
-            raise OmlxShimError("engine has no tokenizer")
-        return str(self._tokenizer.decode([int(t) for t in ids]))
 
     def _sample(self, logits: mx.array, temperature: float, top_k: int, top_p: float, min_p: float,
                 rep: float, pres: float, prev: Sequence[int]) -> int:

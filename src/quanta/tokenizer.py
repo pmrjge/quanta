@@ -99,6 +99,14 @@ class KimiTokenizer:
     def decode(self, ids: list[int]) -> str:
         return self.encoding.decode([int(i) for i in ids if int(i) < self.n_base])
 
+    def decode_bytes(self, ids: list[int]) -> bytes:
+        """Raw bytes for ``ids`` (specials dropped) — for byte-accurate incremental detok.
+
+        A single BPE token can be a partial UTF-8 sequence; streaming must flush only
+        complete characters, so the serving path detokenizes over bytes, not strings.
+        """
+        return self.encoding.decode_bytes([int(i) for i in ids if int(i) < self.n_base])
+
     @cached_property
     def _chat_template(self) -> str | None:
         f = self._dir / "chat_template.jinja"
