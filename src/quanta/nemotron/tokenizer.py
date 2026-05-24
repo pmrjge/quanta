@@ -38,9 +38,11 @@ class NemotronTokenizer:
             if isinstance(i, int)
         }
 
-    def encode(self, text: str, *, add_bos: bool = False) -> list[int]:
-        # add_special_tokens=False: no template wrapping; control tokens present in the text
-        # are still recognized to their ids (the HF tokenizer always splits added tokens).
+    def encode(self, text: str, *, add_bos: bool = False, allow_special: bool = False) -> list[int]:
+        # add_special_tokens=False: no template wrapping; control tokens present in the text are still
+        # recognized to their ids (the HF tokenizer always splits added tokens), so ``allow_special`` is
+        # accepted for the oMLX shim's calling convention but is a no-op here (always recognized).
+        del allow_special
         ids = self._tk.encode(text, add_special_tokens=False).ids
         return [self.bos_id, *ids] if add_bos else list(ids)
 
