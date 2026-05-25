@@ -19,7 +19,7 @@ from quanta.eagle.capture import capture_features_to_shards
 from quanta.runtime import ResidentModel
 
 ART = "/Users/pmrj/models/Kimi-K2.6-quanta_int3g128"
-CORPUS = "/Users/pmrj/models/kimi_eagle/corpus_mix.safetensors"
+CORPUS = "/Users/pmrj/models/corpus/corpus_mix.safetensors"
 OUT = "/Users/pmrj/models/kimi_eagle/features_int3g128"
 LAYERS = (10, 30, 50)  # low / mid / high of 61 decoder layers (EAGLE-3 fuses three)
 
