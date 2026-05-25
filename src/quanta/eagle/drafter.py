@@ -58,15 +58,22 @@ class _SwiGLU(nn.Module):
 class EagleDrafter(nn.Module):
     def __init__(self, hidden: int = 7168, n_heads: int = 56, head_dim: int = 128,
                  intermediate: int = 14336, eps: float = 1e-6, rope_base: float = 50000.0,
-                 n_feature_layers: int = 3) -> None:
+                 n_feature_layers: int = 3, layerscale_init: float = 1e-4) -> None:
         super().__init__()
         self.hidden, self.n_heads, self.head_dim = hidden, n_heads, head_dim
         self.rope_base = rope_base
         self.scale = head_dim ** -0.5
         self.n_feature_layers = n_feature_layers
-        self.feat_norm = nn.RMSNorm(hidden, eps=eps)  # normalize each target hidden before fusing (per component)
-        self.feat_proj = nn.Linear(n_feature_layers * hidden, hidden, bias=False)  # fuse low/mid/high
-        self.in_proj = nn.Linear(2 * hidden, hidden, bias=False)                   # combine [embed, feature]
+        self.feat_proj = nn.Linear(n_feature_layers * hidden, hidden, bias=False)  # fuse RAW low/mid/high -> H
+        self.embed_in = nn.Linear(hidden, hidden, bias=False)                      # project token embedding -> H
+        # Balance the front-end init to a single [(n_feature_layers+1)*H -> H] projection — the linear
+        # probe that reaches 9.7%. MLX's default per-matrix init is |w| <= 1/sqrt(fan_in), which makes
+        # embed_in (fan_in H) ~2x hotter than feat_proj (fan_in 3H); the embedding path then dominates x
+        # at init and CE alone collapses to the marginal token. Re-init BOTH with the COMBINED fan-in so
+        # neither path dominates and the sum front-end matches the probe's balanced single matrix.
+        k = ((n_feature_layers + 1) * hidden) ** -0.5
+        self.feat_proj.weight = mx.random.uniform(-k, k, self.feat_proj.weight.shape)
+        self.embed_in.weight = mx.random.uniform(-k, k, self.embed_in.weight.shape)
         self.input_norm = nn.RMSNorm(hidden, eps=eps)
         self.q_proj = nn.Linear(hidden, n_heads * head_dim, bias=False)
         self.k_proj = nn.Linear(hidden, n_heads * head_dim, bias=False)
@@ -74,18 +81,26 @@ class EagleDrafter(nn.Module):
         self.o_proj = nn.Linear(n_heads * head_dim, hidden, bias=False)
         self.post_norm = nn.RMSNorm(hidden, eps=eps)
         self.mlp = _SwiGLU(hidden, intermediate)
+        # LayerScale: per-channel learned gains on each residual branch, init ~0 so the block starts as
+        # identity (= the raw-feature front-end) and grows only where it cuts loss. A FIXED residual
+        # scale (even 0.1x) instead collapses training to the majority token — the random block output
+        # drowns the small useful channels of x (whose energy sits in a few massive-activation dims).
+        self.ls_attn = mx.full((hidden,), layerscale_init)
+        self.ls_mlp = mx.full((hidden,), layerscale_init)
         self.out_norm = nn.RMSNorm(hidden, eps=eps)              # head-space output: the frozen LM head reads this
         self.recur_norm = nn.RMSNorm(hidden, eps=eps)            # feature-space recurrent output (its own basis,
         self.recur_proj = nn.Linear(hidden, hidden, bias=False)  # decoupled from out_norm so the two don't fight)
 
     def reduce_target_features(self, feat3: mx.array) -> mx.array:
-        """Fuse the concatenated low/mid/high target hidden states ``[B,T,3H]`` → ``[B,T,H]``.
-        Each component is RMS-normalized first (deep residual-stream magnitudes vary widely by depth,
-        so raw fusion is poorly conditioned). Applied once to the target features; the recurrent
-        feature thereafter is the layer's ``x``."""
-        b, t, _ = feat3.shape
-        f = self.feat_norm(feat3.reshape(b, t, self.n_feature_layers, self.hidden))  # norm over H per component
-        return self.feat_proj(f.reshape(b, t, self.n_feature_layers * self.hidden))
+        """Fuse the concatenated low/mid/high target hidden states ``[B,T,3H]`` → ``[B,T,H]`` with a
+        single learned projection on the **raw** features. (An earlier version RMS-normalized each
+        component first; that crushed the signal — deep residual streams carry a few massive-activation
+        channels 100–1000× the rest, so the per-token RMS denominator is dominated by them and the
+        useful small channels collapse. A linear probe on raw feat3 reaches ~72% train top-1 vs ~5%
+        through the norm; ``feat_proj`` learns whatever per-channel conditioning the fusion needs.)
+        Applied once to the target features; the recurrent feature thereafter is the drafter's
+        ``recur``."""
+        return self.feat_proj(feat3)
 
     def _attn(self, x: mx.array, offset: int, mask, cache: DraftCache | None) -> mx.array:
         b, t, _ = x.shape
@@ -108,8 +123,19 @@ class EagleDrafter(nn.Module):
         into logits; ``recur = recur_proj(recur_norm(x))`` is the *feature-space* output, regressed in
         training onto the next reduced target feature and self-fed as the next step's ``feature`` (same
         space as that reduced feature). Keeping them separate stops the head-space CE and the
-        feature-space regression from fighting over one output (the earlier bug that held accept ~3%)."""
-        x = self.in_proj(mx.concatenate([token_emb, feature], axis=-1))
-        x = x + self._attn(self.input_norm(x), offset, mask, cache)
-        x = x + self.mlp(self.post_norm(x))
+        feature-space regression from fighting over one output (an earlier bug that held accept ~3%).
+        Each residual branch is gated by a learned per-channel LayerScale (``ls_attn``/``ls_mlp``, init
+        ~0) so the block starts as identity over the raw-feature front-end and only adds attn/MLP where
+        it helps — without it the block collapses training to the majority token regardless of how
+        small a fixed residual scale is used."""
+        # Front-end = SUM of two single full-rank projections (= the 9.7% linear probe's computation),
+        # NOT a re-projection of the reduced feature. The old `in_proj(concat([emb, feat_proj(feat3)]))`
+        # sent the feat3->x signal through a PRODUCT of two matrices (in_proj[:,H:] . feat_proj, a rank-H
+        # bottleneck); a localization sweep showed that factored front-end ALONE (no block) collapses to
+        # the majority token (3.5% vs the probe's 9.7%) — optimization falls into the marginal basin.
+        # `feature` is already H-wide and full-rank from feat_proj (step 1) or the self-fed recur (which
+        # is regressed onto feat_proj's output, same space), so it is summed directly.
+        x = self.embed_in(token_emb) + feature
+        x = x + self.ls_attn * self._attn(self.input_norm(x), offset, mask, cache)
+        x = x + self.ls_mlp * self.mlp(self.post_norm(x))
         return self.recur_proj(self.recur_norm(x)), self.out_norm(x)
