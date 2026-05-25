@@ -12,7 +12,7 @@ allocations), per the host-OOM safety rule:
     GPTQ codes, that ``unpack(pack(codes)) == codes`` AND ``dequant(pack(codes))`` lies on the
     ``mx.quantize`` grid bit-exactly — via the bake's own :func:`_assert_int6_packs` (the fail-loud
     guard the real bake runs before writing any int6 codes, rule 6). Also checks the real-bake dims
-    (hidden=3072, inter=1536, g128) satisfy the packer's ``in·bits % 32 == 0`` constraint.
+    (hidden=3072, inter=1536, g64) satisfy the packer's ``in·bits % 32 == 0`` constraint.
 (c) **int8 dense path** — int8-affine a small non-expert weight; recon must be tight.
 (d) **manifest round-trip** — a tiny :class:`ArtifactWriter` bake (1 layer, 4 experts: warm + cold)
     through :class:`quanta.minimax.artifact.MiniMaxArtifact`: experts/attention tagged ``affine_packed``
@@ -45,7 +45,7 @@ from quanta.minimax.bake import (
 )
 from quanta.minimax.config import MiniMaxConfig
 
-GS = 32       # tiny-tensor group size (real bake uses 128); divides the synthetic in-dims 32/64
+GS = 32       # tiny-tensor group size (real bake uses 64); divides the synthetic in-dims 32/64
 BITS = 6      # the MiniMax routed-expert width
 INTER, DIM, NE, NTOK = 64, 32, 4, 20   # one layer: 4 experts, FFN width 64, hidden 32, 20 calib rows
 
@@ -132,8 +132,8 @@ def _int6_pack_roundtrip() -> tuple[bool, bool]:
     except ValueError:
         guard_ok = False
 
-    # Real-bake dims (hidden=3072 for w1/w3, inter=1536 for w2; group 128) must pack cleanly.
-    dims_ok = all((d * BITS) % 32 == 0 and d % 128 == 0 for d in (3072, 1536))
+    # Real-bake dims (hidden=3072 for w1/w3, inter=1536 for w2; group 64) must pack cleanly.
+    dims_ok = all((d * BITS) % 32 == 0 and d % 64 == 0 for d in (3072, 1536))
 
     return (codes_exact and grid_exact and guard_ok), dims_ok
 

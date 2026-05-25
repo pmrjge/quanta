@@ -33,7 +33,7 @@ DEFERRED real bake (GPU + memory heavy — DO NOT run here; host OOM rebooted th
     import mlx.core as mx
     bake_minimax("/Users/pmrj/models/MiniMax-M2.7",
                  "/Users/pmrj/models/MiniMax-M2.7-quanta_int6",
-                 calib_ids, group_size=128, expert_method="gptq", scale_dtype=mx.bfloat16)
+                 calib_ids, group_size=64, expert_method="gptq", scale_dtype=mx.bfloat16)
     # then teacher_forced_ppl over the resident int6/int8 runtime vs the bf16 reference.
 """
 
@@ -174,7 +174,7 @@ def bake_minimax(
     n_layers: int | None = None,
     expert_subset: Iterable[int] | None = None,
     include_head: bool = True,
-    group_size: int = 128,
+    group_size: int = 64,
     expert_method: str = "gptq",
     scale_dtype: mx.Dtype | None = None,
 ) -> dict:
