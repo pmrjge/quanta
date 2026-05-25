@@ -101,7 +101,12 @@ def _ce_multistep(drafter: EagleDrafter, f3b: mx.array, itb: mx.array, tgb: mx.a
         tgt = tgb[:, s + 1:s + 1 + ts]
         ce_sum = ce_sum + mx.mean(mx.logsumexp(logits, axis=-1)
                                   - mx.take_along_axis(logits, tgt[..., None], axis=-1)[..., 0])
-        reg_sum = reg_sum + _smooth_l1(recur, mx.stop_gradient(red[:, s + 1:s + 1 + ts]))
+        # scale-invariant feature regression: RMS-normalize recur + target by the target's per-token
+        # RMS so the smooth-L1 is O(1) and isn't dominated by the large raw reduced features (absmax
+        # ~760 once feat_norm is gone), which otherwise starves the CE and collapses token accuracy.
+        tgt_feat = mx.stop_gradient(red[:, s + 1:s + 1 + ts])
+        inv = mx.stop_gradient(mx.rsqrt(mx.mean(tgt_feat * tgt_feat, axis=-1, keepdims=True) + 1e-6))
+        reg_sum = reg_sum + _smooth_l1(recur * inv, tgt_feat * inv)
         feat = recur                             # self-feed the feature-space recurrent output
         n += 1
     n = max(n, 1)
@@ -132,11 +137,17 @@ def _holdout_multistep(drafter: EagleDrafter, f3: mx.array, it: mx.array, tg: mx
 def train_drafter(drafter: EagleDrafter, feat3: mx.array, in_tokens: mx.array, targets: mx.array,
                   embed: mx.array, head: mx.array, *, chunk: int = 2048, batch: int = 2,
                   epochs: int = 60, lr: float = 2e-4, holdout: int = 2, steps: int = 1,
-                  feat_w: float = 1.0) -> dict:
-    """Train over chunks; return final loss + per-step held-out top-1 accept. Uses the canonical
-    EAGLE-3 loss (next-token CE + ``feat_w``-weighted next-feature regression, :func:`_ce_multistep`);
-    ``steps>1`` self-feeds the predicted feature for the multi-step "training-time test" rollout that
-    spec-decode runs in. Set ``feat_w=0`` to ablate the feature regression."""
+                  feat_w: float = 1.0, patience: int = 8, save_path: str | Path | None = None) -> dict:
+    """Train over chunks with **early stopping + best-epoch restore**; return the final loss + the
+    *best* per-step held-out top-1 accept. Uses the canonical EAGLE-3 loss (next-token CE +
+    ``feat_w``-weighted next-feature regression, :func:`_ce_multistep`); ``steps>1`` self-feeds the
+    predicted feature for the multi-step "training-time test" rollout spec-decode runs in. Set
+    ``feat_w=0`` to ablate the feature regression.
+
+    The holdout is evaluated **every epoch** and scored by mean per-step accept; the params are
+    snapshot (and, if ``save_path`` is given, checkpointed to disk) whenever that score improves;
+    training stops after ``patience`` epochs without improvement; the **best** params are restored
+    before returning. ``epochs`` is the cap, not a fixed count."""
     nch = feat3.shape[0] // chunk
     f3 = feat3[:nch * chunk].reshape(nch, chunk, -1)
     it = in_tokens[:nch * chunk].reshape(nch, chunk)
@@ -148,8 +159,10 @@ def train_drafter(drafter: EagleDrafter, feat3: mx.array, in_tokens: mx.array, t
     opt = optim.Adam(learning_rate=lr)
     lvg = nn.value_and_grad(drafter, lambda d, a, b, c: _ce_multistep(d, a, b, c, embed, head, steps, feat_w))
     base = _holdout_multistep(drafter, hf3, hit, htg, embed, head, steps)
-    hist = []
+    hist: list = []
     last_loss = 0.0
+    best_score, best_acc, best_epoch, since = -1.0, base, 0, 0
+    best_params = None
     for ep in range(epochs):
         order = [int(i) for i in mx.random.permutation(n_train)]
         for s in range(0, n_train - batch + 1, batch):
@@ -158,14 +171,31 @@ def train_drafter(drafter: EagleDrafter, feat3: mx.array, in_tokens: mx.array, t
             opt.update(drafter, grads)
             mx.eval(drafter.parameters(), opt.state)
             last_loss = float(loss.item())
-        if ep % 10 == 9 or ep == epochs - 1:
-            acc = _holdout_multistep(drafter, hf3, hit, htg, embed, head, steps)
-            hist.append((ep + 1, last_loss, acc))
-            accs = " ".join(f"{a:.3f}" for a in acc)
-            print(f"  epoch {ep + 1:3d}  loss {last_loss:.4f}  holdout top1/step [{accs}]", flush=True)
-    final = hist[-1][2] if hist else base
-    return {"base_holdout": base, "final_holdout": final, "final_loss": last_loss, "history": hist,
-            "base_holdout_top1": base[0], "final_holdout_top1": final[0]}
+        acc = _holdout_multistep(drafter, hf3, hit, htg, embed, head, steps)
+        score = sum(acc) / len(acc)
+        hist.append((ep + 1, last_loss, acc))
+        improved = score > best_score + 1e-4
+        if improved:
+            best_score, best_acc, best_epoch, since = score, acc, ep + 1, 0
+            best_params = [(k, mx.array(v)) for k, v in tree_flatten(drafter.parameters())]
+            mx.eval([v for _, v in best_params])  # materialize the snapshot off the live graph
+            if save_path is not None:
+                save_drafter(save_path, drafter)   # checkpoint the best epoch (crash-safe)
+        else:
+            since += 1
+        accs = " ".join(f"{a:.3f}" for a in acc)
+        print(f"  epoch {ep + 1:3d}  loss {last_loss:.4f}  holdout top1/step [{accs}]  "
+              f"mean {score:.3f}{'  *best' if improved else ''}", flush=True)
+        if since >= patience:
+            print(f"  early stop @ epoch {ep + 1}: no gain in {patience} (best epoch {best_epoch}, "
+                  f"mean {best_score:.3f})", flush=True)
+            break
+    if best_params is not None:
+        drafter.update(tree_unflatten(best_params))  # restore best-epoch params
+        mx.eval(drafter.parameters())
+    return {"base_holdout": base, "final_holdout": best_acc, "final_loss": last_loss, "history": hist,
+            "base_holdout_top1": base[0], "final_holdout_top1": best_acc[0],
+            "best_epoch": best_epoch, "best_mean_accept": best_score}
 
 
 def save_drafter(path: str | Path, drafter: EagleDrafter) -> None:
