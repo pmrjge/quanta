@@ -4,8 +4,9 @@ Importable without oMLX: subclasses oMLX's ``BaseEngine`` when present (so it pa
 server's ``isinstance(engine, BaseEngine)`` gate and is dispatched by the engine pool) and
 falls back to a plain class otherwise (standalone / tests). The engine owns the quanta runtime —
 it loads the model's resident runtime + tokenizer from the artifact (dispatched on ``model_type``)
-and decodes through a model-specific **stepper**: the KV-cached absorbed-MLA path for Kimi/DeepSeek,
-or the threaded ``(ssm, conv)`` recurrence for the Nemotron-H hybrid — while oMLX provides the
+and decodes through a model-specific **stepper**: the KV-cached absorbed-MLA path for Kimi /
+DeepSeek-V3, the Hyper-Connections + compressed-KV single-token path for DeepSeek-V4-Flash, or the
+threaded ``(ssm, conv)`` recurrence for the Nemotron-H hybrid — while oMLX provides the
 OpenAI/Anthropic server surface. mlx-lm is never imported.
 
 Every generation kwarg from oMLX (temperature, top_p, top_k, min_p, repetition/frequency/presence
@@ -97,6 +98,58 @@ def detect_quanta_artifact(path: str | Path) -> QuantaArtifactInfo | None:
     return QuantaArtifactInfo(root=root, model_type=mt if isinstance(mt, str) else None)
 
 
+# ``quanta.dsv4.encoding.encode_chat`` (the DSV4 prompt renderer) accepts only these kwargs; the
+# engine forwards a superset of chat controls (add_generation_prompt / tools / enable_thinking / …)
+# that must be filtered out before calling it, not passed through.
+_DSV4_CHAT_KEYS = ("thinking_mode", "reasoning_effort", "context", "drop_thinking", "add_default_bos_token")
+
+
+class _DSV4TokenizerAdapter:
+    """Adapt :class:`~quanta.dsv4.tokenizer.DeepSeekV4Tokenizer` to the engine's tokenizer contract.
+
+    The DSV4 tokenizer predates this contract: its ``encode`` has no ``allow_special`` flag (it always
+    interprets added-token strings, like the Nemotron tokenizer), and it renders chat via
+    :func:`quanta.dsv4.encoding.encode_chat` rather than an ``apply_chat_template``. This thin wrapper
+    bridges both *without touching the parity-gated tokenizer*: ``encode`` accepts and ignores
+    ``allow_special``; ``apply_chat_template`` renders through ``encode_chat`` with the request's chat
+    kwargs filtered to the ones that renderer understands (mapping the cross-model ``enable_thinking``
+    toggle onto DSV4's ``thinking_mode``). ``decode`` / ``eos_id`` / ``stop_ids`` / ``bos_id`` delegate.
+    It deliberately exposes no ``decode_bytes`` / ``n_base`` / ``id_to_special``, so the streaming
+    detokenizer takes its string-fallback path — DSV4's ``decode`` already emits special-token markers
+    verbatim, which is the engine's raw-output contract."""
+
+    def __init__(self, tokenizer: Any) -> None:
+        self._tk = tokenizer
+        self.bos_id = getattr(tokenizer, "bos_id", None)
+        self.eos_id = getattr(tokenizer, "eos_id", None)
+        self.stop_ids = getattr(tokenizer, "stop_ids", ())
+
+    def encode(self, text: str, *, add_bos: bool = False, allow_special: bool = False) -> list[int]:
+        del allow_special  # DSV4 always interprets added-token strings (see class docstring)
+        return list(self._tk.encode(text, add_bos=add_bos))
+
+    def decode(self, ids: Sequence[int], **kw: Any) -> str:
+        return str(self._tk.decode(ids, **kw))
+
+    def apply_chat_template(self, messages: list[dict[str, Any]], *, tokenize: bool = False,
+                            add_generation_prompt: bool = True, tools: Any = None,
+                            **kwargs: Any) -> Any:
+        """Render the DSV4 chat prompt (string by default, ids when ``tokenize=True``).
+
+        ``add_generation_prompt`` / ``tools`` are accepted for contract compatibility and ignored:
+        DSV4's format always appends the assistant generation prompt and has no tool-call template."""
+        from quanta.dsv4.encoding import encode_chat
+
+        del add_generation_prompt, tools
+        params = {k: kwargs[k] for k in _DSV4_CHAT_KEYS if k in kwargs}
+        if "thinking_mode" not in params:
+            et = kwargs.get("enable_thinking", kwargs.get("thinking"))
+            if et is not None:
+                params["thinking_mode"] = "thinking" if et else "chat"
+        text = encode_chat(messages, **params)
+        return self.encode(text, add_bos=False) if tokenize else text
+
+
 def _default_runtime_loader(root: Path) -> tuple[RuntimeLike, TokenizerLike]:
     """Build the resident runtime + tokenizer for an artifact, dispatched on ``model_type``.
 
@@ -105,7 +158,15 @@ def _default_runtime_loader(root: Path) -> tuple[RuntimeLike, TokenizerLike]:
     """
     info = detect_quanta_artifact(root)
     mt = (info.model_type if info else None) or ""
-    if mt.startswith("kimi") or mt.startswith("deepseek"):
+    # DeepSeek-V4-Flash (HC + compressed-KV; GPT-2 byte-level BPE) — checked before the V3 ``deepseek``
+    # prefix below, which the ``deepseek_v4`` model_type would otherwise be swallowed by.
+    if mt.startswith("deepseek_v4"):
+        from quanta.dsv4.runtime import DSV4ResidentModel
+        from quanta.dsv4.tokenizer import DeepSeekV4Tokenizer
+
+        tok = _DSV4TokenizerAdapter(DeepSeekV4Tokenizer.from_pretrained(str(root)))
+        return DSV4ResidentModel(root), tok
+    if mt.startswith("kimi") or mt.startswith("deepseek"):  # Kimi / DeepSeek-V3 family (MLA)
         from quanta.runtime import ResidentModel
         from quanta.tokenizer import KimiTokenizer
 
@@ -117,7 +178,8 @@ def _default_runtime_loader(root: Path) -> tuple[RuntimeLike, TokenizerLike]:
 
         return NemotronResidentModel(root), NemotronTokenizer(root)
     raise OmlxShimError(
-        f"no resident runtime for quanta artifact model_type={mt!r} (supported: kimi/deepseek/nemotron)"
+        f"no resident runtime for quanta artifact model_type={mt!r} "
+        "(supported: kimi, deepseek_v3, deepseek_v4, nemotron)"
     )
 
 
@@ -268,6 +330,39 @@ class _NemotronStepper:
         logits, self._ssm, self._conv = self._rt(
             mx.array([tok]), caches=self._caches, ssm=self._ssm, conv=self._conv)
         return logits[0, -1]
+
+
+class _DSV4Stepper:
+    """DeepSeek-V4-Flash: one :class:`~quanta.dsv4.decode.DSV4Cache` shared across all layers (the HC
+    residual carries no cache; the per-layer attention KV / compressed-KV / indexer state does).
+
+    ``prefill`` seeds the cache by stepping the prompt **one token at a time** — bounded memory, never
+    materializing ``[1,T,vocab]`` for a long prompt — and ``step`` decodes one token at the running
+    absolute offset (tracked here, mirroring :func:`quanta.dsv4.generate.generate`; the runtime's
+    single-token forward grows the cache in place). Both return the last-position logits row ``[vocab]``.
+    """
+
+    def __init__(self, runtime: RuntimeLike, *, cache: Any | None = None) -> None:
+        from quanta.dsv4.decode import DSV4Cache
+
+        self._rt = runtime
+        self._cache = cache if cache is not None else DSV4Cache(runtime.num_layers)
+        self._offset = 0
+
+    def prefill(self, prompt_ids: list[int]) -> mx.array:
+        if not prompt_ids:
+            raise OmlxShimError("DSV4 prefill got an empty prompt")
+        row = None
+        for pos, tid in enumerate(prompt_ids):  # seed positions 0..len-1, keep only the last logits
+            row = self._rt(mx.array([tid]), caches=self._cache, offset=pos)[0, -1]
+        self._offset = len(prompt_ids)
+        mx.eval(row)
+        return row
+
+    def step(self, tok: int) -> mx.array:
+        row = self._rt(mx.array([tok]), caches=self._cache, offset=self._offset)[0, -1]
+        self._offset += 1
+        return row
 
 
 class QuantaOmlxEngine(_OmlxBaseEngine):
@@ -455,6 +550,8 @@ class QuantaOmlxEngine(_OmlxBaseEngine):
         Refuses an unknown model class loudly rather than guessing a decode convention (CLAUDE.md #6).
         """
         mt = self.model_type or ""
+        if mt.startswith("deepseek_v4"):  # before the V3 ``deepseek`` prefix it would collide with
+            return _DSV4Stepper(self._runtime)
         if mt.startswith("kimi") or mt.startswith("deepseek"):
             return _MLAStepper(self._runtime, quantized_kv=quantized_kv, sparse=DEFAULT_SPARSE)
         if mt.startswith("nemotron"):
