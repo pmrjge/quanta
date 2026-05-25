@@ -149,24 +149,39 @@ class DSV4ResidentModel:
         """Logits ``[1,T,vocab]`` (or ``(logits, {layer: hidden})`` when ``capture_layers`` is set).
 
         ``caches=None`` ⇒ prefill (reuse the reference ``dsv4_block`` per layer — parity-correct).
-        ``caches`` given ⇒ decode: a single new token (``T == 1``) stepped per layer through the
-        HC-wrapped attention steppers; the regime is chosen per layer by ``cfg.compress_ratio``. The
-        cache is mutated in place; ``offset`` is the new token's absolute position.
+        ``caches`` given ⇒ decode over ``T >= 1`` tokens, each stepped per layer through the
+        HC-wrapped attention steppers (regime chosen per layer by ``cfg.compress_ratio``). Every token
+        completes ALL layers — appending its KV — before the next begins, so the run is causally
+        identical to a batched cached forward; the cache is mutated in place and ``offset`` is the first
+        token's absolute position. ``T == 1`` is the plain decode step (:func:`quanta.dsv4.generate`);
+        ``T > 1`` is how :func:`quanta.dsv4.spec.spec_generate` seeds the prompt and verifies
+        ``[cur, draft]`` in one call. ``capture_layers`` returns each captured layer's HC residual
+        stacked over the ``T`` positions as ``[T, hc, dim]`` (same shape the prefill path returns).
         """
         ids = token_ids if isinstance(token_ids, mx.array) else mx.array(token_ids)
         ids = ids.reshape(1, -1)                                          # [1, T]
         h = hc_expand(self.embed_w[ids].astype(mx.bfloat16), self.cfg.hc_mult)  # [1,T,hc,dim]
 
         if caches is not None:
-            if h.shape[1] != 1:
-                raise ValueError(
-                    f"decode (caches given) expects a single token, got T={h.shape[1]}; seed the "
-                    "cache by stepping the prompt one token at a time (see quanta.dsv4.generate)")
-            for i, p in enumerate(self.layers):
-                cos, sin = self._rope(i, offset + 1)
-                h = self._decode_block(h, p, i, caches, ids, cos, sin, offset)
-            mx.eval(h)
-            return self._head(h)
+            cap_set = set(capture_layers) if capture_layers else set()
+            caps_acc: dict[int, list[mx.array]] = {layer: [] for layer in cap_set}
+            hts: list[mx.array] = []
+            for t in range(h.shape[1]):
+                ht = h[:, t:t + 1]                               # [1,1,hc,dim] token t
+                idt = ids[:, t:t + 1]                            # [1,1] its id (MoE hash routing)
+                off_t = offset + t                               # its absolute position
+                for i, p in enumerate(self.layers):
+                    cos, sin = self._rope(i, off_t + 1)
+                    ht = self._decode_block(ht, p, i, caches, idt, cos, sin, off_t)
+                    if i in cap_set:
+                        caps_acc[i].append(ht[0, 0])             # [hc, dim] residual after layer i
+                mx.eval(ht)                                      # materialize this token's cache growth
+                hts.append(ht)
+            h = hts[0] if len(hts) == 1 else mx.concatenate(hts, axis=1)  # [1,T,hc,dim]
+            logits = self._head(h)                              # [1,T,vocab]
+            if cap_set:
+                return logits, {layer: mx.stack(v, axis=0) for layer, v in caps_acc.items()}
+            return logits
 
         cap_set = set(capture_layers) if capture_layers else set()
         caps: dict[int, mx.array] = {}
