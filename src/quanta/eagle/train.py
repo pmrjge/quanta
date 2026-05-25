@@ -4,13 +4,15 @@ Loads captured ``(feat3, in_tokens, targets)`` and the target's **frozen** embed
 (dequantized from the int2g64 artifact, so the drafter predicts in the target's logit space).
 
 Canonical EAGLE-3 loss (:func:`_ce_multistep`): at position ``p`` the drafter consumes the previous
-reduced feature ``f_{p-1}`` and the next token embedding ``e_p``, and is trained to predict
-``token_{p+1}`` (CE through the frozen head) **and** to regress its output ``x_p`` onto the next
-reduced feature ``f_p`` (smooth-L1). Both objectives pull ``x_p`` toward ``f_p``, so ``x`` becomes a
-reusable recurrent feature; ``steps>1`` self-feeds it for the multi-step "training-time test" rollout
-that spec-decode runs in. (The earlier loss paired ``(f_p, e_p) -> token_{p+1}`` with **no** feature
-term — the recurrent feature was never trained, so self-fed accept collapsed to ~0 / 0.39x; a linear
-probe on the same features beat the drafter, proving it was a training bug, not the data.)
+feature ``f_{p-1}`` and the next token embedding ``e_p``, and is trained to (a) predict ``token_{p+1}``
+via CE through the frozen head on its **head-space** output ``normed_p`` **and** (b) regress its
+*separate* **feature-space** output ``recur_p`` onto the next reduced target feature ``f_p`` (smooth-L1,
+stop-grad). ``recur`` (not ``normed``) is what ``steps>1`` self-feeds for the multi-step "training-time
+test" rollout spec-decode runs in, so the recurrence stays in the reduced-feature space. (Two earlier
+bugs both collapsed self-fed accept: first, **no** feature term at all — the recurrent feature was
+untrained (~0 / 0.39x); then a feature term that regressed/self-fed the **head-space** output ``normed``
+onto the **feature-space** ``f_p`` — incompatible bases, so the regression fought CE and pinned accept
+at ~3%. A linear probe on the same features beat the drafter both times: training bugs, not the data.)
 
 Embedding/head are not module params, so the optimizer touches only the drafter.
 """
@@ -69,16 +71,17 @@ def _smooth_l1(pred: mx.array, target: mx.array, beta: float = 1.0) -> mx.array:
 
 def _ce_multistep(drafter: EagleDrafter, f3b: mx.array, itb: mx.array, tgb: mx.array,
                   embed: mx.array, head: mx.array, steps: int, feat_w: float) -> mx.array:
-    """Canonical EAGLE-3 multi-step loss with **feature regression** (the fix for ~0 accept).
+    """Canonical EAGLE-3 multi-step loss: **decoupled** head-space CE + feature-space regression.
 
     At position ``p`` the drafter consumes the *previous* feature ``f_{p-1}`` (the real reduced target
-    feature on step 1, its own ``x`` thereafter) and the *next* token embedding ``e_p``, and is trained
-    to (a) predict ``token_{p+1}`` through the frozen head (CE) **and** (b) regress its output ``x_p``
-    onto the next reduced target feature ``f_p`` (smooth-L1, stop-grad). Both objectives pull ``x_p`` ->
-    ``f_p``, so ``x`` becomes a *reusable* recurrent feature — the regime spec-decode self-feeds. (The
-    old loss paired ``(f_p, e_p) -> token_{p+1}`` with no feature term, leaving the recurrent feature
-    untrained, hence steps-2+ accept ~0.) Each step shifts the embedding/labels by one and shrinks the
-    length by one. ``feat_w`` weights the regression vs the CE."""
+    feature on step 1, its own ``recur`` thereafter) and the *next* token embedding ``e_p``, and is
+    trained to (a) predict ``token_{p+1}`` through the frozen head (CE on the head-space output
+    ``normed``) **and** (b) regress its separate feature-space output ``recur_p`` onto the next reduced
+    target feature ``f_p`` (smooth-L1, stop-grad). ``recur`` lives in the reduced-feature space, so it
+    can match ``f_p`` *and* be self-fed without disturbing ``normed``'s head space — the two regimes are
+    decoupled. ``steps>1`` self-feeds ``recur`` for the multi-step "training-time test" rollout
+    spec-decode runs in. Each step shifts the embedding/labels by one and shrinks the length by one.
+    ``feat_w`` weights the regression vs the CE."""
     red = drafter.reduce_target_features(f3b)    # [B,T,H] reduced target features (grad flows via input)
     emb = embed[itb]                             # [B,T,H]
     t = red.shape[1]
@@ -90,16 +93,16 @@ def _ce_multistep(drafter: EagleDrafter, f3b: mx.array, itb: mx.array, tgb: mx.a
         ts = t - 1 - s
         if ts <= 0:
             break
-        # `normed` (= out_norm(x), ~unit scale) is BOTH the head input and the recurrent feature, so it
-        # matches `red`'s scale — regressing/self-feeding the raw residual x (large magnitude) instead
-        # explodes the loss and breaks the step-0 vs step-1 input distribution.
-        _, normed = drafter.step(feat[:, :ts], emb[:, s + 1:s + 1 + ts], offset=0, mask="causal")
+        # `recur` (feature space) is the recurrent output we regress/self-feed; `normed` (head space) is
+        # the CE output. Decoupling them is the fix — a single shared output forced into both bases made
+        # the regression fight CE and pinned accept ~3%.
+        recur, normed = drafter.step(feat[:, :ts], emb[:, s + 1:s + 1 + ts], offset=0, mask="causal")
         logits = normed @ head.T
         tgt = tgb[:, s + 1:s + 1 + ts]
         ce_sum = ce_sum + mx.mean(mx.logsumexp(logits, axis=-1)
                                   - mx.take_along_axis(logits, tgt[..., None], axis=-1)[..., 0])
-        reg_sum = reg_sum + _smooth_l1(normed, mx.stop_gradient(red[:, s + 1:s + 1 + ts]))
-        feat = normed                            # self-feed the normalized feature for the next step
+        reg_sum = reg_sum + _smooth_l1(recur, mx.stop_gradient(red[:, s + 1:s + 1 + ts]))
+        feat = recur                             # self-feed the feature-space recurrent output
         n += 1
     n = max(n, 1)
     return (ce_sum + feat_w * reg_sum) / n
@@ -119,10 +122,10 @@ def _holdout_multistep(drafter: EagleDrafter, f3: mx.array, it: mx.array, tg: mx
         ts = t - 1 - s
         if ts <= 0:
             break
-        _, normed = drafter.step(feat[:, :ts], emb[:, s + 1:s + 1 + ts], offset=0, mask="causal")
+        recur, normed = drafter.step(feat[:, :ts], emb[:, s + 1:s + 1 + ts], offset=0, mask="causal")
         pred = mx.argmax(normed @ head.T, axis=-1)
         accs.append(float(mx.mean((pred == tg[:, s + 1:s + 1 + ts]).astype(mx.float32)).item()))
-        feat = normed
+        feat = recur
     return tuple(accs)
 
 

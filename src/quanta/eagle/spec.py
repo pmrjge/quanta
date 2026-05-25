@@ -7,11 +7,11 @@ plain greedy decode** regardless of drafter quality — the drafter only changes
 accepted per target forward), never correctness.
 
 Feature flow (matches training, :func:`quanta.eagle.train._ce_multistep`): each draft step feeds the
-previous reduced feature ``f`` (the real target feature on step 0, the drafter's own **normalized**
-output ``normed`` thereafter) plus the *next* token's embedding, and the frozen head maps the output
-to the next draft token. After verify, the target's captured hidden at the last accepted position
-becomes the next round's real feature. The MLA cache is rolled back (``truncate``) to drop rejected
-drafts so it stays bit-exact.
+previous feature ``f`` (the real reduced target feature on step 0, the drafter's own **feature-space
+recurrent** output ``recur`` thereafter) plus the *next* token's embedding; the head-space output maps
+through the frozen head to the next draft token. After verify, the target's captured hidden at the last
+accepted position becomes the next round's real feature. The MLA cache is rolled back (``truncate``) to
+drop rejected drafts so it stays bit-exact.
 """
 
 from __future__ import annotations
@@ -54,17 +54,17 @@ def spec_generate(
     stop = eos_id is not None and cur == eos_id
 
     while len(out) < max_new and not stop:
-        # --- draft k tokens canonically: step(f_{q+j}, e_{q+1+j}) -> f_{q+1+j} -> token_{q+2+j};
-        #     the recurrent feature is the normalized output (matches training + the reduced feature) ---
+        # --- draft k tokens canonically: step(f_{q+j}, e_{q+1+j}) -> recur_{q+1+j} -> token_{q+2+j};
+        #     self-feed the feature-space recurrent output `recur` (matches training) ---
         dc = DraftCache()
         feat = drafter.reduce_target_features(feat3)   # real reduced target feature f_q
         drafts: list[int] = []
         tok = cur
         for j in range(k):
-            _, normed = drafter.step(feat, embed[tok][None, None], offset=q + 1 + j, cache=dc, mask=None)
+            recur, normed = drafter.step(feat, embed[tok][None, None], offset=q + 1 + j, cache=dc, mask=None)
             tok = int(mx.argmax(normed[0, 0] @ head_t).item())
             drafts.append(tok)
-            feat = normed                              # self-feed the normalized recurrent feature
+            feat = recur                               # self-feed the feature-space recurrent output
 
         # --- verify: one target forward over [cur, d1..dk] at offset q+1 ---
         vin = [cur] + drafts
