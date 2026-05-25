@@ -340,10 +340,10 @@ class Qwen35Tokenizer:
             out.append(buf.decode("utf-8", errors="replace"))
         return "".join(out)
 
-    def encode_chat(self, messages: list[dict[str, Any]], *, add_generation_prompt: bool = True,
+    def render_chat(self, messages: list[dict[str, Any]], *, add_generation_prompt: bool = True,
                     enable_thinking: bool = True, tools: list[Any] | None = None,
-                    **kwargs: Any) -> list[int]:
-        """Render the Qwen3.5 chat prompt via the checkpoint's ``chat_template.jinja`` and BPE-encode it.
+                    **kwargs: Any) -> str:
+        """Render the Qwen3.5 chat prompt to **text** via the checkpoint's ``chat_template.jinja``.
 
         ``add_generation_prompt`` appends the ``<|im_start|>assistant`` opener; with reasoning on
         (``enable_thinking=True``, the default) the template emits a bare ``<think>\\n`` opener, and with
@@ -355,7 +355,15 @@ class Qwen35Tokenizer:
             raise RuntimeError("no chat_template.jinja loaded; use Qwen35Tokenizer.from_pretrained(dir)")
         from jinja2 import Template
 
-        text = Template(tmpl).render(
+        return Template(tmpl).render(
             messages=messages, add_generation_prompt=add_generation_prompt,
             enable_thinking=enable_thinking, tools=tools, **kwargs)
+
+    def encode_chat(self, messages: list[dict[str, Any]], *, add_generation_prompt: bool = True,
+                    enable_thinking: bool = True, tools: list[Any] | None = None,
+                    **kwargs: Any) -> list[int]:
+        """Render the chat prompt (:meth:`render_chat`) and BPE-encode it (``add_bos`` forced off — the
+        template carries its own structure)."""
+        text = self.render_chat(messages, add_generation_prompt=add_generation_prompt,
+                                enable_thinking=enable_thinking, tools=tools, **kwargs)
         return self.encode(text, add_bos=False)

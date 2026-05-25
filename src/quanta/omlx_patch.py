@@ -177,19 +177,22 @@ def _patch_engine_pool(module: ModuleType) -> None:
 
 
 def _patch_tool_calling(module: ModuleType) -> None:
-    """Teach oMLX's ``parse_tool_calls`` the Kimi-K2.6 tool-call format.
+    """Teach oMLX's ``parse_tool_calls`` the quanta tool-call formats it doesn't natively cover.
 
-    oMLX's built-in registry has no Kimi parser, and our custom tokenizer exposes no mlx-lm tool
-    hooks, so Kimi tool markup falls through unparsed. The raw-output engine surfaces the markers as
-    literal text (``clean_special_tokens`` keeps them), so we wrap ``parse_tool_calls`` to extract
-    Kimi calls first and delegate everything else to the original parser."""
-    from quanta.shim.kimi_tools import parse_kimi_tool_calls
+    oMLX's built-in registry handles xml/json/gemma/glm/qwen, but our custom tokenizers expose no
+    mlx-lm tool hooks and several models use markup with no registry entry (Kimi's
+    ``<|tool_calls_section_begin|>`` special tokens; MiniMax's ``<minimax:tool_call>`` wrapper). The
+    raw-output engine surfaces all markers as literal text (``clean_special_tokens`` keeps them), so we
+    wrap ``parse_tool_calls`` to try the quanta parsers first (Kimi/MiniMax/GLM/Qwen — strict, so they
+    never swallow another format) and delegate everything else (e.g. Nemotron's ``<function=…>`` XML)
+    to the original registry parser."""
+    from quanta.shim.tool_parsers import parse_quanta_tool_calls
 
     orig = module.parse_tool_calls
 
     def parse_tool_calls(text: str, tokenizer: Any = None, tools: Any = None):
-        parsed = parse_kimi_tool_calls(text)
-        if parsed is None:  # not Kimi markup → original registry (xml/json/gemma/glm/qwen/...)
+        parsed = parse_quanta_tool_calls(text)
+        if parsed is None:  # not quanta markup → original registry (xml/json/gemma/glm/qwen/...)
             return orig(text, tokenizer, tools)
         from omlx.api.openai_models import FunctionCall, ToolCall
 

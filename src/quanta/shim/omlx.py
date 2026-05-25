@@ -150,6 +150,50 @@ class _DSV4TokenizerAdapter:
         return self.encode(text, add_bos=False) if tokenize else text
 
 
+class _RenderChatAdapter:
+    """Adapt a quanta tokenizer that renders chat via ``render_chat`` (MiniMax-M2.7 / Qwen3.5) to the
+    engine's tokenizer contract.
+
+    Like :class:`_DSV4TokenizerAdapter`, these tokenizers predate the contract: ``encode`` has no
+    ``allow_special`` flag (they always interpret added-token strings) and they expose
+    ``render_chat``/``encode_chat`` rather than ``apply_chat_template``. This thin wrapper bridges both
+    *without touching the parity-gated tokenizer*: ``encode`` accepts and ignores ``allow_special``;
+    ``apply_chat_template`` renders through ``render_chat`` with the request's chat kwargs (mapping the
+    cross-model ``thinking`` toggle onto ``enable_thinking``). ``decode``/``eos_id``/``stop_ids``/
+    ``bos_id`` delegate. It deliberately exposes no ``decode_bytes`` / ``n_base`` / ``id_to_special``,
+    so the streaming detokenizer takes its string-fallback path — these tokenizers' ``decode`` already
+    emits special-token markers verbatim (the engine's raw-output contract)."""
+
+    def __init__(self, tokenizer: Any) -> None:
+        self._tk = tokenizer
+        self.bos_id = getattr(tokenizer, "bos_id", None)
+        self.eos_id = getattr(tokenizer, "eos_id", None)
+        self.stop_ids = getattr(tokenizer, "stop_ids", None) or getattr(tokenizer, "_stop_ids", ())
+
+    def encode(self, text: str, *, add_bos: bool = False, allow_special: bool = False) -> list[int]:
+        del allow_special  # these tokenizers always interpret added-token strings (see class docstring)
+        return list(self._tk.encode(text, add_bos=add_bos))
+
+    def decode(self, ids: Sequence[int], **kw: Any) -> str:
+        return str(self._tk.decode(ids, **kw))
+
+    def apply_chat_template(self, messages: list[dict[str, Any]], *, tokenize: bool = False,
+                            add_generation_prompt: bool = True, tools: Any = None,
+                            **kwargs: Any) -> Any:
+        """Render the chat prompt (text by default, ids when ``tokenize=True``) via ``render_chat``.
+
+        The cross-model ``thinking`` toggle is mapped onto ``enable_thinking`` (Qwen reads it directly;
+        MiniMax's template ignores it harmlessly). Extra template kwargs ride through to the renderer's
+        ``**kwargs`` → jinja, which silently ignores any it does not reference."""
+        params = dict(kwargs)
+        if "enable_thinking" not in params and "thinking" in params:
+            params["enable_thinking"] = params["thinking"]
+        params.pop("thinking", None)
+        text = self._tk.render_chat(messages, add_generation_prompt=add_generation_prompt,
+                                    tools=tools, **params)
+        return self.encode(text, add_bos=False) if tokenize else text
+
+
 def _default_runtime_loader(root: Path) -> tuple[RuntimeLike, TokenizerLike]:
     """Build the resident runtime + tokenizer for an artifact, dispatched on ``model_type``.
 
@@ -177,9 +221,24 @@ def _default_runtime_loader(root: Path) -> tuple[RuntimeLike, TokenizerLike]:
         from quanta.nemotron.tokenizer import NemotronTokenizer
 
         return NemotronResidentModel(root), NemotronTokenizer(root)
+    if mt.startswith("glm"):  # GLM-5.1 (MLA + DSA Lightning-Indexer); tokenizer conforms directly
+        from quanta.glm.runtime import GLMResidentModel
+        from quanta.glm.tokenizer import GLMTokenizer
+
+        return GLMResidentModel(root), GLMTokenizer.from_pretrained(str(root))
+    if mt.startswith("minimax"):  # MiniMax-M2.7 (GQA); render_chat tokenizer needs the adapter
+        from quanta.minimax.runtime import MiniMaxResidentModel
+        from quanta.minimax.tokenizer import MiniMaxTokenizer
+
+        return MiniMaxResidentModel(root), _RenderChatAdapter(MiniMaxTokenizer.from_pretrained(str(root)))
+    if mt.startswith("qwen3_5") or mt.startswith("qwen3.5"):  # Qwen3.5 hybrid (DeltaNet + gated GQA)
+        from quanta.qwen35.runtime import Qwen35ResidentModel
+        from quanta.qwen35.tokenizer import Qwen35Tokenizer
+
+        return Qwen35ResidentModel(root), _RenderChatAdapter(Qwen35Tokenizer.from_pretrained(str(root)))
     raise OmlxShimError(
         f"no resident runtime for quanta artifact model_type={mt!r} "
-        "(supported: kimi, deepseek_v3, deepseek_v4, nemotron)"
+        "(supported: kimi, deepseek_v3, deepseek_v4, nemotron, glm, minimax, qwen3_5)"
     )
 
 
@@ -365,6 +424,37 @@ class _DSV4Stepper:
         return row
 
 
+class _SingleTokenStepper:
+    """Generic single-token decode session for the GLM-5.1 / MiniMax-M2.7 / Qwen3.5 resident runtimes.
+
+    All three expose the same single-token contract as DSV4 (``__call__(token_ids, *, caches, offset)``
+    grows a per-layer decode cache in place), so one stepper serves them: seed the cache by stepping the
+    prompt one token at a time (bounded memory — never materialize ``[1,T,vocab]`` for a long prompt),
+    then decode one token per step at the running absolute offset. This mirrors each model's standalone
+    ``generate`` exactly. Returns the last-position logits row ``[vocab]``. The cache (built by
+    :meth:`QuantaOmlxEngine._make_stepper` for the model class) is mutated in place."""
+
+    def __init__(self, runtime: RuntimeLike, cache: Any) -> None:
+        self._rt = runtime
+        self._cache = cache
+        self._offset = 0
+
+    def prefill(self, prompt_ids: list[int]) -> mx.array:
+        if not prompt_ids:
+            raise OmlxShimError("prefill got an empty prompt")
+        row = None
+        for pos, tid in enumerate(prompt_ids):  # seed positions 0..len-1, keep only the last logits
+            row = self._rt(mx.array([tid]), caches=self._cache, offset=pos)[0, -1]
+        self._offset = len(prompt_ids)
+        mx.eval(row)
+        return row
+
+    def step(self, tok: int) -> mx.array:
+        row = self._rt(mx.array([tok]), caches=self._cache, offset=self._offset)[0, -1]
+        self._offset += 1
+        return row
+
+
 class QuantaOmlxEngine(_OmlxBaseEngine):
     """oMLX ``BaseEngine`` backed by the quanta resident runtime (model-specific decode stepper)."""
 
@@ -374,6 +464,7 @@ class QuantaOmlxEngine(_OmlxBaseEngine):
         self._model_name = model_name
         self._root = Path(model_name).expanduser().resolve(strict=False)
         self._runtime = runtime
+        self._injected_runtime = runtime is not None  # explicit runtime (standalone/test) vs artifact load
         self._tokenizer = tokenizer
         self._runtime_loader = runtime_loader or _default_runtime_loader
         self._output_cls = output_cls
@@ -556,6 +647,21 @@ class QuantaOmlxEngine(_OmlxBaseEngine):
             return _MLAStepper(self._runtime, quantized_kv=quantized_kv, sparse=DEFAULT_SPARSE)
         if mt.startswith("nemotron"):
             return _NemotronStepper(self._runtime)
+        if mt.startswith("glm"):
+            from quanta.glm.decode import GLMCache
+
+            return _SingleTokenStepper(self._runtime, GLMCache(self._runtime.num_layers))
+        if mt.startswith("minimax"):
+            from quanta.minimax.decode import MiniMaxCache
+
+            return _SingleTokenStepper(self._runtime, MiniMaxCache(self._runtime.num_layers))
+        if mt.startswith("qwen3_5") or mt.startswith("qwen3.5"):  # hybrid cache needs cfg → use factory
+            return _SingleTokenStepper(self._runtime, self._runtime.make_caches())
+        if not mt and self._injected_runtime:
+            # standalone / injected runtime with no artifact model_type (tests, embedding the engine
+            # directly): use the generic single-token decoder. A *real* artifact always carries a
+            # model_type, so an unrecognized one still fails loud below (rule 6 — no mis-routing).
+            return _SingleTokenStepper(self._runtime, None)
         raise OmlxShimError(f"no decode stepper for quanta artifact model_type={mt!r}")
 
     def _sample(self, logits: mx.array, temperature: float, top_k: int, top_p: float, min_p: float,
