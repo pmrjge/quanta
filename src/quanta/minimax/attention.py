@@ -32,27 +32,74 @@ from __future__ import annotations
 import mlx.core as mx
 import mlx.nn as nn
 
+from quanta.cache_quant import dequantize_last_axis, quantize_last_axis
 from quanta.minimax.config import MiniMaxConfig
 
 
 class KVCache:
-    """Plain GQA KV cache: stores ``[B, n_kv, S, head_dim]`` k/v, grows along the seq axis."""
+    """Plain GQA KV cache: stores ``[B, n_kv, S, head_dim]`` k/v, grows along the seq axis (axis=2).
 
-    def __init__(self) -> None:
+    Two storage modes:
+
+    * ``quantized=False`` (default, historical): k/v held as **bf16** ``[B, n_kv, S, head_dim]`` —
+      exact, the path every existing prefill / decode parity gate runs against.
+    * ``quantized=True``: k/v held as **affine int8** per-token, per-group over ``head_dim`` —
+      ``mx.quantize``/``mx.dequantize`` via :mod:`quanta.cache_quant`. Storage is codes
+      ``[B, n_kv, S, head_dim/4]`` + scales/biases ``[B, n_kv, S, head_dim/group_size]`` ≈ 8.25
+      bpp (vs bf16's 16 bpp); ``update`` dequantizes the full cache for the return so SDPA-time
+      compute is unchanged. The win is **steady-state memory** at long context — MiniMax's per-token
+      KV is 4 KB / token / layer (8 KV × 128 head_dim × 2) × 62 layers ≈ 248 GB at 1M ctx in bf16;
+      int8 halves storage so 1M is achievable under the 490 GiB ceiling.
+
+    Rule 6 (no silent wrong-length state): every quantized field is sliced together by ``truncate``
+    in :class:`quanta.minimax.decode._LayerKVCache`, so rollback is lossless on either mode.
+    """
+
+    def __init__(self, *, quantized: bool = False, group_size: int = 64) -> None:
+        self.quantized = quantized
+        self.group_size = group_size
+        # bf16 mode
         self.k: mx.array | None = None
         self.v: mx.array | None = None
+        # int8 mode (codes + per-group scales/biases)
+        self.k_q: mx.array | None = None
+        self.k_s: mx.array | None = None
+        self.k_b: mx.array | None = None
+        self.v_q: mx.array | None = None
+        self.v_s: mx.array | None = None
+        self.v_b: mx.array | None = None
 
     @property
     def offset(self) -> int:
+        if self.quantized:
+            return 0 if self.k_q is None else self.k_q.shape[2]
         return 0 if self.k is None else self.k.shape[2]
 
     def update(self, k: mx.array, v: mx.array) -> tuple[mx.array, mx.array]:
-        if self.k is None:
-            self.k, self.v = k, v
+        if not self.quantized:
+            if self.k is None:
+                self.k, self.v = k, v
+            else:
+                self.k = mx.concatenate([self.k, k], axis=2)
+                self.v = mx.concatenate([self.v, v], axis=2)
+            return self.k, self.v
+        # int8 path: quantize new tokens (per-token rows along the last axis), append along S (axis=2),
+        # then dequantize the full cache for the SDPA return so the caller's path is unchanged.
+        k_qn, k_sn, k_bn = quantize_last_axis(k, self.group_size)
+        v_qn, v_sn, v_bn = quantize_last_axis(v, self.group_size)
+        if self.k_q is None:
+            self.k_q, self.k_s, self.k_b = k_qn, k_sn, k_bn
+            self.v_q, self.v_s, self.v_b = v_qn, v_sn, v_bn
         else:
-            self.k = mx.concatenate([self.k, k], axis=2)
-            self.v = mx.concatenate([self.v, v], axis=2)
-        return self.k, self.v
+            self.k_q = mx.concatenate([self.k_q, k_qn], axis=2)
+            self.k_s = mx.concatenate([self.k_s, k_sn], axis=2)
+            self.k_b = mx.concatenate([self.k_b, k_bn], axis=2)
+            self.v_q = mx.concatenate([self.v_q, v_qn], axis=2)
+            self.v_s = mx.concatenate([self.v_s, v_sn], axis=2)
+            self.v_b = mx.concatenate([self.v_b, v_bn], axis=2)
+        k_full = dequantize_last_axis(self.k_q, self.k_s, self.k_b, self.group_size, dtype=k.dtype)
+        v_full = dequantize_last_axis(self.v_q, self.v_s, self.v_b, self.group_size, dtype=v.dtype)
+        return k_full, v_full
 
 
 def _causal_mask(q_len: int, kv_len: int, dtype: mx.Dtype) -> mx.array:

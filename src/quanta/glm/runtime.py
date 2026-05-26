@@ -116,8 +116,10 @@ class GLMResidentModel:
 
     def make_caches(self) -> GLMCache:
         """A fresh per-layer decode cache (MLA KV + DSA indexer key). :mod:`quanta.glm.generate` /
-        :mod:`quanta.glm.spec` prefer this factory so the resident model is self-contained."""
-        return GLMCache(self.num_layers)
+        :mod:`quanta.glm.spec` prefer this factory so the resident model is self-contained. int8 MLA
+        latent by default — matches the Kimi pattern (MLACache(quantized=True) since #47); pass
+        ``GLMCache(n, quantized=False)`` directly for bf16."""
+        return GLMCache(self.num_layers, quantized=True)
 
     def _head(self, h: mx.array) -> mx.array:
         """Final RMSNorm → lm_head: residual ``[B,T,dim] -> [B,T,vocab]``."""

@@ -116,14 +116,20 @@ class Qwen35Cache:
     """
 
     def __init__(self, n_layers: int, cfg: Qwen35Config | None = None,
-                 *, layer_is_linear=None, snapshot_depth: int = DEFAULT_SNAPSHOT_DEPTH) -> None:
+                 *, layer_is_linear=None, snapshot_depth: int = DEFAULT_SNAPSHOT_DEPTH,
+                 quantized: bool = False, group_size: int = 64) -> None:
         if cfg is not None and layer_is_linear is None:
             def layer_is_linear(i: int) -> bool:
                 return cfg.is_linear_attention(i)
         if layer_is_linear is None:
             raise ValueError("Qwen35Cache needs cfg or layer_is_linear to type each layer")
+        self.quantized = quantized
+        self.group_size = group_size
+        # ``quantized=True`` applies only to the full-attention KV caches (the linear-attention
+        # layers carry an O(1) recurrent state — small, not a memory bottleneck, no benefit from int8).
         self.layers: list = [
-            _GDNLayerState(snapshot_depth) if layer_is_linear(i) else KVCache()
+            _GDNLayerState(snapshot_depth) if layer_is_linear(i)
+            else KVCache(quantized=quantized, group_size=group_size)
             for i in range(n_layers)
         ]
 
@@ -159,12 +165,26 @@ class Qwen35Cache:
 
 
 def _kv_truncate(cache: KVCache, length: int) -> None:
-    """Slice a GQA KV cache back to ``length`` cached positions (lossless — per-position storage)."""
-    if cache.k is None:
+    """Slice a GQA KV cache back to ``length`` cached positions (lossless — per-position storage).
+
+    Handles both bf16 and int8 storage modes: for int8 the trio (codes, scales, biases) for K and V
+    slices in lockstep along the seq axis so the rolled-back state is bit-identical to a fresh cache
+    fed only those ``length`` positions."""
+    if cache.offset == 0:
         return
     if length <= 0:
         cache.k = cache.v = None
+        cache.k_q = cache.k_s = cache.k_b = None
+        cache.v_q = cache.v_s = cache.v_b = None
         return
-    if length < cache.k.shape[2]:
-        cache.k = cache.k[:, :, :length]
-        cache.v = cache.v[:, :, :length]
+    if length < cache.offset:
+        if cache.quantized:
+            cache.k_q = cache.k_q[:, :, :length]
+            cache.k_s = cache.k_s[:, :, :length]
+            cache.k_b = cache.k_b[:, :, :length]
+            cache.v_q = cache.v_q[:, :, :length]
+            cache.v_s = cache.v_s[:, :, :length]
+            cache.v_b = cache.v_b[:, :, :length]
+        else:
+            cache.k = cache.k[:, :, :length]
+            cache.v = cache.v[:, :, :length]

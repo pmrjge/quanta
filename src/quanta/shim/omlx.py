@@ -650,11 +650,14 @@ class QuantaOmlxEngine(_OmlxBaseEngine):
         if mt.startswith("glm"):
             from quanta.glm.decode import GLMCache
 
-            return _SingleTokenStepper(self._runtime, GLMCache(self._runtime.num_layers))
+            # int8 MLA latent by default — Kimi pattern (#47). Caller passes a bf16 cache directly
+            # if they need it (e.g. tight parity testing); oMLX serving always wants int8.
+            return _SingleTokenStepper(self._runtime, GLMCache(self._runtime.num_layers, quantized=True))
         if mt.startswith("minimax"):
             from quanta.minimax.decode import MiniMaxCache
 
-            return _SingleTokenStepper(self._runtime, MiniMaxCache(self._runtime.num_layers))
+            return _SingleTokenStepper(self._runtime,
+                                       MiniMaxCache(self._runtime.num_layers, quantized=True))
         if mt.startswith("qwen3_5") or mt.startswith("qwen3.5"):  # hybrid cache needs cfg → use factory
             return _SingleTokenStepper(self._runtime, self._runtime.make_caches())
         if not mt and self._injected_runtime:

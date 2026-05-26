@@ -33,27 +33,70 @@ import math
 import mlx.core as mx
 import mlx.nn as nn
 
+from quanta.cache_quant import dequantize_last_axis, quantize_last_axis
 from quanta.qwen35.config import Qwen35Config
 
 
 class KVCache:
-    """Plain GQA KV cache: stores ``[B, n_kv, S, head_dim]`` k/v, grows along the seq axis."""
+    """Plain GQA KV cache: stores ``[B, n_kv, S, head_dim]`` k/v, grows along the seq axis (axis=2).
 
-    def __init__(self) -> None:
+    Used by the 15 full-attention layers of the hybrid (linear-attention layers carry an O(1)
+    recurrent state instead — see :class:`quanta.qwen35.decode._GDNLayerState`). Two storage modes:
+
+    * ``quantized=False`` (default): k/v held as **bf16** ``[B, n_kv, S, head_dim]`` — the
+      historical path every existing prefill / decode parity gate runs against.
+    * ``quantized=True``: k/v held as **affine int8** per-token, per-group over ``head_dim`` via
+      :mod:`quanta.cache_quant`. Storage is codes ``[B, n_kv, S, head_dim/4]`` + scales/biases
+      ``[B, n_kv, S, head_dim/group_size]`` ≈ 8.25 bpp (vs bf16's 16 bpp). ``update`` dequantizes
+      the full cache for the SDPA return so the attention path is unchanged. The win is
+      steady-state memory at 1M context (#114) — 15 full-attn layers × 2 KV × 256 head_dim = 8 KB/
+      token; int8 halves that so 1M-token serving is achievable under the 490 GiB ceiling.
+    """
+
+    def __init__(self, *, quantized: bool = False, group_size: int = 64) -> None:
+        self.quantized = quantized
+        self.group_size = group_size
+        # bf16 mode
         self.k: mx.array | None = None
         self.v: mx.array | None = None
+        # int8 mode (codes + per-group scales/biases)
+        self.k_q: mx.array | None = None
+        self.k_s: mx.array | None = None
+        self.k_b: mx.array | None = None
+        self.v_q: mx.array | None = None
+        self.v_s: mx.array | None = None
+        self.v_b: mx.array | None = None
 
     @property
     def offset(self) -> int:
+        if self.quantized:
+            return 0 if self.k_q is None else self.k_q.shape[2]
         return 0 if self.k is None else self.k.shape[2]
 
     def update(self, k: mx.array, v: mx.array) -> tuple[mx.array, mx.array]:
-        if self.k is None:
-            self.k, self.v = k, v
+        if not self.quantized:
+            if self.k is None:
+                self.k, self.v = k, v
+            else:
+                self.k = mx.concatenate([self.k, k], axis=2)
+                self.v = mx.concatenate([self.v, v], axis=2)
+            return self.k, self.v
+        # int8 path
+        k_qn, k_sn, k_bn = quantize_last_axis(k, self.group_size)
+        v_qn, v_sn, v_bn = quantize_last_axis(v, self.group_size)
+        if self.k_q is None:
+            self.k_q, self.k_s, self.k_b = k_qn, k_sn, k_bn
+            self.v_q, self.v_s, self.v_b = v_qn, v_sn, v_bn
         else:
-            self.k = mx.concatenate([self.k, k], axis=2)
-            self.v = mx.concatenate([self.v, v], axis=2)
-        return self.k, self.v
+            self.k_q = mx.concatenate([self.k_q, k_qn], axis=2)
+            self.k_s = mx.concatenate([self.k_s, k_sn], axis=2)
+            self.k_b = mx.concatenate([self.k_b, k_bn], axis=2)
+            self.v_q = mx.concatenate([self.v_q, v_qn], axis=2)
+            self.v_s = mx.concatenate([self.v_s, v_sn], axis=2)
+            self.v_b = mx.concatenate([self.v_b, v_bn], axis=2)
+        k_full = dequantize_last_axis(self.k_q, self.k_s, self.k_b, self.group_size, dtype=k.dtype)
+        v_full = dequantize_last_axis(self.v_q, self.v_s, self.v_b, self.group_size, dtype=v.dtype)
+        return k_full, v_full
 
 
 def _rms(x: mx.array, w: mx.array, eps: float) -> mx.array:

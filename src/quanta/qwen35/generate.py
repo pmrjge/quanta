@@ -121,7 +121,9 @@ def generate(
             cache = factory()
         else:
             from quanta.qwen35.decode import Qwen35Cache
-            cache = Qwen35Cache(model.num_layers, model.cfg)
+            # int8 KV on full-attn layers by default — Kimi pattern (#47). Linear-attn layers carry
+            # an O(1) recurrent state (no benefit from int8). bf16 escape: pass ``cache=`` explicitly.
+            cache = Qwen35Cache(model.num_layers, model.cfg, quantized=True)
 
     # seed the cache by stepping the prompt; keep the last position's logits (one bounded loop)
     logits = None

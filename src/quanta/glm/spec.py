@@ -35,7 +35,8 @@ def _make_caches(model):
     if factory is not None:
         return factory()
     from quanta.glm.decode import GLMCache
-    return GLMCache(model.num_layers)
+    # int8 MLA latent by default for inference — Kimi pattern (MLACache(quantized=True) since #47).
+    return GLMCache(model.num_layers, quantized=True)
 
 
 def spec_generate(model, mtp, embed: mx.array, head: mx.array, prompt_ids,

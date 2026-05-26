@@ -106,7 +106,9 @@ def generate(
         raise ValueError("prompt_ids is empty (need at least one token to prefill)")
     if cache is None:
         from quanta.glm.decode import GLMCache
-        cache = GLMCache(model.num_layers)
+        # int8 MLA latent by default for inference — matches the Kimi pattern
+        # (MLACache(quantized=True) since #47). bf16 escape hatch: pass ``cache=`` explicitly.
+        cache = GLMCache(model.num_layers, quantized=True)
 
     logits = None
     for pos, tid in enumerate(ids):

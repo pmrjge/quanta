@@ -36,21 +36,25 @@ from quanta.minimax.attention import KVCache, MiniMaxAttention
 class _LayerKVCache(KVCache):
     """Per-layer growing GQA K/V cache + lossless ``truncate`` for speculative-decode rollback.
 
-    Inherits :class:`quanta.minimax.attention.KVCache`'s ``update`` / ``offset`` unchanged (the exact
-    storage the prefill cache path writes ``[B, n_kv, S, head_dim]``); rollback is a clean prefix
-    slice because K/V is stored per absolute position.
+    Inherits :class:`quanta.minimax.attention.KVCache`'s ``update`` / ``offset`` unchanged — the
+    same storage the prefill cache path writes (``[B, n_kv, S, head_dim]`` bf16 in the historical
+    mode, or affine int8 codes + scales + biases when ``quantized=True``). Rollback is a clean
+    prefix slice on **whichever** set of fields the cache holds (per-position storage in both
+    modes).
     """
 
     def truncate(self, length: int) -> None:
         """Roll this layer back to exactly the state after consuming ``length`` tokens.
 
-        Drops the trailing ``offset - length`` positions from the K/V streams (a clean prefix slice —
-        per-position storage). ``length == offset`` is a no-op; ``length > offset`` fails loud (cannot
-        fabricate future K/V); ``length < 0`` fails loud. The slice is lossless by construction; there
-        is no lossy fallback (rule 6)."""
+        Slices the trailing ``offset - length`` positions from the K/V streams along the seq axis
+        (axis=2) — for the int8 mode every field of the trio (codes, scales, biases) is sliced
+        together so the rolled-back state is bit-identical to one that only ever appended those
+        positions. ``length == offset`` is a no-op; ``length > offset`` fails loud (cannot fabricate
+        future K/V); ``length < 0`` fails loud. The slice is lossless in either mode by
+        construction (rule 6 — no lossy fallback)."""
         if length < 0:
             raise ValueError(f"truncate length {length} < 0")
-        cur = 0 if self.k is None else self.k.shape[2]
+        cur = self.offset
         if length > cur:
             raise ValueError(f"truncate({length}) > cached length {cur}: cannot roll forward past "
                              f"consumed tokens (rule 6: no silent wrong-length state)")
@@ -58,9 +62,19 @@ class _LayerKVCache(KVCache):
             return
         if length == 0:
             self.k = self.v = None
+            self.k_q = self.k_s = self.k_b = None
+            self.v_q = self.v_s = self.v_b = None
             return
-        self.k = self.k[:, :, :length]
-        self.v = self.v[:, :, :length]
+        if self.quantized:
+            self.k_q = self.k_q[:, :, :length]
+            self.k_s = self.k_s[:, :, :length]
+            self.k_b = self.k_b[:, :, :length]
+            self.v_q = self.v_q[:, :, :length]
+            self.v_s = self.v_s[:, :, :length]
+            self.v_b = self.v_b[:, :, :length]
+        else:
+            self.k = self.k[:, :, :length]
+            self.v = self.v[:, :, :length]
 
 
 class MiniMaxCache:
@@ -72,10 +86,14 @@ class MiniMaxCache:
     the first populated layer's K/V length — exact and ``truncate``-stable.
     """
 
-    def __init__(self, n_layers: int) -> None:
+    def __init__(self, n_layers: int, *, quantized: bool = False, group_size: int = 64) -> None:
         if n_layers <= 0:
             raise ValueError(f"MiniMaxCache needs n_layers >= 1, got {n_layers}")
-        self.layers: list[_LayerKVCache] = [_LayerKVCache() for _ in range(n_layers)]
+        self.quantized = quantized
+        self.group_size = group_size
+        self.layers: list[_LayerKVCache] = [
+            _LayerKVCache(quantized=quantized, group_size=group_size) for _ in range(n_layers)
+        ]
 
     def __getitem__(self, i: int) -> _LayerKVCache:
         return self.layers[i]
@@ -88,10 +106,13 @@ class MiniMaxCache:
         """Number of tokens already cached (positions consumed); 0 before the first append.
 
         Every attention layer advances in lock-step, so any populated layer reports the same value;
-        read the first populated one (robust to a cache driving only a subset of layers)."""
+        read the first populated one (robust to a cache driving only a subset of layers). The
+        per-layer ``.offset`` already handles both bf16 (``self.k``) and int8 (``self.k_q``) storage
+        modes, so this stays the same on either."""
         for lc in self.layers:
-            if lc.k is not None:
-                return lc.k.shape[2]
+            o = lc.offset
+            if o > 0:
+                return o
         return 0
 
     def truncate(self, length: int) -> None:
@@ -107,7 +128,7 @@ class MiniMaxCache:
             raise ValueError(f"truncate({length}) > consumed length {cur}: cannot roll forward past "
                              f"consumed tokens (rule 6: no silent wrong-length state)")
         for lc in self.layers:
-            if lc.k is None:                  # subset-driven cache: this layer never advanced
+            if lc.offset == 0:                # subset-driven cache: this layer never advanced
                 continue
             lc.truncate(length)
 

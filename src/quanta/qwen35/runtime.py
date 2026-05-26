@@ -131,8 +131,10 @@ class Qwen35ResidentModel:
 
     # --- cache factory (consumed by generate / spec) -------------------------
     def make_caches(self) -> Qwen35Cache:
-        """A fresh per-layer decode cache typed by the config schedule (KV / recurrent)."""
-        return Qwen35Cache(self.num_layers, self.cfg)
+        """A fresh per-layer decode cache typed by the config schedule (KV / recurrent). int8 KV on
+        full-attn layers by default — Kimi pattern (#47); linear-attn layers stay recurrent
+        (O(1) state, no benefit from int8)."""
+        return Qwen35Cache(self.num_layers, self.cfg, quantized=True)
 
     def embed(self) -> mx.array:
         return self.embed_w

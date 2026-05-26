@@ -147,5 +147,8 @@ class MiniMaxResidentModel:
 
 
 def make_cache(model: MiniMaxResidentModel) -> MiniMaxCache:
-    """A fresh decode cache sized to ``model`` (one growing K/V cache per layer)."""
-    return MiniMaxCache(model.num_layers)
+    """A fresh decode cache sized to ``model`` (one growing K/V cache per layer). int8 KV by default
+    — matches the Kimi pattern (MLACache(quantized=True) since #47) so serving runs use the int8
+    storage win at long context. For bf16 (e.g. tight parity vs the reference), construct
+    ``MiniMaxCache(n, quantized=False)`` directly."""
+    return MiniMaxCache(model.num_layers, quantized=True)

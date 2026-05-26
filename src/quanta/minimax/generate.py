@@ -120,7 +120,10 @@ def generate(
         raise ValueError("prompt_ids is empty (need at least one token to prefill)")
     if cache is None:
         from quanta.minimax.decode import MiniMaxCache
-        cache = MiniMaxCache(model.num_layers)
+        # int8 KV cache by default for inference — matches the Kimi pattern (MLACache(quantized=True)
+        # since #47). Callers can override by passing their own bf16 cache via ``cache=`` (e.g. the
+        # parity gates and model-free tests do this with a stub).
+        cache = MiniMaxCache(model.num_layers, quantized=True)
 
     # seed the cache by stepping the prompt; keep the last position's logits (one bounded loop)
     logits = None

@@ -26,24 +26,64 @@ from __future__ import annotations
 
 import mlx.core as mx
 
+from quanta.cache_quant import dequantize_last_axis, quantize_last_axis
+
 
 class _LayerKVCache:
     """Per-layer MLA latent KV cache: the post-layernorm latent ``c_kv`` ``[B,S,kv_lora]`` and the
     roped single-head ``k_pe`` ``[B,1,S,rope]`` (the ``update(c_kv, k_pe) -> (c_kv_all, k_pe_all)``
-    protocol :meth:`quanta.glm.attention.MLAAttention.step` consumes; mirrors :class:`quanta.cache.MLACache`,
-    bf16-only)."""
+    protocol :meth:`quanta.glm.attention.MLAAttention.step` consumes; mirrors :class:`quanta.cache.MLACache`).
 
-    __slots__ = ("c_kv", "k_pe")
+    Two storage modes for ``c_kv``:
 
-    def __init__(self) -> None:
+    * ``quantized=False`` (default, historical): bf16 ``[B, S, kv_lora]``.
+    * ``quantized=True``: **affine int8** per-token, per-group over ``kv_lora`` — codes
+      ``[B, S, kv_lora/4]`` + scales/biases ``[B, S, kv_lora/group_size]`` via
+      :mod:`quanta.cache_quant` (the exact scheme :class:`quanta.cache.MLACache` ships with as
+      default since #47). ``k_pe`` is **always bf16** (small single-head rope key, not worth
+      quantizing). ``update`` dequantizes the full cache for the SDPA return so :meth:`MLAAttention.step`
+      is unchanged.
+    """
+
+    __slots__ = ("c_kv", "k_pe", "c_kv_q", "c_kv_s", "c_kv_b", "quantized", "group_size")
+
+    def __init__(self, *, quantized: bool = False, group_size: int = 128) -> None:
+        self.quantized = quantized
+        self.group_size = group_size
+        # bf16 mode
         self.c_kv: mx.array | None = None     # [B,S,kv_lora] post-layernorm latent
-        self.k_pe: mx.array | None = None     # [B,1,S,rope] roped MQA rope key
+        self.k_pe: mx.array | None = None     # [B,1,S,rope] roped MQA rope key (always bf16)
+        # int8 mode (codes + per-group scales/biases for c_kv only — k_pe stays bf16)
+        self.c_kv_q: mx.array | None = None
+        self.c_kv_s: mx.array | None = None
+        self.c_kv_b: mx.array | None = None
+
+    @property
+    def offset(self) -> int:
+        if self.quantized:
+            return 0 if self.c_kv_q is None else self.c_kv_q.shape[1]
+        return 0 if self.c_kv is None else self.c_kv.shape[1]
 
     def update(self, c_kv_new: mx.array, k_pe_new: mx.array) -> tuple[mx.array, mx.array]:
-        """Append the new token's latent + rope key; return the full streams."""
-        self.c_kv = c_kv_new if self.c_kv is None else mx.concatenate([self.c_kv, c_kv_new], axis=1)
+        """Append the new token's latent + rope key; return the full streams (latent as bf16 in
+        both modes)."""
         self.k_pe = k_pe_new if self.k_pe is None else mx.concatenate([self.k_pe, k_pe_new], axis=2)
-        return self.c_kv, self.k_pe
+        if not self.quantized:
+            self.c_kv = (c_kv_new if self.c_kv is None
+                         else mx.concatenate([self.c_kv, c_kv_new], axis=1))
+            return self.c_kv, self.k_pe
+        # int8 path: quantize the new tokens per-position, append along S (axis=1), then dequantize
+        # the full cache so the SDPA caller sees the same bf16 latent it always has.
+        q, s, b = quantize_last_axis(c_kv_new, self.group_size)
+        if self.c_kv_q is None:
+            self.c_kv_q, self.c_kv_s, self.c_kv_b = q, s, b
+        else:
+            self.c_kv_q = mx.concatenate([self.c_kv_q, q], axis=1)
+            self.c_kv_s = mx.concatenate([self.c_kv_s, s], axis=1)
+            self.c_kv_b = mx.concatenate([self.c_kv_b, b], axis=1)
+        c_kv_full = dequantize_last_axis(self.c_kv_q, self.c_kv_s, self.c_kv_b, self.group_size,
+                                        dtype=c_kv_new.dtype)
+        return c_kv_full, self.k_pe
 
 
 class _IndexKeyCache:
@@ -67,8 +107,8 @@ class _LayerCache:
 
     __slots__ = ("kv", "idx")
 
-    def __init__(self) -> None:
-        self.kv = _LayerKVCache()
+    def __init__(self, *, quantized: bool = False, group_size: int = 128) -> None:
+        self.kv = _LayerKVCache(quantized=quantized, group_size=group_size)
         self.idx = _IndexKeyCache()
 
 
@@ -80,8 +120,12 @@ class GLMCache:
     advances in lock-step, so ``offset`` reads any populated layer; ``truncate`` slices the per-position
     streams so the kept prefix is bit-identical to having only fed that many tokens (rule 4 rollback)."""
 
-    def __init__(self, n_layers: int) -> None:
-        self.layers: list[_LayerCache] = [_LayerCache() for _ in range(n_layers)]
+    def __init__(self, n_layers: int, *, quantized: bool = False, group_size: int = 128) -> None:
+        self.quantized = quantized
+        self.group_size = group_size
+        self.layers: list[_LayerCache] = [
+            _LayerCache(quantized=quantized, group_size=group_size) for _ in range(n_layers)
+        ]
 
     def __getitem__(self, i: int) -> _LayerCache:
         return self.layers[i]
@@ -93,25 +137,32 @@ class GLMCache:
     def offset(self) -> int:
         """Number of positions already cached (0 before the first append). Every layer advances in
         lock-step, so the first populated layer reports the shared value (robust to a cache driving a
-        subset of layers)."""
+        subset of layers). Reads the per-layer ``.offset`` which already handles both storage modes."""
         for lc in self.layers:
-            if lc.kv.c_kv is not None:
-                return lc.kv.c_kv.shape[1]
+            o = lc.kv.offset
+            if o > 0:
+                return o
         return 0
 
     def truncate(self, length: int) -> None:
         """Roll every layer back to exactly the state after consuming ``length`` tokens (drop rejected
-        speculative drafts). The latent / rope-key / indexer-key streams slice cleanly (per-position
-        storage), so the kept prefix is bit-identical to having only fed ``length`` tokens. A negative
-        length fails loud (rule 6); ``length >= offset`` is a no-op."""
+        speculative drafts). For bf16 mode: latent / rope-key / indexer-key streams slice cleanly
+        (per-position storage). For int8 mode: every field of the latent trio (codes, scales, biases)
+        slices in lockstep along the seq axis — bit-identical to having only fed ``length`` tokens.
+        A negative length fails loud (rule 6); ``length >= offset`` is a no-op."""
         if length < 0:
             raise ValueError(f"truncate length {length} < 0")
         if length >= self.offset:
             return
         for lc in self.layers:
-            if lc.kv.c_kv is None:
+            if lc.kv.offset == 0:
                 continue
-            lc.kv.c_kv = lc.kv.c_kv[:, :length]
+            if lc.kv.quantized:
+                lc.kv.c_kv_q = lc.kv.c_kv_q[:, :length]
+                lc.kv.c_kv_s = lc.kv.c_kv_s[:, :length]
+                lc.kv.c_kv_b = lc.kv.c_kv_b[:, :length]
+            else:
+                lc.kv.c_kv = lc.kv.c_kv[:, :length]
             lc.kv.k_pe = lc.kv.k_pe[:, :, :length]
             if lc.idx.k is not None:
                 lc.idx.k = lc.idx.k[:, :, :length]

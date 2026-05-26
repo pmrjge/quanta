@@ -46,7 +46,8 @@ def _make_caches(model):
     if factory is not None:
         return factory()
     from quanta.qwen35.decode import Qwen35Cache
-    return Qwen35Cache(model.num_layers, model.cfg)
+    # int8 KV on full-attn layers by default — Kimi pattern (#47).
+    return Qwen35Cache(model.num_layers, model.cfg, quantized=True)
 
 
 def _normalize_eos(eos_id) -> set[int]:
