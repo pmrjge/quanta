@@ -1,12 +1,13 @@
 """#52 EAGLE spec-decode benchmark: real accept-rate + tok/s with the trained drafter (full Kimi).
 
-Loads the full RAM-resident Kimi int2-g64 target + the trained EAGLE drafter (layers 10/30/50),
-prompts with real corpus tokens, and compares lossless spec-decode vs plain greedy decode:
-mean accepted tokens per target forward (1 = no speedup, k+1 = perfect) and wall-clock tok/s.
+Loads the full RAM-resident Kimi int3-g128 target + the trained EAGLE drafter (layers 10/30/50),
+prompts with real corpus tokens (sourced from the first int3g128 feature shard), and compares
+lossless spec-decode vs plain greedy decode: mean accepted tokens per target forward (1 = no
+speedup, k+1 = perfect) and wall-clock tok/s.
 
     uv run python -m parity.eagle_spec_bench [drafter.safetensors] [k]
 
-NOTE: loads the ~389 GB resident target — run only with the memory free.
+NOTE: loads ~398 GB resident target + ~12 GB embed/head/drafter — run only with the memory free.
 """
 
 from __future__ import annotations
@@ -23,9 +24,9 @@ from quanta.eagle.train import load_drafter, load_frozen_embed_head
 from quanta.generate import generate
 from quanta.runtime import ResidentModel
 
-ART = "/Users/pmrj/models/Kimi-K2.6-quanta_int2g64"
-DRAFTER = "/Users/pmrj/models/kimi_eagle/drafter_general.safetensors"
-FEATURES = "/Users/pmrj/models/kimi_eagle/features.safetensors"
+ART = "/Users/pmrj/models/Kimi-K2.6-quanta_int3g128"
+DRAFTER = "/Users/pmrj/models/kimi_eagle/drafter_int3g128.safetensors"
+FEATURES = "/Users/pmrj/models/kimi_eagle/features_int3g128/feat_0000.safetensors"
 MAXN = 128
 
 

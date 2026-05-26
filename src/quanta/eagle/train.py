@@ -137,7 +137,9 @@ def _holdout_multistep(drafter: EagleDrafter, f3: mx.array, it: mx.array, tg: mx
 def train_drafter(drafter: EagleDrafter, feat3: mx.array, in_tokens: mx.array, targets: mx.array,
                   embed: mx.array, head: mx.array, *, chunk: int = 2048, batch: int = 2,
                   epochs: int = 60, lr: float = 2e-4, holdout: int = 2, steps: int = 1,
-                  feat_w: float = 1.0, patience: int = 8, save_path: str | Path | None = None) -> dict:
+                  feat_w: float = 1.0, patience: int = 8, save_path: str | Path | None = None,
+                  seed: int | None = None, grad_clip: float | None = None,
+                  lr_schedule: str = "constant", warmup_steps: int = 0) -> dict:
     """Train over chunks with **early stopping + best-epoch restore**; return the final loss + the
     *best* per-step held-out top-1 accept. Uses the canonical EAGLE-3 loss (next-token CE +
     ``feat_w``-weighted next-feature regression, :func:`_ce_multistep`); ``steps>1`` self-feeds the
@@ -147,7 +149,23 @@ def train_drafter(drafter: EagleDrafter, feat3: mx.array, in_tokens: mx.array, t
     The holdout is evaluated **every epoch** and scored by mean per-step accept; the params are
     snapshot (and, if ``save_path`` is given, checkpointed to disk) whenever that score improves;
     training stops after ``patience`` epochs without improvement; the **best** params are restored
-    before returning. ``epochs`` is the cap, not a fixed count."""
+    before returning. ``epochs`` is the cap, not a fixed count.
+
+    Stabilization kwargs (all default to a no-op — the historical recipe is unchanged):
+
+    * ``seed`` — if set, seeds MLX's global RNG so the per-epoch chunk permutation is reproducible
+      (the only stochastic input to the training loop besides Adam's internal state).
+    * ``grad_clip`` — if set, clips the global L2 norm of the gradients to this max per step (mitigates
+      the Adam late-stage blowup that diverged the unconstrained int3g128 run from loss 2.07 at epoch
+      24 to 7.33 by epoch 27).
+    * ``lr_schedule`` — ``"constant"`` (default, no schedule), ``"cosine"`` (cosine decay from ``lr``
+      to ``0.1*lr`` over the full ``epochs * steps_per_epoch``), or ``"warmup_cosine"`` (linear warmup
+      ``0 → lr`` over ``warmup_steps``, then cosine decay).
+    * ``warmup_steps`` — required when ``lr_schedule == "warmup_cosine"``; must be in
+      ``(0, total_steps)``.
+    """
+    if seed is not None:
+        mx.random.seed(seed)
     nch = feat3.shape[0] // chunk
     f3 = feat3[:nch * chunk].reshape(nch, chunk, -1)
     it = in_tokens[:nch * chunk].reshape(nch, chunk)
@@ -156,7 +174,25 @@ def train_drafter(drafter: EagleDrafter, feat3: mx.array, in_tokens: mx.array, t
     assert n_train >= batch, f"need >= {batch} train chunks, have {n_train} (corpus too small)"
     hf3, hit, htg = f3[n_train:], it[n_train:], tg[n_train:]
 
-    opt = optim.Adam(learning_rate=lr)
+    steps_per_epoch = max(1, (n_train - batch + 1 + batch - 1) // batch)  # ceil-div over the batch stride
+    total_steps = max(1, epochs * steps_per_epoch)
+    if lr_schedule == "constant":
+        lr_sched: object = lr
+    elif lr_schedule == "cosine":
+        lr_sched = optim.cosine_decay(lr, total_steps, end=lr * 0.1)
+    elif lr_schedule == "warmup_cosine":
+        if not 0 < warmup_steps < total_steps:
+            raise ValueError(
+                f"warmup_cosine needs 0 < warmup_steps < total_steps; got "
+                f"{warmup_steps}/{total_steps}")
+        warm = optim.linear_schedule(0.0, lr, warmup_steps)
+        cos = optim.cosine_decay(lr, total_steps - warmup_steps, end=lr * 0.1)
+        lr_sched = optim.join_schedules([warm, cos], [warmup_steps])
+    else:
+        raise ValueError(
+            f"unknown lr_schedule {lr_schedule!r}; expected 'constant'/'cosine'/'warmup_cosine'")
+
+    opt = optim.Adam(learning_rate=lr_sched)
     lvg = nn.value_and_grad(drafter, lambda d, a, b, c: _ce_multistep(d, a, b, c, embed, head, steps, feat_w))
     base = _holdout_multistep(drafter, hf3, hit, htg, embed, head, steps)
     hist: list = []
@@ -168,6 +204,8 @@ def train_drafter(drafter: EagleDrafter, feat3: mx.array, in_tokens: mx.array, t
         for s in range(0, n_train - batch + 1, batch):
             idx = mx.array(order[s:s + batch])
             loss, grads = lvg(drafter, f3[idx], it[idx], tg[idx])
+            if grad_clip is not None:
+                grads, _ = optim.clip_grad_norm(grads, max_norm=grad_clip)
             opt.update(drafter, grads)
             mx.eval(drafter.parameters(), opt.state)
             last_loss = float(loss.item())

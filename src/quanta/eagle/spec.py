@@ -23,16 +23,20 @@ LAYERS = (10, 30, 50)
 def spec_generate(
     model, drafter: EagleDrafter, embed: mx.array, head: mx.array, prompt_ids,
     *, max_new: int, k: int = 4, layers: tuple[int, ...] = LAYERS,
-    quantized_kv: bool = True, sparse=DEFAULT_SPARSE, eos_id: int | None = None,
+    quantized_kv: bool = True, sparse=DEFAULT_SPARSE, absorbed: bool = False,
+    eos_id: int | None = None,
 ) -> tuple[list[int], dict]:
     """Lossless EAGLE spec-decode for Kimi-K2.6. Returns ``(tokens, stats)`` — ``stats['mean_accept']``
-    is mean tokens emitted per target forward (1 = no speedup, ``k+1`` = perfect)."""
+    is mean tokens emitted per target forward (1 = no speedup, ``k+1`` = perfect). ``absorbed=True``
+    routes the verify through the absorbed MLA fast path (cheaper SDPA, same argmax → lossless
+    preserved); ``absorbed=False`` (default) keeps the historical path the drafter was trained
+    against."""
     n = model.cfg.num_hidden_layers
     caches = [MLACache(quantized=quantized_kv) for _ in range(n)]
 
     def forward_fn(ids, c, offset, capture_layers):
         return model(ids, caches=c, offset=offset, capture_layers=capture_layers,
-                     absorbed=False, sparse=sparse)
+                     absorbed=absorbed, sparse=sparse)
 
     def truncate_fn(c, length):
         for layer in c:
