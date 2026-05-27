@@ -45,17 +45,21 @@ from quanta.dsv4.artifact import (
     FINAL_NORM_KEY,
     LM_HEAD_KEY,
     DSV4Artifact,
+    MTPArtifactView,
 )
 from quanta.dsv4.attention import _rms_w, rope_cos_sin
 from quanta.dsv4.decode import decode_step_compressed, decode_step_dense
 from quanta.dsv4.hyper import hc_expand, hc_head, hc_post, hc_pre
 from quanta.dsv4.model import dsv4_block, load_block_params
 from quanta.dsv4.moe import dsv4_moe
+from quanta.dsv4.mtp import MTPHead
 
 
 def _block_arrays(p: dict) -> list[mx.array]:
     """Every resident array of one layer's params dict (recurse into nested sub-dicts: attention holds
-    ``compressor``/``indexer`` sub-dicts; experts/shared/router are flat dicts of stacks/tensors)."""
+    ``compressor``/``indexer`` sub-dicts; experts/shared/router are flat dicts of stacks/tensors).
+
+    Skips non-array values (``group_size``/``bits`` ints in the packed expert dicts)."""
     out: list[mx.array] = []
     for v in p.values():
         if isinstance(v, dict):
@@ -73,18 +77,51 @@ class DSV4ResidentModel:
     oMLX shim's DeepSeek stepper and :func:`quanta.dsv4.generate.generate` expect.
     """
 
-    def __init__(self, art_dir: str | Path, *, n_layers: int | None = None) -> None:
+    def __init__(self, art_dir: str | Path, *, n_layers: int | None = None,
+                 packed_experts: bool = True, load_mtp: bool = True,
+                 mtp_draft_topk: int | None = 4) -> None:
+        """``packed_experts=True`` (default, #141) keeps routed expert stacks as packed int4 so the
+        full 43-layer DSV4 fits the 490 GB ceiling: ~3 GB/layer vs ~12 GB bf16. Routed MoE goes
+        through ``mx.gather_qmm``; attention/shared/norms stay bf16 (small). ``packed_experts=False``
+        falls back to bf16-dequant-at-load — historical mode for short-prefix debugging.
+
+        ``load_mtp=True`` also materializes the j=0 native MTP block (~4 GB extra resident with
+        packed experts) and exposes :attr:`mtp` as a callable :class:`quanta.dsv4.mtp.MTPHead`
+        ready for :func:`quanta.dsv4.spec.spec_generate`. The block params live under
+        ``mtp.{j}.*`` in the artifact and are loaded via :class:`MTPArtifactView` (mirror of the
+        per-layer load), so the MTP forward goes through the same packed/parity-correct path as
+        the main model.
+
+        ``mtp_draft_topk`` (default 4) tells the MTP head how many top experts to route through
+        during drafting (vs ``cfg.num_experts_per_tok = 6`` for the main / verify forward). Set
+        from the #142 sweep: top-4 matched top-6's accept rate (1.703) at a tiny draft-cost cut,
+        and beat top-1 / top-2 (1.575 / 1.703). Pass ``None`` to disable the override (full topk)
+        or any other int in ``[1, cfg.num_experts_per_tok]`` to override per-run."""
         self.art = DSV4Artifact(art_dir)
         self.cfg = self.art.cfg
         n = self.cfg.num_hidden_layers if n_layers is None else n_layers
+        self.packed_experts = packed_experts
         self.layers: list[dict] = []
         for i in range(n):  # rule-8: materialize one layer's params, eval, then drop source shards
-            p = load_block_params(self.art, self.cfg, i)
+            p = load_block_params(self.art, self.cfg, i, packed_experts=packed_experts)
             mx.eval(_block_arrays(p))
             self.layers.append(p)
             self.art.release()
             mx.clear_cache()
         self.num_layers = n  # for DSV4Cache sizing by the oMLX engine / generate
+
+        # Optional native-MTP load (j=0): combine/head + inherited decoder block under mtp.0.*
+        self.mtp: MTPHead | None = None
+        if load_mtp and self.cfg.n_mtp_layers > 0 and n == self.cfg.num_hidden_layers:
+            mview = MTPArtifactView(self.art, j=0)
+            mtp_lid = self.cfg.num_hidden_layers
+            mtp_p = load_block_params(mview, self.cfg, mtp_lid, packed_experts=packed_experts)
+            mtp_p.update(self.art.mtp(0))                       # e_proj/h_proj/enorm/hnorm/norm/hc_head_*
+            mx.eval(_block_arrays(mtp_p))
+            self.mtp_p = mtp_p
+            self.mtp = MTPHead(mtp_p, self.cfg, j=0, draft_topk=mtp_draft_topk)
+            self.art.release()
+            mx.clear_cache()
 
         # embed / final HC-head params / final norm / lm_head (bf16; head may be tied to embed)
         self.embed_w = self.art.read(EMBED_KEY)

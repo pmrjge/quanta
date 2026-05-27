@@ -73,6 +73,11 @@ class DSV4Artifact:
         """Drop cached shard handles so materialized tensors can be freed."""
         self._shards.clear()
 
+    def _has_dense(self, key: str) -> bool:
+        """True iff ``key`` is present in the weight index (works for any format, but used by the
+        loader helpers to gate optional dense control tensors like router ``bias`` / ``tid2eid``)."""
+        return key in self.weight_map
+
     # --- manifest resolution ---------------------------------------------------
     def _meta(self, key: str) -> tuple[str, dict]:
         """Resolve a logical key to ``(base, meta)``: a dense entry at the full key, else the
@@ -244,9 +249,61 @@ class DSV4Artifact:
         self.release()
         return stacks
 
+    def expert_stacks_packed(self, i: int, n_experts: int | None = None) -> dict[str, dict[str, mx.array]]:
+        """Packed routed experts → ``{w1/w3/w2: {packed, scale, bias, awq_scale, group_size, bits}}``.
+
+        Unlike :meth:`expert_stacks` this does **not** dequantize: it stacks the per-expert int4
+        AWQ codes / scales / biases / per-input-channel ``awq_scale`` into ``[E, ...]`` arrays
+        consumed by :func:`quanta.dsv4.moe._swiglu_stack_packed` via ``mx.gather_qmm``. Resident
+        cost per layer is ~3.0 GB (vs ~12 GB bf16), the win that makes the full 43-layer DSV4
+        fit the 490 GB working-set ceiling (#141).
+
+        Streamed per expert in groups of 16; shard handles released between groups so peak load
+        residency stays bounded. ``s=1`` cold/RTN experts have an ``awq_scale`` of all ones (the
+        bake writes it uniformly so the runtime path is uniform: same div-by-scale for warm/cold).
+        """
+        ne = n_experts if n_experts is not None else self.cfg.n_routed_experts
+        projs = ("w1", "w2", "w3")
+
+        # Resolve int4/group_size from the first expert (uniform across all experts of a layer).
+        first_meta = self.manifest[f"{self._bp(i)}ffn.experts.0.w1"]
+        bits, group_size = int(first_meta["bits"]), int(first_meta["group_size"])
+
+        # Per-projection accumulators of [E] lists, then stacked at end of layer.
+        per_proj: dict[str, dict[str, list[mx.array]]] = {
+            proj: {"packed": [], "scale": [], "bias": [], "awq_scale": []} for proj in projs
+        }
+        for e in range(ne):
+            for proj in projs:
+                base = f"{self._bp(i)}ffn.experts.{e}.{proj}"
+                per_proj[proj]["packed"].append(self.get(base + ".weight_packed"))
+                per_proj[proj]["scale"].append(self.get(base + ".weight_scale"))
+                per_proj[proj]["bias"].append(self.get(base + ".weight_bias"))
+                per_proj[proj]["awq_scale"].append(self.get(base + ".awq_scale"))
+            if e % 16 == 15:
+                for proj in projs:
+                    mx.eval([per_proj[proj][k][-16:] for k in ("packed", "scale", "bias", "awq_scale")])
+                self.release()
+
+        stacks: dict[str, dict[str, mx.array]] = {}
+        for proj in projs:
+            stacks[proj] = {
+                "packed": mx.stack(per_proj[proj]["packed"], axis=0),
+                "scale": mx.stack(per_proj[proj]["scale"], axis=0),
+                "bias": mx.stack(per_proj[proj]["bias"], axis=0),
+                "awq_scale": mx.stack(per_proj[proj]["awq_scale"], axis=0),
+                "group_size": group_size,
+                "bits": bits,
+            }
+            mx.eval([stacks[proj][k] for k in ("packed", "scale", "bias", "awq_scale")])
+            self.release()
+        return stacks
+
     # --- native MTP block ------------------------------------------------------
     def mtp(self, j: int = 0) -> dict[str, mx.array]:
-        """MTP block tensors: projections / norms + the inherited HC head params."""
+        """MTP-specific tensors (combine + head). For the **full** MTP decoder-block params (attn,
+        router, experts, shared, norms, HC) under the same ``mtp.{j}.`` prefix, use
+        :class:`MTPArtifactView` — :func:`quanta.dsv4.model.load_block_params` reads it unchanged."""
         p = f"mtp.{j}."
         out = {
             "e_proj": self.read(p + "e_proj.weight"),
@@ -260,7 +317,34 @@ class DSV4Artifact:
         mx.eval(list(out.values()))
         return out
 
-    # --- internal --------------------------------------------------------------
-    def _has_dense(self, key: str) -> bool:
-        """True iff ``key`` is present as a dense tensor in the index (no dequant resolution)."""
-        return key in self.weight_map
+
+class MTPArtifactView:
+    """Proxies a :class:`DSV4Artifact` but reroutes ``layers.{i}.*`` reads to ``mtp.{j}.*``.
+
+    Mirror of :class:`quanta.dsv4.loader.MTPCheckpointView` on the artifact side: by overriding
+    ``_bp`` it lets :func:`quanta.dsv4.model.load_block_params` (and the packed-expert path)
+    assemble the MTP block's inherited decoder params (attn, router, shared, experts, norms, HC)
+    from the artifact unchanged. The view exposes the same surface
+    :class:`DSV4Artifact` does, plus the wrapped instance's ``mtp(j)`` for the combine/head.
+
+    Implementation note: ``__getattr__`` rebinds class-level methods to ``self`` (the view) so the
+    method's internal ``self._bp(i)`` resolves to the view's override (returning ``mtp.{j}.``)
+    rather than the wrapped artifact's ``layers.{i}.``. Non-method attributes (``weight_map``,
+    ``manifest``, ``_shards`` …) still forward to ``_art`` so the shard cache stays single-instance.
+    """
+
+    def __init__(self, art: DSV4Artifact, j: int = 0) -> None:
+        self._art = art
+        self._j = j
+        self.cfg = art.cfg
+
+    def _bp(self, _i: int) -> str:
+        return f"mtp.{self._j}."
+
+    def __getattr__(self, name: str):
+        # Look up on the wrapped artifact's class — if it's a method, rebind to `self` so internal
+        # `self._bp(i)` calls hit our override. Otherwise forward the instance attribute.
+        cls_attr = getattr(type(self._art), name, None)
+        if callable(cls_attr) and not isinstance(cls_attr, type):
+            return cls_attr.__get__(self, type(self._art))
+        return getattr(self._art, name)

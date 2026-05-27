@@ -68,7 +68,7 @@ class KimiModel:
         token_ids: mx.array,
         *,
         n_layers: int | None = None,
-        use_fast: bool = False,
+        use_fast: bool = True,
         caches: list | None = None,
         offset: int = 0,
         sparse: XAttnConfig | None = DEFAULT_SPARSE,

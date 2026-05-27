@@ -37,12 +37,19 @@ import mlx.core as mx
 from quanta.dsv4.decode import DSV4Cache
 
 
-def _make_caches(model):
-    """A fresh decode cache for ``model`` — its own factory if it has one, else a ``DSV4Cache``."""
+def _make_caches(model, *, max_rollback: int = 1):
+    """A fresh decode cache for ``model`` — its own factory if it has one (called with ``max_rollback``
+    when supported, else without — so older factories keep working), else a default ``DSV4Cache``
+    sized for ``max_rollback``. ``max_rollback`` = the maximum number of tokens a single ``truncate``
+    can drop in one call (= ``k`` for :func:`spec_generate_k`); the cache's raw-hidden ring scales
+    with it so deeper rollbacks don't blow past the bounded window-pooling state."""
     factory = getattr(model, "make_caches", None)
     if factory is not None:
-        return factory()
-    return DSV4Cache(model.num_layers)
+        try:
+            return factory(max_rollback=max_rollback)
+        except TypeError:
+            return factory()
+    return DSV4Cache(model.num_layers, max_rollback=max_rollback)
 
 
 def spec_generate(model, mtp, embed: mx.array, head: mx.array, prompt_ids,
@@ -107,4 +114,97 @@ def spec_generate(model, mtp, embed: mx.array, head: mx.array, prompt_ids,
         "mean_accept": (sum(accept_lens) / len(accept_lens)) if accept_lens else 0.0,
         "max_accept": max(accept_lens) if accept_lens else 0,
         "k": 1,
+    }
+
+
+def spec_generate_k(model, mtp, embed: mx.array, head: mx.array, prompt_ids,
+                    *, k: int, max_new: int, eos_id: int | None = None
+                    ) -> tuple[list[int], dict]:
+    """Lossless self-speculation with ``k`` **chained** MTP drafts per round.
+
+    For each round: draft 1 token with ``MTP(main_hidden, [cur])``, then chain ``k-1`` more drafts
+    each consuming the *previous MTP step's own post-block hidden* as ``prev_hidden`` (the head was
+    trained on main-model hidden — the chain runs off-distribution, so acceptance drops fast past
+    step 1). Verify all ``k+1`` positions in **one** main-model forward over ``[cur, d_1, ..., d_k]``
+    at the current offset; accept the longest greedy-matching prefix of ``[d_1, ..., d_k]`` and
+    always emit the bonus (the main model's greedy at the first unverified position). The cache is
+    truncated to drop the rejected tail so the KV state is bit-identical to never having fed it
+    (rule-4 / losslessness — output is identical to plain greedy).
+
+    Why ``k≥2`` at all when chained drafts are off-distribution? On bandwidth-bound MoE decode the
+    verify cost per token drops sub-linearly with verify length (see ``parity/dsv4_int4_bench.py``):
+    even with low chained-accept rates a longer verify window can amortize expert weight loads
+    enough to net a win — that's the bet this entry point makes measurable. ``k=1`` is equivalent to
+    :func:`spec_generate` (kept as the parity-tested code path; this entry is the speed lever).
+
+    Mirrors :func:`spec_generate` shape (same model/cache/MTP contracts, same eos stop semantics)."""
+    if k < 1:
+        raise ValueError(f"k must be >= 1 (got {k})")
+    if k == 1:
+        return spec_generate(model, mtp, embed, head, prompt_ids, max_new=max_new, eos_id=eos_id)
+
+    last = model.cfg.num_hidden_layers - 1
+    prompt_ids = list(prompt_ids)
+    if not prompt_ids:
+        raise ValueError("spec_generate_k needs a non-empty prompt")
+    caches = _make_caches(model, max_rollback=k)    # ring must support full-suffix rejection
+
+    logits, caps = model(mx.array(prompt_ids), caches=caches, offset=0, capture_layers=(last,))
+    mx.eval(logits, caps[last])
+    q = len(prompt_ids) - 1
+    prev_hidden = caps[last][-1][None, None]            # [1,1,hc,dim] main hidden at position q
+    cur = int(mx.argmax(logits[0, -1]).item())
+    out = [cur]
+    accept_lens: list[int] = []
+    stop = eos_id is not None and cur == eos_id
+
+    while len(out) < max_new and not stop:
+        # --- draft k tokens by chaining the MTP head; first step uses MAIN hidden, subsequent ---
+        # steps feed the MTP block's own post-block hidden back in (off-distribution; accept rate
+        # decays — verify still arbitrates so this only shifts cost, never correctness).
+        drafts: list[int] = []
+        d_log, d_h = mtp(prev_hidden, mx.array([[cur]]), embed, head, return_hidden=True)
+        d_tok = int(mx.argmax(d_log[0, 0]).item())
+        drafts.append(d_tok)
+        for _step in range(k - 1):
+            d_log, d_h = mtp(d_h, mx.array([[d_tok]]), embed, head, return_hidden=True)
+            d_tok = int(mx.argmax(d_log[0, 0]).item())
+            drafts.append(d_tok)
+
+        # --- verify [cur, d_1, ..., d_k] in ONE main forward at offset q+1 ---
+        verify_seq = [cur, *drafts]
+        vlog, vcaps = model(mx.array(verify_seq), caches=caches, offset=q + 1,
+                            capture_layers=(last,))
+        bpred = mx.argmax(vlog[0], axis=-1)              # [k+1]
+        mx.eval(bpred, vcaps[last])
+        bp = [int(bpred[i].item()) for i in range(k + 1)]  # bp[i] = main greedy at position q+2+i
+
+        # accept the longest greedy-matching prefix of drafts (j tokens accepted, bonus = bp[j])
+        j = 0
+        while j < k and drafts[j] == bp[j]:
+            j += 1
+        bonus = bp[j]
+        out.extend(drafts[:j])
+        out.append(bonus)
+        accept_lens.append(j + 1)
+
+        caches.truncate((q + 1) + (j + 1))               # keep cur + j accepted drafts; drop rest
+        prev_hidden = vcaps[last][j][None, None]         # main hidden at the last accepted position
+        q = q + 1 + j
+        cur = bonus
+
+        if eos_id is not None:
+            tail = drafts[:j] + [bonus]
+            if eos_id in tail:
+                stop = True
+
+    out = out[:max_new]
+    if eos_id is not None and eos_id in out:
+        out = out[: out.index(eos_id) + 1]
+    return out, {
+        "rounds": len(accept_lens),
+        "tokens": len(out),
+        "mean_accept": (sum(accept_lens) / len(accept_lens)) if accept_lens else 0.0,
+        "max_accept": max(accept_lens) if accept_lens else 0,
+        "k": k,
     }

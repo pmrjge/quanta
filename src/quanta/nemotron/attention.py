@@ -27,37 +27,84 @@ from __future__ import annotations
 import mlx.core as mx
 import mlx.nn as nn
 
+from quanta.cache_quant import dequantize_last_axis, quantize_last_axis
 from quanta.nemotron.config import NemotronHConfig
 
 
 class KVCache:
-    """Plain GQA KV cache: stores ``[B, n_kv, S, head_dim]`` k/v, grows along the seq axis.
+    """GQA KV cache for Nemotron: stores ``[B, n_kv, S, head_dim]`` k/v, grows along the seq axis.
 
-    Speculative-decode rollback (``truncate(length)``) slices both streams cleanly along the seq axis
-    — per-position storage makes the rolled-back state bit-identical to a fresh cache fed only those
-    ``length`` positions. ``max_rollback`` declares the deepest rollback the cache will accept for
-    multi-step spec-decode (``k`` MTP drafts → rollback up to ``k`` tokens); a deeper ``truncate``
-    fails LOUD (rule 6: never silently keep a diverged state). For ``max_rollback == 0`` (the
-    plain-decode default) the cache rejects every shrinking truncate."""
+    Two storage modes (#133 audit lever — long-context steady-state memory):
 
-    def __init__(self, *, max_rollback: int = 1) -> None:
+    * ``quantized=True`` (default since #133): **affine int8** per-token, per-group over
+      ``head_dim`` — codes ``[B, n_kv, S, head_dim/4]`` + scales/biases ``[B, n_kv, S,
+      head_dim/group_size]`` via :mod:`quanta.cache_quant`. ``update`` dequantizes the full
+      cache for the SDPA return so the attention path is unchanged (same scheme as the Kimi
+      MLA cache since #47 and the GLM/MiniMax/Qwen3.5 caches since #122). At long context the
+      steady-state KV memory drops from 16 bpp to ~8.25 bpp (8 bits + ``32/group_size`` for
+      scale+bias), trading ≈2× per-step dequant cost for halved KV residency — the right call
+      at 1M context where memory is the bottleneck, not per-step decode latency.
+    * ``quantized=False``: bf16 ``[B, n_kv, S, head_dim]`` (the historical mode; kept for
+      parity gates and short-context debugging).
+
+    Speculative-decode rollback (``truncate(length)``) slices the active stream(s) cleanly along
+    the seq axis — per-position storage makes the rolled-back state bit-identical to a fresh cache
+    fed only those ``length`` positions. ``max_rollback`` declares the deepest rollback the cache
+    will accept for multi-step spec-decode (``k`` MTP drafts → rollback up to ``k`` tokens); a
+    deeper ``truncate`` fails LOUD (rule 6: never silently keep a diverged state).
+    """
+
+    def __init__(self, *, quantized: bool = True, group_size: int = 128,
+                 max_rollback: int = 1) -> None:
         if max_rollback < 0:
             raise ValueError(f"max_rollback {max_rollback} < 0")
+        self.quantized = quantized
+        self.group_size = group_size
+        self.max_rollback = int(max_rollback)
+        # bf16 mode
         self.k: mx.array | None = None
         self.v: mx.array | None = None
-        self.max_rollback = int(max_rollback)
+        # int8 mode: codes + per-group scales/biases on the head_dim axis (the last axis); grow
+        # along the seq axis (axis=2) so the trio still shares the leading ``[B, n_kv, S]`` prefix.
+        self.k_q: mx.array | None = None
+        self.k_s: mx.array | None = None
+        self.k_b: mx.array | None = None
+        self.v_q: mx.array | None = None
+        self.v_s: mx.array | None = None
+        self.v_b: mx.array | None = None
 
     @property
     def offset(self) -> int:
+        if self.quantized:
+            return 0 if self.k_q is None else self.k_q.shape[2]
         return 0 if self.k is None else self.k.shape[2]
 
     def update(self, k: mx.array, v: mx.array) -> tuple[mx.array, mx.array]:
-        if self.k is None:
-            self.k, self.v = k, v
+        """Append the new token's k/v; return the full streams (bf16 in both modes)."""
+        if not self.quantized:
+            if self.k is None:
+                self.k, self.v = k, v
+            else:
+                self.k = mx.concatenate([self.k, k], axis=2)
+                self.v = mx.concatenate([self.v, v], axis=2)
+            return self.k, self.v
+        # int8: quantize the new tokens along head_dim (last axis), then append along the seq axis
+        # (axis=2). Dequantize the full cache to bf16 so the SDPA call site is unchanged.
+        kq, ks, kb = quantize_last_axis(k, self.group_size)
+        vq, vs, vb = quantize_last_axis(v, self.group_size)
+        if self.k_q is None:
+            self.k_q, self.k_s, self.k_b = kq, ks, kb
+            self.v_q, self.v_s, self.v_b = vq, vs, vb
         else:
-            self.k = mx.concatenate([self.k, k], axis=2)
-            self.v = mx.concatenate([self.v, v], axis=2)
-        return self.k, self.v
+            self.k_q = mx.concatenate([self.k_q, kq], axis=2)
+            self.k_s = mx.concatenate([self.k_s, ks], axis=2)
+            self.k_b = mx.concatenate([self.k_b, kb], axis=2)
+            self.v_q = mx.concatenate([self.v_q, vq], axis=2)
+            self.v_s = mx.concatenate([self.v_s, vs], axis=2)
+            self.v_b = mx.concatenate([self.v_b, vb], axis=2)
+        k_full = dequantize_last_axis(self.k_q, self.k_s, self.k_b, self.group_size, dtype=k.dtype)
+        v_full = dequantize_last_axis(self.v_q, self.v_s, self.v_b, self.group_size, dtype=v.dtype)
+        return k_full, v_full
 
     def truncate(self, length: int) -> None:
         """Roll the cache back to exactly ``length`` cached positions (drop the rolled-back tail).
@@ -77,9 +124,19 @@ class KVCache:
                 f"with max_rollback >= k (the per-round chained-draft depth).")
         if length == 0:
             self.k = self.v = None
+            self.k_q = self.k_s = self.k_b = None
+            self.v_q = self.v_s = self.v_b = None
             return
-        self.k = self.k[:, :, :length]
-        self.v = self.v[:, :, :length]
+        if self.quantized:
+            self.k_q = self.k_q[:, :, :length]
+            self.k_s = self.k_s[:, :, :length]
+            self.k_b = self.k_b[:, :, :length]
+            self.v_q = self.v_q[:, :, :length]
+            self.v_s = self.v_s[:, :, :length]
+            self.v_b = self.v_b[:, :, :length]
+        else:
+            self.k = self.k[:, :, :length]
+            self.v = self.v[:, :, :length]
 
 
 def _causal_mask(q_len: int, kv_len: int, dtype: mx.Dtype) -> mx.array:

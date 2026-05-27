@@ -43,6 +43,13 @@ class NemotronLatentMoE(nn.Module):
         self.shared_up = nn.Linear(h, si, bias=False)
         self.shared_down = nn.Linear(si, h, bias=False)
         self.token_chunk = 8192
+        # Sort tokens by expert id so each expert's rows are contiguous (grouped GEMM). Mirrors
+        # Kimi's #11 sorted dispatch; output-equivalent (verified bit-identical in
+        # ``parity/nemotron_sorted_moe_test``). Default-on per the #133 optimization audit —
+        # bf16 ``gather_mm`` shows a small overhead from the sort but the same flag is the
+        # production win on the post-bake ``gather_qmm`` decode path where the int4 codestream
+        # reads benefit from grouped access; consistent default across both modules.
+        self.sort_dispatch = True
 
     def set_experts(self, up: mx.array, down: mx.array) -> None:
         self.up_stack, self.down_stack = up, down
@@ -84,10 +91,20 @@ class NemotronLatentMoE(nn.Module):
         mc = nc * topk
         exp = idx_c.reshape(-1)
         tok = mx.repeat(mx.arange(nc, dtype=mx.int32), topk)
-        up = mx.gather_mm(self.up_stack, col, lhs_indices=exp, rhs_indices=tok)  # [mc, inter, 1]
+        srt = self.sort_dispatch
+        if srt:
+            order = mx.argsort(exp)
+            inv = mx.argsort(order)
+            exp, tok = exp[order], tok[order]
+        up = mx.gather_mm(self.up_stack, col, lhs_indices=exp, rhs_indices=tok,
+                          sorted_indices=srt)  # [mc, inter, 1]
         h = relu2(up)
-        d = mx.gather_mm(self.down_stack, h, lhs_indices=exp, rhs_indices=mx.arange(mc, dtype=mx.int32))
-        d = d[:, :, 0].reshape(nc, topk, lat)
+        d = mx.gather_mm(self.down_stack, h, lhs_indices=exp,
+                         rhs_indices=mx.arange(mc, dtype=mx.int32), sorted_indices=srt)
+        d = d[:, :, 0]
+        if srt:
+            d = d[inv]  # restore (token, slot) order so the downstream weighted-sum is correct
+        d = d.reshape(nc, topk, lat)
         return mx.sum(d.astype(mx.float32) * w_c[:, :, None], axis=1).astype(lat_c.dtype)
 
     def __call__(self, x: mx.array, *, topk_override: int | None = None) -> mx.array:
@@ -138,6 +155,11 @@ class NemotronQuantizedMoE(nn.Module):
         self._up: dict[str, mx.array] = {}    # packed/scale/bias stacks [E, inter, lat_packed]
         self._down: dict[str, mx.array] = {}  # packed/scale/bias stacks [E, lat, inter_packed]
         self.token_chunk = 8192
+        # Sorted-MoE dispatch: pre-sort by expert id so gather_qmm operates on contiguous expert
+        # groups (mirrors Kimi #11). The win is on quantized stacks where the gather kernel reads
+        # an inflated packed-int4 codestream and benefits from grouped access. Output-equivalent
+        # to the unsorted path. Default-on per the #133 optimization audit.
+        self.sort_dispatch = True
 
     def set_experts(self, up: dict[str, mx.array], down: dict[str, mx.array]) -> None:
         """``up``/``down``: dicts ``{packed, scale, bias}`` of stacked ``[E,*]`` quantized experts."""
@@ -168,11 +190,13 @@ class NemotronQuantizedMoE(nn.Module):
             w = w / (mx.sum(w, axis=-1, keepdims=True) + 1e-20)
         return idx, w * self.cfg.routed_scaling_factor
 
-    def _qmm(self, x: mx.array, st: dict[str, mx.array], lhs: mx.array, rhs: mx.array) -> mx.array:
+    def _qmm(self, x: mx.array, st: dict[str, mx.array], lhs: mx.array, rhs: mx.array,
+             *, sorted_indices: bool = False) -> mx.array:
         """``gather_qmm`` over packed expert stack: gather ``x`` rows by ``lhs``, weights by ``rhs``."""
         return mx.gather_qmm(x[:, None, :], st["packed"], st["scale"], st["bias"],
                              lhs_indices=lhs, rhs_indices=rhs, transpose=True,
-                             group_size=self.group_size, bits=self.bits)[:, 0, :]
+                             group_size=self.group_size, bits=self.bits,
+                             sorted_indices=sorted_indices)[:, 0, :]
 
     def _routed_chunk(self, lat_c: mx.array, idx_c: mx.array, w_c: mx.array) -> mx.array:
         """``topk`` inferred from ``idx_c`` (== ``idx_c.shape[1]``) so the chunk works for both the
@@ -182,8 +206,20 @@ class NemotronQuantizedMoE(nn.Module):
         mc = nc * topk
         exp = idx_c.reshape(-1)
         tok = mx.repeat(mx.arange(nc, dtype=mx.int32), topk)
-        up = self._qmm(lat_c, self._up, tok, exp)                       # [mc, inter]
-        d = self._qmm(relu2(up), self._down, mx.arange(mc, dtype=mx.int32), exp)  # [mc, lat]
+        srt = self.sort_dispatch
+        if srt:
+            order = mx.argsort(exp)
+            inv = mx.argsort(order)
+            exp, tok = exp[order], tok[order]
+        up = self._qmm(lat_c, self._up, tok, exp, sorted_indices=srt)   # [mc, inter]
+        h = relu2(up)
+        if srt:
+            # the down-proj gathers ``h`` rows by ``arange(mc)`` (identity, already sorted) and
+            # weights by the same sorted ``exp``; we'll undo the permutation after.
+            d_sorted = self._qmm(h, self._down, mx.arange(mc, dtype=mx.int32), exp, sorted_indices=True)
+            d = d_sorted[inv]
+        else:
+            d = self._qmm(h, self._down, mx.arange(mc, dtype=mx.int32), exp)  # [mc, lat]
         d = d.reshape(nc, topk, lat)
         return mx.sum(d.astype(mx.float32) * w_c[:, :, None], axis=1).astype(lat_c.dtype)
 

@@ -34,7 +34,7 @@ from quanta.bake.calibrate import expert_rows
 from quanta.bake.quant import quantize_affine
 from quanta.dsv4.calibrate import capture_calibration
 from quanta.dsv4.config import DeepSeekV4Config
-from quanta.dsv4.loader import DeepSeekV4SourceCheckpoint
+from quanta.dsv4.loader import DeepSeekV4SourceCheckpoint, MTPCheckpointView
 from quanta.dsv4.moe import silu
 
 EMBED, NORMF, HEAD = "embed.weight", "norm.weight", "head.weight"
@@ -136,8 +136,22 @@ def _bake_attention(writer: ArtifactWriter, ap: str, attn: dict, cfg: DeepSeekV4
 
 
 def _bake_mtp(writer: ArtifactWriter, ck: DeepSeekV4SourceCheckpoint, cfg: DeepSeekV4Config,
-              j: int, gs: int, scale_dtype: mx.Dtype | None) -> None:
-    """MTP block: ``e_proj``/``h_proj`` int8; norms + ``hc_head_*`` dense."""
+              j: int, gs: int, scale_dtype: mx.Dtype | None, limit: float) -> int:
+    """Bake the j-th native MTP head as a full decoder block under ``mtp.{j}.``.
+
+    Two parts:
+
+    * **MTP-only tensors** (combine + head): ``e_proj``/``h_proj`` int8; ``enorm``/``hnorm``/
+      ``norm`` and ``hc_head_*`` dense — same as the source ``mtp(j)`` dict.
+    * **Inherited block** (attn / router / shared / experts / norms / HC) mirrored from the per-
+      layer bake loop, read via :class:`MTPCheckpointView` so routing keys off
+      ``mtp_lid = num_hidden_layers + j`` (the MTP block's ``compress_ratios`` slot, which
+      governs sliding-window / compressor / indexer regime). Routed experts use **RTN** (no AWQ
+      calibration): the draft head's quality only affects accept rate, not correctness, so the
+      one-extra-calibration-pass cost isn't worth the marginal win.
+
+    Returns the number of warm experts written (always 0 for RTN; kept for symmetry).
+    """
     t = ck.mtp(j)
     p = f"mtp.{j}."
     for name in ("e_proj", "h_proj"):
@@ -147,6 +161,43 @@ def _bake_mtp(writer: ArtifactWriter, ck: DeepSeekV4SourceCheckpoint, cfg: DeepS
     for k in ("fn", "base", "scale"):
         writer.add_dense(f"{p}hc_head_{k}", t[f"hc_head_{k}"])
     del t
+
+    # Inherited block: route via MTPCheckpointView so loader methods read from mtp.{j}.* with
+    # routing keyed by mtp_lid (the MTP block's compress_ratios slot — has_compressor /
+    # has_indexer / is_hash decisions match the reference's MTPBlock construction).
+    view = MTPCheckpointView(ck, j)
+    mtp_lid = cfg.num_hidden_layers + j
+
+    ap = p + "attn."
+    _bake_attention(writer, ap, view.attention(mtp_lid), cfg, mtp_lid, gs, scale_dtype)
+
+    norms = view.block_norms(mtp_lid)
+    writer.add_dense(f"{p}attn_norm.weight", norms["attn_norm"])
+    writer.add_dense(f"{p}ffn_norm.weight", norms["ffn_norm"])
+    for k, v in view.block_hc(mtp_lid).items():
+        writer.add_dense(f"{p}{k}", v)
+
+    router = view.moe_router(mtp_lid)
+    _write_int8(writer, f"{p}ffn.gate", router["weight"], gs, scale_dtype)
+    if "tid2eid" in router:
+        writer.add_dense(f"{p}ffn.gate.tid2eid", router["tid2eid"])
+    elif "bias" in router:
+        writer.add_dense(f"{p}ffn.gate.bias", router["bias"])
+
+    shared = view.shared_expert(mtp_lid)
+    for proj in ("w1", "w2", "w3"):
+        writer.add_dense(f"{p}ffn.shared_experts.{proj}.weight", shared[proj])
+
+    es = view.expert_stacks(mtp_lid, cfg.n_routed_experts)
+    warm = 0
+    for e in range(cfg.n_routed_experts):
+        base = f"{p}ffn.experts.{e}"
+        warm += int(_bake_expert(writer, base, es["w1"][e], es["w3"][e], es["w2"][e],
+                                 None, gs, "rtn", limit, scale_dtype) > 0)
+    del es, shared, router, norms
+    ck.release()
+    mx.clear_cache()
+    return warm
 
 
 def bake_dsv4(
@@ -223,7 +274,7 @@ def bake_dsv4(
 
     if include_head and cfg.n_mtp_layers > 0:  # native MTP head (baked like a decoder layer)
         for j in range(cfg.n_mtp_layers):
-            _bake_mtp(writer, ck, cfg, j, group_size, scale_dtype)
+            _bake_mtp(writer, ck, cfg, j, group_size, scale_dtype, limit)
             ck.release()
             mx.clear_cache()
 

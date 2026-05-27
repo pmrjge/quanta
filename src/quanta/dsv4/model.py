@@ -27,8 +27,13 @@ from quanta.dsv4.moe import dsv4_moe
 
 
 def dsv4_block(h: mx.array, p: dict, cfg: DeepSeekV4Config, layer_id: int,
-               ids: mx.array) -> mx.array:
-    """One decoder block on the HC residual stream ``h`` ``[B,S,hc,dim] -> [B,S,hc,dim]``."""
+               ids: mx.array, *, topk_override: int | None = None) -> mx.array:
+    """One decoder block on the HC residual stream ``h`` ``[B,S,hc,dim] -> [B,S,hc,dim]``.
+
+    ``topk_override`` (optional) is forwarded to :func:`dsv4_moe` so the MTP draft head can run
+    a lighter MoE (top-1 / top-2) without changing the main-model path (which always uses
+    ``cfg.num_experts_per_tok``). Lossless: the main model verifies every drafted token, and
+    only the drafter's routing changes."""
     eps, hc, iters, heps = cfg.norm_eps, cfg.hc_mult, cfg.hc_sinkhorn_iters, cfg.hc_eps
     attn = attention_compressed if cfg.has_compressor(layer_id) else attention_dense
 
@@ -41,19 +46,31 @@ def dsv4_block(h: mx.array, p: dict, cfg: DeepSeekV4Config, layer_id: int,
     res = h
     x, post, comb = hc_pre(h, p["hc_ffn_fn"], p["hc_ffn_scale"], p["hc_ffn_base"], hc, iters, eps, heps)
     x = _rms_w(x, p["ffn_norm"], eps)
-    x = dsv4_moe(x, p["router"], p["experts"], p["shared"], cfg, layer_id, ids)
+    x = dsv4_moe(x, p["router"], p["experts"], p["shared"], cfg, layer_id, ids,
+                 topk_override=topk_override)
     h = hc_post(x, res, post, comb)
     return h
 
 
-def load_block_params(ck, cfg: DeepSeekV4Config, layer_id: int, dtype: mx.Dtype = mx.bfloat16) -> dict:
-    """Materialize one block's params (attention + router + expert stacks + shared + norms + HC)."""
+def load_block_params(ck, cfg: DeepSeekV4Config, layer_id: int, dtype: mx.Dtype = mx.bfloat16,
+                      *, packed_experts: bool = False) -> dict:
+    """Materialize one block's params (attention + router + expert stacks + shared + norms + HC).
+
+    With ``packed_experts=True`` (the resident decode path, #141) the routed experts are loaded
+    as int4 packed dicts (``{packed, scale, bias, awq_scale, group_size, bits}``) instead of
+    bf16 ``[E,*,*]`` stacks. Attention / shared / norms / HC stay bf16/f32 — they're small.
+    ``dsv4_moe`` auto-detects the packed shape and routes through ``mx.gather_qmm``."""
     def cast(d):
         return {k: (cast(v) if isinstance(v, dict) else v.astype(dtype)) for k, v in d.items()}
 
+    if packed_experts and hasattr(ck, "expert_stacks_packed"):
+        experts = ck.expert_stacks_packed(layer_id)
+    else:
+        experts = {k: v.astype(dtype) for k, v in ck.expert_stacks(layer_id).items()}
+
     p = {"attn": cast(ck.attention(layer_id)),
          "router": ck.moe_router(layer_id),                          # gate.weight/bias bf16, tid2eid int
-         "experts": {k: v.astype(dtype) for k, v in ck.expert_stacks(layer_id).items()},
+         "experts": experts,
          "shared": cast(ck.shared_expert(layer_id))}
     p.update({k: v.astype(dtype) for k, v in ck.block_norms(layer_id).items()})
     p.update({k: v.astype(mx.float32) for k, v in ck.block_hc(layer_id).items()})   # HC params stay f32

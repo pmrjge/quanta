@@ -72,8 +72,10 @@ def mtp_combine(prev_hidden: mx.array, next_ids: mx.array, embed: mx.array, p: d
 
 
 def mtp_forward(prev_hidden: mx.array, next_ids: mx.array, embed: mx.array, head: mx.array,
-                p: dict, cfg: DeepSeekV4Config, j: int = 0) -> mx.array:
-    """One MTP head's next-token logits ``[B,T,vocab]``.
+                p: dict, cfg: DeepSeekV4Config, j: int = 0,
+                *, draft_topk: int | None = None,
+                return_hidden: bool = False) -> mx.array | tuple[mx.array, mx.array]:
+    """One MTP head's next-token logits ``[B,T,vocab]`` (and optionally its post-block HC hidden).
 
     ``prev_hidden``: the main model's HC residual stream ``[B,T,hc,d]`` (the hidden *before* the final
     HC-head reduction) at the predicting positions; ``next_ids``: the next-token ids ``[B,T]``;
@@ -85,14 +87,29 @@ def mtp_forward(prev_hidden: mx.array, next_ids: mx.array, embed: mx.array, head
     given window (the reference's teacher-forced convention; ``dsv4_block`` does not thread a decode
     offset). The MTP head only changes *which* token is drafted, never correctness — the main model
     verifies every draft (see :mod:`quanta.dsv4.spec`) — so the window convention is a speed lever,
-    not a correctness one."""
+    not a correctness one.
+
+    ``draft_topk`` (optional) routes the MTP block's MoE through only this many top experts per
+    token (instead of ``cfg.num_experts_per_tok = 6``), cutting the routed FFN cost ~6/draft_topk-fold
+    in exchange for a small drop in draft acceptance rate. Lossless: spec verify is unchanged.
+
+    ``return_hidden`` (optional): also return the MTP block's post-block HC residual ``[B,T,hc,d]``
+    (the same tensor shape as the main model's per-layer hidden, which is what this function consumes
+    as ``prev_hidden``). Enables k≥2 chained drafting in :mod:`quanta.dsv4.spec`: feed the MTP's own
+    block-out hidden back in as ``prev_hidden`` for the next draft step. The chain is architecturally
+    off-distribution (the head was trained on main-model hidden, not its own) so acceptance drops
+    fast past k=1; the spec loop still verifies losslessly, so this only trades draft cost for a
+    longer verify window — useful when the verify kernel amortizes weight loads sub-linearly."""
     lid = mtp_layer_id(cfg, j)
     h = mtp_combine(prev_hidden, next_ids, embed, p, cfg)             # [B,T,hc,d]
-    h = dsv4_block(h, p, cfg, lid, next_ids)                          # inherited decoder block
+    h = dsv4_block(h, p, cfg, lid, next_ids, topk_override=draft_topk)
     hh = hc_head(h, p["hc_head_fn"], p["hc_head_scale"], p["hc_head_base"],
                  cfg.hc_mult, cfg.norm_eps, cfg.hc_eps)               # [B,T,d]
     hh = _rms_w(hh, p["norm"], cfg.norm_eps)
-    return hh @ head.T.astype(hh.dtype)
+    logits = hh @ head.T.astype(hh.dtype)
+    if return_hidden:
+        return logits, h
+    return logits
 
 
 class MTPHead:
@@ -102,13 +119,20 @@ class MTPHead:
     uniform ``mtp(prev_hidden, next_ids, embed, head) -> logits`` call (the duck-typed surface a test
     stub mirrors). The wrapper holds no state across calls; the shared ``embed``/``head`` are passed
     in per call (they are the main model's, not MTP-owned), matching :class:`quanta.eagle.spec`'s
-    frozen-embed/head convention."""
+    frozen-embed/head convention.
 
-    def __init__(self, p: dict, cfg: DeepSeekV4Config, j: int = 0) -> None:
+    ``draft_topk`` (mutable instance attribute): if set, the MTP block's MoE routes through this
+    many top experts instead of the cfg's full top-6. The spec bench sweeps it for tuning."""
+
+    def __init__(self, p: dict, cfg: DeepSeekV4Config, j: int = 0,
+                 draft_topk: int | None = None) -> None:
         self.p = p
         self.cfg = cfg
         self.j = j
+        self.draft_topk = draft_topk
 
     def __call__(self, prev_hidden: mx.array, next_ids: mx.array, embed: mx.array,
-                 head: mx.array) -> mx.array:
-        return mtp_forward(prev_hidden, next_ids, embed, head, self.p, self.cfg, self.j)
+                 head: mx.array, *, return_hidden: bool = False
+                 ) -> mx.array | tuple[mx.array, mx.array]:
+        return mtp_forward(prev_hidden, next_ids, embed, head, self.p, self.cfg, self.j,
+                           draft_topk=self.draft_topk, return_hidden=return_hidden)

@@ -219,7 +219,9 @@ class DeepSeekV4SourceCheckpoint:
 
     # --- native MTP block ------------------------------------------------------
     def mtp(self, j: int = 0) -> dict[str, mx.array]:
-        """MTP block tensors: projections/norms + the inherited Block (attn, ffn, norms, HC)."""
+        """MTP-specific tensors only (combine + head). The inherited decoder-block params (attn,
+        router, experts, shared, norms, HC) live under the same ``mtp.{j}.`` prefix and are loaded
+        with the layer methods via an :class:`MTPCheckpointView`."""
         p = f"mtp.{j}."
         out = {
             "e_proj": self.read_dequant(p + "e_proj.weight"),
@@ -232,3 +234,38 @@ class DeepSeekV4SourceCheckpoint:
             out[f"hc_head_{k}"] = self.read(p + f"hc_head_{k}")
         mx.eval(list(out.values()))
         return out
+
+
+class MTPCheckpointView:
+    """Proxies a :class:`DeepSeekV4SourceCheckpoint` but reroutes ``layers.{i}.*`` reads to
+    ``mtp.{j}.*``.
+
+    The DSV4 source ships the j-th MTP head as a full decoder block under ``mtp.{j}.`` — same
+    sub-keys as a normal layer (attn / router / experts / shared / norms / HC), plus the MTP-only
+    combine/head tensors. By overriding only ``_bp``, every existing loader method (``attention``,
+    ``moe_router``, ``shared_expert``, ``expert_stacks``, ``block_norms``, ``block_hc``,
+    ``indexer``) reads the MTP keys with **routing decisions keyed by** ``cfg.num_hidden_layers +
+    j`` (the MTP block's compress-ratios slot). Both the bake (``_bake_mtp``) and the resident
+    runtime (``DSV4Artifact.mtp_block_params``) use this view to compose the inherited block
+    without duplicating the per-method read logic.
+
+    Implementation note: ``__getattr__`` rebinds class-level methods to ``self`` (the view) so the
+    method's internal ``self._bp(i)`` resolves to the view's override (returning ``mtp.{j}.``), not
+    to the original ``_ck._bp(i)``. Non-method attributes (``weight_map``, ``cfg``, ``_shards`` …)
+    still forward to ``_ck`` so the mmap/shard cache stays single-instance."""
+
+    def __init__(self, ck: "DeepSeekV4SourceCheckpoint", j: int = 0) -> None:
+        self._ck = ck
+        self._j = j
+        self.cfg = ck.cfg
+
+    def _bp(self, _i: int) -> str:
+        return f"mtp.{self._j}."
+
+    def __getattr__(self, name: str):
+        # Look up on the underlying checkpoint's class — if it's a method, rebind to `self` so
+        # internal `self._bp(i)` calls hit our override. Otherwise forward the instance attribute.
+        cls_attr = getattr(type(self._ck), name, None)
+        if callable(cls_attr) and not isinstance(cls_attr, type):
+            return cls_attr.__get__(self, type(self._ck))
+        return getattr(self._ck, name)

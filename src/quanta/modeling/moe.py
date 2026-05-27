@@ -56,9 +56,11 @@ class SparseMoE(nn.Module):
         self.up_stack = mx.zeros((e, inter, hidden))
         self.down_stack = mx.zeros((e, hidden, inter))
         # Sort tokens by expert id so each expert's rows are contiguous (grouped GEMM).
-        # Output-equivalent to the unsorted path; the real throughput win lands on the
-        # post-bake gather_qmm path (mlx PR #2078). Off by default until parity-proven.
-        self.sort_dispatch = False
+        # Output-equivalent to the unsorted path (verified bit-identical in #11); the real
+        # throughput win lands on the post-bake gather_qmm path (mlx PR #2078). Default-on per
+        # the #133 optimization audit — bf16 reference passes still match unsorted to within
+        # bf16 reorder ULPs.
+        self.sort_dispatch = True
         # Run tokens through the experts in chunks of this many so the routed intermediate
         # ([chunk*topk, hidden]) stays bounded at long-context prefill. Per-token independent
         # ⇒ output-equivalent; a no-op (single chunk) when n <= token_chunk (decode / short
