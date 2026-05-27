@@ -138,6 +138,19 @@ class KVCache:
             self.k = self.k[:, :, :length]
             self.v = self.v[:, :, :length]
 
+    def _copy(self) -> "KVCache":
+        """Shallow copy for batched tree-spec replication: shares the immutable MLX array refs
+        (both storage modes) so the replica is zero-copy; subsequent ``update`` on the copy creates
+        new concatenated arrays (MLX arrays are immutable), so the original cache and every sibling
+        replica stay untouched. Drives
+        :func:`quanta.nemotron.batched_runtime.replicate_state` for batched verify."""
+        new = KVCache(quantized=self.quantized, group_size=self.group_size,
+                      max_rollback=self.max_rollback)
+        new.k, new.v = self.k, self.v
+        new.k_q, new.k_s, new.k_b = self.k_q, self.k_s, self.k_b
+        new.v_q, new.v_s, new.v_b = self.v_q, self.v_s, self.v_b
+        return new
+
 
 def _causal_mask(q_len: int, kv_len: int, dtype: mx.Dtype) -> mx.array:
     """Lower-right causal additive mask (query j at abs pos kv_len-q_len+j)."""

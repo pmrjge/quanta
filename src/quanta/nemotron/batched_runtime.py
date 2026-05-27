@@ -61,6 +61,39 @@ def make_stream_state(cfg: NemotronHConfig) -> tuple[list, list, list]:
     return caches, ssm, conv
 
 
+def replicate_state(state: tuple[list, list, list], b: int) -> list[tuple[list, list, list]]:
+    """Return ``b`` parallel per-stream state triples, each initially sharing the prefix tensors.
+
+    Nemotron's "cache" is a three-tuple ``(caches, ssm, conv)`` rather than a single object (the
+    KV caches per attention layer + the Mamba ``(ssm, conv)`` recurrence state per mamba layer).
+    Each replica gets:
+
+    * a NEW per-layer ``caches`` list whose entries are :meth:`KVCache._copy` (shares the immutable
+      KV codes/scales by reference — subsequent ``update`` on a replica creates new concatenated
+      arrays and leaves the original cache + siblings untouched).
+    * a NEW per-layer ``ssm`` / ``conv`` list (the Python list spine cloned via ``list(...)``).
+      Each entry references the prefix's Mamba state tensors (MLX arrays are immutable; assigning
+      ``ssm_s[i] = new_state`` after a mixer step only mutates THIS replica's list).
+
+    Zero copy cost — the per-token weight reads dominate; this is just bookkeeping to give each
+    replica its own mutation surface so the B-wide verify amortizes the routed-MoE weight reads.
+    Drives :func:`quanta.nemotron.spec.batch_verify` for ``spec_generate_tree(batched=True)``.
+
+    Sibling-replica isolation gated model-free in
+    ``parity/nemotron_batched_tree_verify_test.py``'s "replicate fidelity" + "replica divergence".
+    """
+    if b < 1:
+        raise ValueError(f"replicate_state(B) requires B >= 1 (got {b})")
+    caches, ssm, conv = state
+    out: list[tuple[list, list, list]] = []
+    for _ in range(b):
+        caches_r = [c._copy() if c is not None else None for c in caches]
+        ssm_r = list(ssm) if ssm is not None else None
+        conv_r = list(conv) if conv is not None else None
+        out.append((caches_r, ssm_r, conv_r))
+    return out
+
+
 def make_step_state(cfg: NemotronHConfig) -> tuple[list, list, list]:
     """A pre-step state for the decode-only test path: ``conv_state`` zero-initialised on mamba
     layers so the O(1) step path engages from token 0 (used by :mod:`parity.nemotron_decode_test`'s
@@ -238,3 +271,94 @@ class NemotronBatchedResidentModel:
             stream_token_ids=stream_token_ids,
             stream_caches=stream_caches,
         )
+
+    # --- shared-offset batched step for tree-spec batched verify ----------------
+    def batch_step(
+        self,
+        tokens,
+        *,
+        replicas: list[tuple[list, list, list]],
+        offset: int,
+        capture_layer: int | None = None,
+    ) -> tuple[mx.array, mx.array | None]:
+        """One batched decode step with a SHARED offset across all ``B = len(tokens)`` streams —
+        the verify shape :func:`quanta.nemotron.spec.batch_verify` drives for batched tree-spec
+        (docs/batched_tree_verify.md). Returns ``(logits [B,1,vocab], captured [B,1,hidden] or None)``.
+
+        Differences from :meth:`step_batch`:
+
+        * single position (``T == 1``) per call — the spec's verify loops :math:`depth+1` calls;
+        * every replica shares ``offset`` (built from the same prefix via :func:`replicate_state`,
+          so they advance lock-step); the attention layers' per-replica KV caches must all already
+          sit at this offset (rule 6: validated, no silent drift);
+        * optionally captures one layer's residual ``[B, 1, hidden]`` for the MTP feature.
+
+        Reuses the same per-stream mamba/attention + batched-MoE pattern as
+        :func:`batched_decode_step`; the only new pieces are the shared-offset contract, the
+        capture, and the canonical ``[B, 1, vocab]`` stacked-logits return (vs ``step_batch``'s
+        per-stream list).
+        """
+        b = len(tokens)
+        if b < 1:
+            raise ValueError("batch_step needs >= 1 stream")
+        if b > self.max_batch:
+            raise ValueError(f"batch_step: B={b} exceeds max_batch={self.max_batch}")
+        if len(replicas) != b:
+            raise ValueError(
+                f"batch_step: len(replicas)={len(replicas)} != len(tokens)={b}"
+            )
+        # Every replica's attention-layer KV must sit at the shared offset (rule 6 / no silent drift).
+        for s, (caches_s, _ssm_s, _conv_s) in enumerate(replicas):
+            for li, c in enumerate(caches_s):
+                if c is None:
+                    continue
+                if c.offset != offset:
+                    raise ValueError(
+                        f"batch_step: replicas[{s}].caches[{li}].offset={c.offset} != "
+                        f"offset={offset} (all B replicas must sit at the shared verify offset)"
+                    )
+        if capture_layer is not None and not 0 <= capture_layer < self.num_layers:
+            raise ValueError(
+                f"batch_step: capture_layer={capture_layer} not in [0, {self.num_layers})"
+            )
+
+        # Per-stream embed (each row a single token).
+        ids_b = mx.array([int(t) for t in tokens], dtype=mx.int32)              # [B]
+        h_b = self.embed_w[ids_b][:, None].astype(mx.bfloat16)                  # [B, 1, hidden]
+        hs: list[mx.array] = [h_b[s:s + 1] for s in range(b)]                   # B × [1, 1, hidden]
+
+        captured: mx.array | None = None
+        for i, blk in enumerate(self.layers):
+            if blk.kind in ("mamba", "attention"):
+                # Per-stream state-local mixer call (bounded B-loop, rule-3 acceptable boundary).
+                # Each replica's caches/ssm/conv mutate independently — siblings unaffected via
+                # MLX immutability + per-replica list spine ownership.
+                new_hs: list[mx.array] = []
+                for s in range(b):
+                    caches_s, ssm_s, conv_s = replicas[s]
+                    y_s, ssm_s[i], conv_s[i] = blk(
+                        hs[s], cache=caches_s[i], ssm_state=ssm_s[i], conv_state=conv_s[i],
+                        use_fast=True,
+                    )
+                    new_hs.append(y_s)
+                hs = new_hs
+            elif blk.kind == "moe":
+                # Stack across replicas → ONE blk call → split. The gather_qmm routed-MoE reads
+                # each touched expert's weights once for all B rows that route to it — the win.
+                stacked = mx.concatenate(hs, axis=0)                            # [B, 1, hidden]
+                out_stacked, _, _ = blk(stacked, cache=None, ssm_state=None, conv_state=None,
+                                        use_fast=True)
+                hs = [out_stacked[s:s + 1] for s in range(b)]
+            else:
+                raise ValueError(f"unknown block kind {blk.kind!r}")
+
+            # Optional residual capture after layer i — stacked across replicas for the MTP feature.
+            if capture_layer is not None and i == capture_layer:
+                captured = mx.concatenate(hs, axis=0)                           # [B, 1, hidden]
+
+        # Final norm + lm_head over the stacked [B, 1, hidden] (single matmul, all replicas).
+        stacked_h = mx.concatenate(hs, axis=0)                                  # [B, 1, hidden]
+        stacked_h = mx.fast.rms_norm(stacked_h, self.norm_f.astype(stacked_h.dtype),
+                                     self.cfg.norm_eps)
+        logits = stacked_h @ self.lm_head_w.T.astype(stacked_h.dtype)           # [B, 1, vocab]
+        return logits, captured
