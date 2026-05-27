@@ -29,12 +29,17 @@ def silu(x: mx.array) -> mx.array:
     return x * mx.sigmoid(x)
 
 
-def qwen35_route(xf: mx.array, gate_w: mx.array, cfg: Qwen35Config) -> tuple[mx.array, mx.array]:
+def qwen35_route(xf: mx.array, gate_w: mx.array, cfg: Qwen35Config,
+                 *, topk_override: int | None = None) -> tuple[mx.array, mx.array]:
     """Top-k softmax routing. ``xf`` ``[N,hidden]`` -> ``(idx [N,topk] int32, w [N,topk] f32)``.
 
     Softmax over all experts, then select top-k and (optionally) re-normalize the gathered probs.
+
+    ``topk_override`` (optional) reduces the number of routed slots per token below
+    ``cfg.num_experts_per_tok`` — used by the MTP draft head to run a lighter MoE during
+    speculation (lossless: the main model verifies every drafted token at ``cfg.num_experts_per_tok``).
     """
-    topk = cfg.num_experts_per_tok
+    topk = topk_override if topk_override is not None else cfg.num_experts_per_tok
     logits = xf.astype(mx.float32) @ gate_w.astype(mx.float32).T          # [N, E]
     if cfg.scoring_func == "sigmoid":
         scores = mx.sigmoid(logits)
@@ -101,18 +106,30 @@ def _shared(xf: mx.array, p: dict) -> mx.array:
 
 
 def qwen35_moe(x: mx.array, p: dict, cfg: Qwen35Config, *, sparse: bool = True,
-               token_chunk: int = 8192) -> mx.array:
+               token_chunk: int = 8192,
+               topk_override: int | None = None) -> mx.array:
     """Full MoE: top-10 routed (gather_mm) + sigmoid-gated shared expert. ``x`` ``[B,S,h] -> [B,S,h]``.
 
     ``p``: ``{gate, experts_gate_up [E,2*inter,h], experts_down [E,h,inter], shared_gate_proj,
     shared_up_proj, shared_down_proj [.,h], shared_expert_gate [1,h]}``. ``sparse=False`` runs the
     dense reference (every expert) — the parity oracle, small-E only.
+
+    ``topk_override`` (optional): route to only this many top experts instead of
+    ``cfg.num_experts_per_tok``. Used by the MTP draft head (:class:`quanta.qwen35.mtp.MTPHead`)
+    to run a *lighter* MoE during speculation — cuts the routed FFN cost ~k/topk_override-fold
+    while keeping every other op identical. Forwards (verify) still use the full ``cfg.topk``
+    so spec losslessness is preserved (the main model arbitrates every emitted token).
     """
     b, s, hidden = x.shape
     n = b * s
     inter = cfg.moe_intermediate_size
+    topk = topk_override if topk_override is not None else cfg.num_experts_per_tok
+    if topk < 1 or topk > cfg.num_experts_per_tok:
+        raise ValueError(
+            f"topk_override {topk_override} must be in [1, {cfg.num_experts_per_tok}]"
+        )
     xf = x.reshape(n, hidden)
-    idx, w = qwen35_route(xf, p["gate"], cfg)
+    idx, w = qwen35_route(xf, p["gate"], cfg, topk_override=topk)
     if sparse:
         chunk = token_chunk if token_chunk and token_chunk > 0 else n
         multi = n > chunk

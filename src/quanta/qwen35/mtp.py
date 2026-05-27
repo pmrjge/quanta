@@ -59,8 +59,10 @@ def mtp_combine(prev_hidden: mx.array, next_ids: mx.array, embed: mx.array, p: d
 
 
 def mtp_forward(prev_hidden: mx.array, next_ids: mx.array, embed: mx.array, head: mx.array,
-                p: dict, cfg: Qwen35Config, block: Qwen35Block) -> mx.array:
-    """One MTP head's next-token logits ``[B,T,vocab]``.
+                p: dict, cfg: Qwen35Config, block: Qwen35Block,
+                *, draft_topk: int | None = None,
+                return_hidden: bool = False) -> mx.array | tuple[mx.array, mx.array]:
+    """One MTP head's next-token logits ``[B,T,vocab]`` (and optionally its post-block hidden).
 
     ``prev_hidden``: the main model's hidden ``[B,T,hidden]`` (before the final norm) at the predicting
     positions; ``next_ids``: the next-token ids ``[B,T]``; ``embed``/``head``: the shared embedding
@@ -72,11 +74,29 @@ def mtp_forward(prev_hidden: mx.array, next_ids: mx.array, embed: mx.array, head
     teacher-forced convention; the block here does not thread a decode offset). The MTP head only changes
     *which* token is drafted, never correctness — the main model verifies every draft (see
     :mod:`quanta.qwen35.spec`) — so the window convention is a speed lever, not a correctness one.
+
+    ``draft_topk`` (optional) routes the MTP block's MoE through only this many top experts per
+    token (instead of ``cfg.num_experts_per_tok = 10``), cutting the routed FFN cost
+    ~num_experts_per_tok/draft_topk-fold in exchange for a small drop in draft acceptance rate.
+    Lossless: spec verify is unchanged.
+
+    ``return_hidden`` (optional): also return the MTP block's post-block residual ``[B,T,hidden]``
+    (the same tensor shape as the main model's per-layer hidden, which is what this function consumes
+    as ``prev_hidden``). Enables k≥2 chained drafting in :mod:`quanta.qwen35.spec`: feed the MTP's own
+    block-out hidden back in as ``prev_hidden`` for the next draft step. The chain is architecturally
+    off-distribution (the head was trained on main-model hidden, not its own) so acceptance drops
+    fast past k=1; the spec loop still verifies losslessly, so this only trades draft cost for a
+    longer verify window — useful when the verify kernel amortizes weight loads sub-linearly.
     """
     h = mtp_combine(prev_hidden, next_ids, embed, p, cfg)             # [B,T,hidden]
-    h, _, _ = block(h, cache=None, state=None, conv_state=None)       # inherited full-attn + MoE block
+    h, _, _ = block(h, cache=None, state=None, conv_state=None,
+                    topk_override=draft_topk)                          # inherited full-attn + MoE block
+    post_block_hidden = h                                              # capture before norm + lm_head
     h = _rms_w(h, p["norm"], cfg.norm_eps)                            # MTP final norm
-    return h @ head.T.astype(h.dtype)
+    logits = h @ head.T.astype(h.dtype)
+    if return_hidden:
+        return logits, post_block_hidden
+    return logits
 
 
 def build_mtp_block(art, cfg: Qwen35Config) -> tuple[Qwen35Block, dict]:
@@ -119,21 +139,30 @@ class MTPHead:
     spec loop can draft with a uniform ``mtp(prev_hidden, next_ids, embed, head) -> logits`` call (the
     duck-typed surface a test stub mirrors). The wrapper holds no state across calls; the shared
     ``embed``/``head`` are passed in per call (they are the main model's, not MTP-owned).
+
+    ``draft_topk`` (mutable instance attribute): if set, the MTP block's MoE routes through this
+    many top experts instead of the cfg's full top-k (``num_experts_per_tok``). The spec bench
+    sweeps it for tuning.
     """
 
-    def __init__(self, block: Qwen35Block, p: dict, cfg: Qwen35Config) -> None:
+    def __init__(self, block: Qwen35Block, p: dict, cfg: Qwen35Config,
+                 draft_topk: int | None = None) -> None:
         self.block = block
         self.p = p
         self.cfg = cfg
+        self.draft_topk = draft_topk
 
     @classmethod
-    def from_artifact(cls, art, cfg: Qwen35Config) -> "MTPHead":
+    def from_artifact(cls, art, cfg: Qwen35Config,
+                      draft_topk: int | None = None) -> "MTPHead":
         """Build directly from a :class:`Qwen35Artifact` (assembles + evals the MTP block)."""
         blk, p = build_mtp_block(art, cfg)
         mx.eval([v for v in p.values()]
                 + [blk.mlp.experts_gate_up, blk.mlp.experts_down])
-        return cls(blk, p, cfg)
+        return cls(blk, p, cfg, draft_topk=draft_topk)
 
     def __call__(self, prev_hidden: mx.array, next_ids: mx.array, embed: mx.array,
-                 head: mx.array) -> mx.array:
-        return mtp_forward(prev_hidden, next_ids, embed, head, self.p, self.cfg, self.block)
+                 head: mx.array, *, return_hidden: bool = False
+                 ) -> mx.array | tuple[mx.array, mx.array]:
+        return mtp_forward(prev_hidden, next_ids, embed, head, self.p, self.cfg, self.block,
+                           draft_topk=self.draft_topk, return_hidden=return_hidden)

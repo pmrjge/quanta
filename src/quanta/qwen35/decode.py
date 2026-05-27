@@ -117,7 +117,16 @@ class Qwen35Cache:
 
     def __init__(self, n_layers: int, cfg: Qwen35Config | None = None,
                  *, layer_is_linear=None, snapshot_depth: int = DEFAULT_SNAPSHOT_DEPTH,
-                 quantized: bool = False, group_size: int = 64) -> None:
+                 quantized: bool = False, group_size: int = 64,
+                 max_rollback: int = 1) -> None:
+        """``max_rollback`` (≥ 1) enlarges the per-linear-layer recurrent-state snapshot depth so
+        :meth:`truncate` can drop up to that many trailing tokens in a single call (k≥2 chained
+        spec-decode in :mod:`quanta.qwen35.spec`). Default 1 = the k=1 spec ceiling. ``snapshot_depth``
+        is taken as ``max(snapshot_depth, max_rollback)`` so callers that explicitly raise the depth
+        still win, and a deeper-than-bounded rollback raises rather than silently diverging (rule 6).
+        """
+        if max_rollback < 1:
+            raise ValueError(f"max_rollback must be >= 1 (got {max_rollback})")
         if cfg is not None and layer_is_linear is None:
             def layer_is_linear(i: int) -> bool:
                 return cfg.is_linear_attention(i)
@@ -125,10 +134,12 @@ class Qwen35Cache:
             raise ValueError("Qwen35Cache needs cfg or layer_is_linear to type each layer")
         self.quantized = quantized
         self.group_size = group_size
+        self.max_rollback = int(max_rollback)
+        effective_depth = max(int(snapshot_depth), int(max_rollback))
         # ``quantized=True`` applies only to the full-attention KV caches (the linear-attention
         # layers carry an O(1) recurrent state — small, not a memory bottleneck, no benefit from int8).
         self.layers: list = [
-            _GDNLayerState(snapshot_depth) if layer_is_linear(i)
+            _GDNLayerState(effective_depth) if layer_is_linear(i)
             else KVCache(quantized=quantized, group_size=group_size)
             for i in range(n_layers)
         ]
@@ -154,7 +165,10 @@ class Qwen35Cache:
     def truncate(self, length: int) -> None:
         """Roll every layer back to exactly the state after consuming ``length`` tokens — losslessly
         for BOTH state types (KV slice; recurrent snapshot restore). Fails loud on a recurrent rollback
-        deeper than the retained snapshots (rule 6)."""
+        deeper than the retained snapshots (rule 6) — the per-linear-layer snapshot ring is sized for
+        ``max(snapshot_depth, max_rollback)`` (see :meth:`__init__`) so a within-bound rollback always
+        succeeds and an out-of-bounds one raises from :meth:`_GDNLayerState.truncate` rather than
+        silently keeping a diverged state."""
         if length < 0:
             raise ValueError(f"truncate length {length} < 0")
         for lc in self.layers:

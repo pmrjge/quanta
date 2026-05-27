@@ -57,8 +57,9 @@ class Qwen35MoEModule(nn.Module):
             "shared_expert_gate": self.shared_expert_gate,
         }
 
-    def __call__(self, x, *, sparse: bool = True):
-        return qwen35_moe(x, self._params(), self.cfg, sparse=sparse, token_chunk=self.token_chunk)
+    def __call__(self, x, *, sparse: bool = True, topk_override: int | None = None):
+        return qwen35_moe(x, self._params(), self.cfg, sparse=sparse,
+                          token_chunk=self.token_chunk, topk_override=topk_override)
 
 
 class Qwen35Block(nn.Module):
@@ -78,14 +79,19 @@ class Qwen35Block(nn.Module):
         self.mlp = Qwen35MoEModule(cfg)
 
     def __call__(self, x, *, cache=None, state=None, conv_state=None, use_fast=True,
-                 seq_hint=None, sparse=True):
+                 seq_hint=None, sparse=True, topk_override: int | None = None):
+        """Forward one block. ``topk_override`` is forwarded to the MoE so the MTP draft head can
+        run a lighter MoE (top-1 / top-2) without changing the main-model path (which always uses
+        ``cfg.num_experts_per_tok``). Lossless: the main model verifies every drafted token, and
+        only the drafter's routing changes."""
         h = self.input_layernorm(x)
         if self.is_linear:
             y, state, conv_state = self.mixer(h, state=state, conv_state=conv_state)
         else:
             y = self.mixer(h, cache=cache, use_fast=use_fast, seq_hint=seq_hint)
         x = x + y
-        x = x + self.mlp(self.post_attention_layernorm(x), sparse=sparse)
+        x = x + self.mlp(self.post_attention_layernorm(x), sparse=sparse,
+                         topk_override=topk_override)
         return x, state, conv_state
 
 
