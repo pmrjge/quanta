@@ -387,32 +387,27 @@ def test_enumerate_paths_malformed() -> None:
 
 
 def test_per_model_dispatch_stubs_import() -> None:
-    """The DSV4 ``spec_generate_tree`` stub is importable and raises the documented contract.
+    """Per-model ``spec_generate_tree`` entry points are importable (sanity-only).
 
-    Qwen3.5 and Nemotron implementations of ``spec_generate_tree`` use the W-parallel chain-verify
-    form (hybrid-model-safe — their recurrent state can't be losslessly tree-masked); the DSV4
-    follow-on (single-forward tree-causal-mask through the dense / compressed / indexed attention
-    regimes) remains a stub here. Each implemented model has its own per-model parity test
-    (``parity/qwen35_tree_spec_test.py``, ``parity/nemotron_tree_spec_test.py``) — those exercise
-    the spec contract with a stub main model + stub MTP; this file only smoke-checks the remaining
-    DSV4 stub still names the follow-on (rule 6 — never silently produce wrong output).
+    DSV4, Qwen3.5, and Nemotron all implement the W-parallel chain-verify form of tree drafting —
+    the form that is lossless on both pure-attention and hybrid-recurrent main models, at the cost
+    of ``W ** D + 1`` forwards per round. Each model has its own per-model parity test that
+    exercises the spec contract with a stub main model + stub MTP:
+
+    * ``parity/dsv4_tree_spec_test.py`` — DSV4 (pure attention, three regimes)
+    * ``parity/qwen35_tree_spec_test.py`` — Qwen3.5 hybrid (GDN + GQA)
+    * ``parity/nemotron_tree_spec_test.py`` — Nemotron hybrid (Mamba + GQA)
+
+    This file's structural tests cover the model-agnostic primitives in :mod:`quanta.spec.tree`
+    (``build_tree`` / ``enumerate_paths`` / ``tree_causal_mask`` / ``longest_accepted_path`` /
+    ``tree_size``). This dispatch check only smoke-tests that the per-model entries import without
+    error — the real assertions live in the per-model tests.
     """
-    from quanta.dsv4.spec import spec_generate_tree as dsv4_tree
-
-    try:
-        dsv4_tree(None, None, None, None, [1, 2, 3], width=2, depth=2, max_new=4)
-    except NotImplementedError as e:
-        assert "attention-mask plumbing" in str(e) or "spec_generate_tree" in str(e), (
-            f"dsv4: expected the contract message to name the follow-on, got: {e}"
-        )
-    else:
-        raise AssertionError("dsv4: spec_generate_tree must raise NotImplementedError")
-    # Sanity: the implemented Qwen3.5 / Nemotron entry points are importable (callable, not raising
-    # NotImplementedError on import). They are exercised in their own parity tests.
+    from quanta.dsv4.spec import spec_generate_tree as dsv4_tree  # noqa: F401
     from quanta.nemotron.spec import spec_generate_tree as nemo_tree  # noqa: F401
     from quanta.qwen35.spec import spec_generate_tree as qwen_tree  # noqa: F401
-    print("[OK] dsv4 spec_generate_tree stub raises with follow-on named; "
-          "qwen35 + nemotron entries importable")
+    print("[OK] dsv4 + qwen35 + nemotron spec_generate_tree entries all importable "
+          "(per-model parity exercised in dsv4/qwen35/nemotron_tree_spec_test.py)")
 
 
 def main() -> int:

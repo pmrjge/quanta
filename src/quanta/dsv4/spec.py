@@ -35,6 +35,7 @@ from __future__ import annotations
 import mlx.core as mx
 
 from quanta.dsv4.decode import DSV4Cache
+from quanta.spec.tree import build_tree, enumerate_paths
 
 
 def _make_caches(model, *, max_rollback: int = 1):
@@ -210,40 +211,176 @@ def spec_generate_k(model, mtp, embed: mx.array, head: mx.array, prompt_ids,
     }
 
 
+def _mtp_top_w(logits_row: mx.array, width: int) -> list[int]:
+    """Top-``width`` token ids from a ``[vocab]`` MTP logit row, most-likely first.
+
+    Used by :func:`spec_generate_tree`'s ``expand`` callable to seed the BFS tree-build. For DSV4's
+    vocab (``163_840``) and the canonical ``width ∈ {2, 4, 8}``, a single ``argsort`` is trivially
+    cheap (~µs); we never materialize a per-vocab tensor anywhere else in the spec loop."""
+    if width == 1:
+        return [int(mx.argmax(logits_row).item())]
+    idx = mx.argsort(-logits_row.astype(mx.float32))   # descending order
+    return [int(idx[i].item()) for i in range(width)]
+
+
 def spec_generate_tree(model, mtp, embed: mx.array, head: mx.array, prompt_ids,
                        *, width: int, depth: int, max_new: int,
                        eos_id: int | None = None) -> tuple[list[int], dict]:
-    """Tree drafting (EAGLE-2 style) over the native DSV4 MTP head — **structural stub** (task #157).
+    """**W-parallel chain-verify** tree drafting over the native DSV4 MTP head — lossless (#157).
 
-    The per-round contract this entry point would implement, mirroring :func:`spec_generate_k` but
-    with a tree-shaped draft instead of a linear chain:
+    Each round drafts a ``(width, depth)`` tree from the MTP head, enumerates the ``W ** D``
+    root-to-leaf draft paths, and verifies each as a chain ``[cur, *path_drafts]`` through the main
+    model — with the decode cache rolled back losslessly between paths via
+    :meth:`quanta.dsv4.decode.DSV4Cache.truncate`. The longest greedy-matching prefix across paths
+    is committed (accepted drafts + bonus); a final commit-forward re-feeds the accepted drafts to
+    advance the cache to the committed offset. Output is **bit-identical to plain greedy decode**
+    for any MTP quality (CLAUDE.md rule 4) — the head only changes which candidate set is presented
+    to verify, never which tokens commit.
 
-      1. build a (``width``, ``depth``)-tree of drafts via :func:`quanta.spec.tree.build_tree`,
-         taking the top-``width`` MTP children of each node (the MTP head is the trained DSV4 one
-         from :mod:`quanta.dsv4.mtp`, used un-retrained);
-      2. construct the tree-causal attention mask via :func:`quanta.spec.tree.tree_causal_mask`;
-      3. verify the flat tree in **one** main forward at the current offset, with that mask applied
-         in every attention layer's SDPA call;
-      4. accept the longest greedy-matching root-to-leaf path via
-         :func:`quanta.spec.tree.longest_accepted_path`; emit the accepted drafts + bonus and roll
-         the decode cache back to the committed offset.
+    Why W-parallel chain verify (and not the single-forward tree-causal-mask form)? DSV4 is
+    pure-attention (no recurrent state) and *could* admit the EAGLE-2 single-forward tree-mask form
+    — but its three attention regimes (``attention_dense`` for ratio-0 layers, the compressed-KV
+    path, and the indexed sparse path) each need explicit tree-mask plumbing through their SDPA
+    calls AND through every decode stepper in :mod:`quanta.dsv4.decode`. The W-parallel form is
+    interface-uniform with Qwen3.5 / Nemotron (also #157), reuses the existing decode steppers as-is,
+    and is the natural drop-in target for the planned batched verify (B = ``W ** D`` in ONE forward
+    via :mod:`quanta.dsv4.batched_runtime`) that flips the economics in tree drafting's favor.
 
-    EAGLE-2 reports ``mean_accept ≈ 3.5–4.5`` at ``width=4, depth=2`` (vs. our chained
-    ``k=2`` ``mean_accept=2.78``). Lossless because the main model still arbitrates every emitted
-    token — only the *candidate set* presented to verify changes (CLAUDE.md rule 4).
+    **Economics.** This implementation runs ``W ** D + 1`` main-model forwards per round
+    (``W ** D`` per-path verifies + 1 commit-forward to advance the cache to the committed offset).
+    At ``W=2, D=2`` that is 5 forwards; ``mean_accept`` is bounded by ``depth + 1``, so PER ACCEPTED
+    TOKEN this is ~2–3× the cost of :func:`spec_generate_k` (chained k=2: 1 forward at
+    ``mean_accept ≈ 2.78``). USE :func:`spec_generate_k` FOR ACTUAL DECODE SPEEDUP UNTIL THE
+    BATCHED-VERIFY OR SINGLE-FORWARD TREE-MASK FORM LANDS. This entry point is kept for (a) lossless
+    contract correctness — it admits a ``(W, D)`` tree on DSV4 without per-regime mask plumbing;
+    (b) interface uniformity with the hybrid-model paths (Qwen3.5 / Nemotron) — same call site;
+    (c) the natural follow-on batched-verify integration via :mod:`quanta.dsv4.batched_runtime`
+    that collapses the ``W ** D`` sequential forwards into ONE batched forward.
 
-    **Status — structural piece only (this commit).** The tree-build + mask + acceptance primitives
-    are in place and parity-tested model-free in ``parity/tree_spec_test.py``. The verify-side
-    plumbing — passing a tree-causal attention mask through DSV4's *three* attention regimes
-    (``attention_dense`` for ratio-0 layers, the compressed-KV path, and the indexed sparse path)
-    plus the multi-token decode steppers in :mod:`quanta.dsv4.decode` — is the per-model follow-on
-    and is NOT included here. This entry point raises ``NotImplementedError`` with the follow-on
-    named, so the contract is callable / importable but cannot silently produce wrong output
-    (CLAUDE.md rule 6). Fall back to :func:`spec_generate_k` for now.
+    Returns ``(tokens, stats)`` where ``stats`` reports ``mean_accept`` (tokens emitted per round),
+    ``rounds``, ``max_accept``, ``width``, ``depth``, and ``paths_per_round`` (= ``W ** D``).
+    Mirrors :func:`spec_generate_k`'s eos / max_new semantics. ``width=1`` degenerates to a chain
+    (= :func:`spec_generate_k` with ``k=depth``) and short-circuits to that proven path.
     """
-    del model, mtp, embed, head, prompt_ids, width, depth, max_new, eos_id
-    raise NotImplementedError(
-        "dsv4.spec_generate_tree: structural piece in place (see quanta.spec.tree). "
-        "Per-DSV4 attention-mask plumbing across the dense / compressed / indexed regimes is the "
-        "follow-on task — fall back to spec_generate_k(k=width) until that lands."
-    )
+    if width < 1 or depth < 1:
+        raise ValueError(f"width must be >= 1, depth must be >= 1 (got width={width}, depth={depth})")
+    if width == 1:
+        # A width-1 tree is a length-``depth`` chain — defer to the proven chained spec_generate_k
+        # rather than reinvent its accept/rollback logic here.
+        return spec_generate_k(model, mtp, embed, head, prompt_ids,
+                               k=depth, max_new=max_new, eos_id=eos_id)
+
+    last = model.cfg.num_hidden_layers - 1
+    prompt_ids = list(prompt_ids)
+    if not prompt_ids:
+        raise ValueError("spec_generate_tree needs a non-empty prompt")
+    # max_rollback = depth + 1: per-path verify pushes ``depth+1`` new tokens; the round-start
+    # (q+1) state must remain reachable for the per-path truncate. The +1 covers the commit-forward
+    # in the same ring window.
+    caches = _make_caches(model, max_rollback=depth + 1)
+
+    # --- prefill: verified token at position q = len(prompt)-1, plus its feature ---
+    logits, caps = model(mx.array(prompt_ids), caches=caches, offset=0, capture_layers=(last,))
+    mx.eval(logits, caps[last])
+    q = len(prompt_ids) - 1
+    prev_hidden = caps[last][-1][None, None]            # [1,1,hc,dim] main hidden at position q
+    cur = int(mx.argmax(logits[0, -1]).item())          # verified token at q+1
+    out = [cur]
+    accept_lens: list[int] = []
+    stopped = eos_id is not None and cur == eos_id
+
+    paths_per_round = width ** depth
+
+    while len(out) < max_new and not stopped:
+        # --- build the (W, D) MTP draft tree ---
+        # ``expand(parent_hidden, parent_token)`` runs ONE MTP step and returns the top-``width``
+        # children as ``[(child_token, child_hidden), ...]``. The MTP's post-block hidden is fed to
+        # the next level (off-distribution past depth 1 — the head was trained on MAIN hidden;
+        # acceptance drops fast past step 1, but the chain remains lossless because verify still
+        # arbitrates). All ``width`` children of one parent share the SAME post-MTP hidden — the
+        # MTP head only sees the parent context, not the per-child token-id branching.
+        def _expand(parent_hidden: mx.array, parent_token: int):
+            d_log, d_h = mtp(parent_hidden, mx.array([[int(parent_token)]]),
+                             embed, head, return_hidden=True)
+            top = _mtp_top_w(d_log[0, 0], width)
+            return [(tok, d_h) for tok in top]
+
+        draft = build_tree(_expand, root_hidden=prev_hidden, root_token=cur,
+                           width=width, depth=depth)
+        paths = enumerate_paths(draft.parents, draft.tokens)  # W^D paths of length D each
+
+        # --- per-path verify with cache snapshot/restore ---
+        # Track the best path's (accept length, bonus token, last-accepted-position hidden, the
+        # path itself). Captured during verify BEFORE the round-end truncate — those tensors are
+        # already materialized; the cache truncate doesn't invalidate them.
+        best_j = -1
+        best_bonus = cur                                  # safe sentinel; overwritten on first path
+        best_path: list[int] = []
+        best_hidden = prev_hidden
+
+        for path_drafts in paths:
+            verify_seq = [cur, *path_drafts]
+            vlog, vcaps = model(mx.array(verify_seq), caches=caches, offset=q + 1,
+                                capture_layers=(last,))
+            bpred = mx.argmax(vlog[0], axis=-1)            # [depth+1]
+            mx.eval(bpred, vcaps[last])
+            bp = [int(bpred[i].item()) for i in range(depth + 1)]
+
+            # Longest matching prefix of ``path_drafts`` against ``bp[:depth]``.
+            # ``bp[i]`` is the main-greedy at verify position ``i`` = the token that should follow
+            # ``verify_seq[i]``; so a draft ``path_drafts[i]`` is accepted iff
+            # ``bp[i] == path_drafts[i]``.
+            j = 0
+            while j < depth and path_drafts[j] == bp[j]:
+                j += 1
+
+            if j > best_j:
+                best_j = j
+                best_bonus = bp[j]
+                best_path = path_drafts
+                best_hidden = vcaps[last][j][None, None]   # hidden at last accepted draft / cur
+
+            # Roll back the cache so the next path verifies from the same round-start state. KV
+            # slice + compressor pooling remainder restore + indexer state — DSV4Cache.truncate
+            # handles all three regimes uniformly (gated in parity/dsv4_decode_attn_test.py).
+            # Within-bound rollback is guaranteed because max_rollback was sized to depth + 1 at
+            # make_caches time.
+            caches.truncate(q + 1)
+
+        # --- commit the best path ---
+        # Re-feed [cur, *best_path[:best_j]] starting at offset q+1 to advance the cache to the
+        # committed offset. best_j == 0 commits only cur (cache stays at q+1 — no extra forward).
+        commit_seq = [cur, *best_path[:best_j]]
+        if commit_seq:
+            _ = model(mx.array(commit_seq), caches=caches, offset=q + 1)
+            mx.eval(caches.offset)                         # materialize the cache update
+
+        # Emit accepted drafts + the bonus (the main model's greedy at the first un-accepted tree
+        # position along the best path). Mirrors :func:`spec_generate_k`'s emit pattern.
+        out.extend(best_path[:best_j])
+        out.append(best_bonus)
+        accept_lens.append(best_j + 1)
+
+        q = q + 1 + best_j
+        cur = best_bonus
+        prev_hidden = best_hidden
+
+        # Bounded eos check: only the tokens emitted *this round* could have hit an eos that wasn't
+        # caught earlier; check them inclusive of the bonus and terminate the loop after emitting.
+        if eos_id is not None:
+            tail = best_path[:best_j] + [best_bonus]
+            if eos_id in tail:
+                stopped = True
+
+    out = out[:max_new]
+    if eos_id is not None and eos_id in out:            # terminate at the first eos (inclusive)
+        out = out[: out.index(eos_id) + 1]
+    return out, {
+        "rounds": len(accept_lens),
+        "tokens": len(out),
+        "mean_accept": (sum(accept_lens) / len(accept_lens)) if accept_lens else 0.0,
+        "max_accept": max(accept_lens) if accept_lens else 0,
+        "width": width,
+        "depth": depth,
+        "paths_per_round": paths_per_round,
+    }
