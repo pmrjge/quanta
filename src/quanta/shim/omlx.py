@@ -689,3 +689,244 @@ def load_quanta_engine(model_name: str, **_: Any) -> QuantaOmlxEngine:
     if detect_quanta_artifact(model_name) is None:
         raise OmlxShimError(f"not a quanta artifact: {model_name}")
     return QuantaOmlxEngine(model_name)
+
+
+# --- Qwen3.5 agentic serving: batched runtime + multi-step MTP ------------------------------------
+#
+# Two new capabilities the Qwen3.5 path surfaces for serving — both wrap proven single-stream
+# contracts so the per-stream output is bit-identical to the existing generate path:
+#
+#   * ``Qwen35BatchedEngine`` — many concurrent agent traces share resident weights; the routed-MoE
+#     weight reads amortize across B streams via the batched runtime's ``step_batch`` (target ~10×
+#     aggregate throughput vs B=1 at B=32). Continuous batching: finished streams free their slot.
+#   * ``spec_k`` parameter — drives multi-step native MTP (k>=2 chains ``k-1`` extra drafts off the
+#     MTP's own post-block hidden; k==1 is the plain :func:`quanta.qwen35.spec.spec_generate`).
+#     Output is bit-identical to greedy regardless of ``k`` (the verify arbitrates losslessly);
+#     ``k`` is a SPEED lever only — accept rate drops past step 1 (off-distribution chained drafts)
+#     but a longer verify window amortizes routed-expert weight loads.
+#
+# Both are lazy-imported (the runtime / spec_k symbols come from sibling task agents that may not
+# be on main yet); when the import fails this engine raises a loud, named error rather than
+# silently falling back to a non-batched / non-multi-step path (CLAUDE.md #6).
+
+
+def _import_qwen35_batched():
+    """Lazy import of ``quanta.qwen35.batched_runtime`` + ``quanta.qwen35.batched_generate``.
+
+    Returns ``(Qwen35BatchedResidentModel, generate_batched)``. Raises :class:`OmlxShimError` (NOT
+    ImportError) when the in-flight sibling modules are not yet on disk — so the shim still loads on
+    a checkout without them, but a serving call requesting the batched path fails loud."""
+    try:
+        from quanta.qwen35 import batched_runtime as _qbr
+        from quanta.qwen35 import batched_generate as _qbg
+    except ImportError as e:
+        raise OmlxShimError(
+            "Qwen35BatchedEngine needs quanta.qwen35.batched_runtime + batched_generate "
+            f"(task #147 sibling): {e}") from e
+    return _qbr.Qwen35BatchedResidentModel, _qbg.generate_batched
+
+
+def _import_qwen35_spec_k():
+    """Lazy import of :func:`quanta.qwen35.spec.spec_generate_k`. Falls back to :func:`spec_generate`
+    if ``spec_generate_k`` is not yet on disk — the k=1 path is equivalent (the k-chained code path is
+    the in-flight task #149 addition). When the spec module itself is missing, raises
+    :class:`OmlxShimError`."""
+    try:
+        from quanta.qwen35 import spec as _qsp
+    except ImportError as e:
+        raise OmlxShimError(f"Qwen35BatchedEngine needs quanta.qwen35.spec: {e}") from e
+    return getattr(_qsp, "spec_generate_k", None), _qsp.spec_generate
+
+
+class Qwen35BatchedEngine(QuantaOmlxEngine):
+    """Qwen3.5 oMLX engine extended for agentic-loop serving — batched B>1 + multi-step MTP.
+
+    Inherits the single-stream ``stream_generate`` / ``chat`` path from :class:`QuantaOmlxEngine`
+    (so behavior is identical for B=1 + spec_k=1) and adds:
+
+    * :meth:`batched_generate` — drive many concurrent prompts through one resident copy of the
+      weights, dispatching ``B`` tokens through one MoE call per step. Per-request sampling
+      kwargs (temperature/top_k/top_p/min_p) honored per stream; per-request ``max_new`` / eos
+      respected per stream. Finished streams free their slot (continuous batching — the underlying
+      :func:`quanta.qwen35.batched_generate.generate_batched` already implements this).
+
+    * ``spec_k`` parameter on :meth:`spec_generate_batched` — when ``spec_k > 1`` the engine
+      dispatches per-stream through :func:`quanta.qwen35.spec.spec_generate_k` (multi-step MTP),
+      else through plain :func:`quanta.qwen35.spec.spec_generate`. Output is bit-identical to
+      plain greedy decode regardless of ``spec_k`` (the verify arbitrates losslessly), so
+      ``spec_k`` is a speed lever only:
+
+        * ``spec_k=1`` — single MTP draft per round; safe baseline (the existing parity-gated path);
+        * ``spec_k>=2`` — chain ``spec_k-1`` extra drafts off the MTP's own post-block hidden.
+          Chained drafts are off-distribution → accept rate drops fast past step 1, but a longer
+          verify window amortizes the routed-expert weight load. Numbers TBD from orchestrator benches.
+
+    Lazy imports — :class:`quanta.qwen35.batched_runtime.Qwen35BatchedResidentModel` and
+    :func:`quanta.qwen35.spec.spec_generate_k` come from sibling agents that may not be merged yet;
+    a serving call hitting either path while the sibling is absent fails loud (no silent fallback to
+    the non-batched / non-multi-step path; rule 6).
+    """
+
+    def __init__(self, model_name: str, *, max_batch: int = 32, spec_k: int = 1,
+                 **kwargs: Any) -> None:
+        """``max_batch`` caps concurrent streams in :meth:`batched_generate`; ``spec_k`` sets the
+        default MTP chain length for :meth:`spec_generate_batched` (each call may override).
+        Forwarded ``**kwargs`` go to :class:`QuantaOmlxEngine`."""
+        if max_batch < 1:
+            raise OmlxShimError(f"max_batch must be >= 1 (got {max_batch})")
+        if spec_k < 1:
+            raise OmlxShimError(f"spec_k must be >= 1 (got {spec_k})")
+        super().__init__(model_name, **kwargs)
+        self.max_batch = int(max_batch)
+        self.spec_k = int(spec_k)
+        # the batched runtime wraps the single-stream Qwen35ResidentModel — lazily built on first
+        # batched call so a B=1 + spec_k=1 deployment never touches the batched code path.
+        self._batched_model: Any = None
+
+    # --- batched lifecycle ----------------------------------------------------
+    async def stop(self) -> None:
+        """Drop the cached batched model alongside the inner runtime/tokenizer.
+
+        Without this override the parent's :meth:`QuantaOmlxEngine.stop` nulls ``_runtime`` /
+        ``_tokenizer`` but leaves ``_batched_model`` dangling — and a subsequent ``start()`` builds a
+        fresh ``_runtime`` while the next batched call short-circuits on the cached ``_batched_model``
+        that still holds the OLD runtime's ``layers`` / ``embed_w`` / ``lm_head_w`` references
+        (oMLX's engine pool stops and restarts engines on cache eviction — exactly this case)."""
+        self._batched_model = None
+        await super().stop()
+
+    def _ensure_batched_model(self) -> Any:
+        """Return the batched runtime, building it once on first batched call. The single-stream
+        :class:`QuantaOmlxEngine.start` has already loaded :attr:`_runtime` via the artifact loader;
+        the batched model wraps an *already-loaded* inner runtime via ``from_inner`` so the artifact
+        is read once (rule 8 — one layer resident at load time, not duplicated).
+
+        Validates that the inner runtime carries the Qwen3.5 surface the batched runtime's
+        ``from_inner`` needs (``layers`` / ``embed_w`` / ``norm_w`` / ``lm_head_w`` / ``cfg``) — fails
+        loud (CLAUDE.md #6) when the engine was constructed over a non-Qwen3.5 artifact rather than
+        crashing later with an opaque ``AttributeError`` from the runtime mismatch.
+        """
+        if self._batched_model is not None:
+            return self._batched_model
+        if self._runtime is None:
+            raise OmlxShimError("Qwen35BatchedEngine: call await engine.start() before batched serving")
+        rt = self._runtime
+        missing = [a for a in ("layers", "embed_w", "norm_w", "lm_head_w", "cfg") if not hasattr(rt, a)]
+        if missing:
+            raise OmlxShimError(
+                f"Qwen35BatchedEngine: inner runtime {type(rt).__name__} is missing attrs "
+                f"{missing} (Qwen3.5 surface). Check model_type={self.model_type!r} — only "
+                "qwen3_5 artifacts are supported by this engine.")
+        Qwen35BatchedResidentModel, _ = _import_qwen35_batched()
+        # the inner runtime is the single-stream resident model already loaded by start(); reuse its
+        # weights via from_inner so we never double-load the artifact.
+        self._batched_model = Qwen35BatchedResidentModel.from_inner(
+            rt.layers, rt.embed_w, rt.norm_w, rt.lm_head_w, rt.cfg, max_batch=self.max_batch)
+        return self._batched_model
+
+    # --- batched generation ---------------------------------------------------
+    async def batched_generate(self, prompts: Sequence[Sequence[int]], *,
+                               max_new_tokens: int = 256,
+                               temperature: float | Sequence[float] = 0.0,
+                               top_p: float | Sequence[float] = 1.0,
+                               top_k: int | Sequence[int] = 0,
+                               min_p: float | Sequence[float] = 0.0,
+                               eos_id: Any = None,
+                               seeds: int | Sequence[int] = 0) -> list[list[int]]:
+        """Generate up to ``max_new_tokens`` per prompt over ``B=len(prompts)`` concurrent streams.
+
+        ``prompts`` are TOKEN-ID iterables (not strings — the orchestrator owns prompt rendering, so
+        each agent trace can carry its own chat template / system prompt). Per-stream sampling
+        kwargs (temperature/top_k/top_p/min_p) accept a scalar (applied to every stream) OR a
+        per-stream sequence of length ``B``; ``seeds`` likewise accepts a single int (offset per
+        stream so each gets its own key) or a per-stream sequence.
+
+        Per-stream output is bit-identical to running :func:`quanta.qwen35.generate.generate` on
+        each prompt alone with the same args (the batched runtime's step is parity-gated equal to
+        the single-stream step, and the sampler is the very same function — gated in
+        ``parity/qwen35_batched_test.py``).
+
+        Fails loud (:class:`OmlxShimError`) when ``B > max_batch`` rather than silently rebatching
+        — the caller picks the queue policy."""
+        await self.start()
+        b = len(prompts)
+        if b == 0:
+            return []
+        if b > self.max_batch:
+            raise OmlxShimError(
+                f"batched_generate: B={b} exceeds max_batch={self.max_batch} "
+                "(raise max_batch on construction or split the queue)")
+        model = self._ensure_batched_model()
+        _, generate_batched = _import_qwen35_batched()
+        # eos default: the engine's own configured stop set (tokenizer eos + stop_ids) so the batched
+        # path matches the single-stream stop semantics. Caller may override with an explicit eos_id.
+        stop_set = eos_id if eos_id is not None else (self._eos or None)
+        self._active += b
+        try:
+            return generate_batched(model, prompts, max_new_tokens=max_new_tokens,
+                                    temperature=temperature, top_k=top_k, top_p=top_p, min_p=min_p,
+                                    eos_id=stop_set, seeds=seeds)
+        finally:
+            self._active -= b
+
+    # --- multi-step MTP -------------------------------------------------------
+    async def spec_generate_batched(self, mtp: Any, embed: mx.array, head: mx.array,
+                                    prompt_ids: Sequence[int], *, max_new: int,
+                                    eos_id: Any = None, spec_k: int | None = None
+                                    ) -> tuple[list[int], dict]:
+        """Single-stream native-MTP self-speculative generation, ``k = spec_k`` (default
+        :attr:`spec_k`). Output is bit-identical to plain greedy regardless of ``spec_k``.
+
+        ``mtp`` is the native MTP head (callable contract per
+        :class:`quanta.qwen35.mtp.MTPHead`); ``embed`` / ``head`` are the shared embedding / LM-head
+        matrices the combine + readout need. ``prompt_ids`` is the prompt's token ids.
+
+        Dispatch:
+
+        * ``spec_k == 1`` -> :func:`quanta.qwen35.spec.spec_generate` (the existing parity-tested
+          single-draft path);
+        * ``spec_k >= 2`` -> :func:`quanta.qwen35.spec.spec_generate_k` (chained drafts, in-flight
+          sibling task #149). When that symbol is not yet on disk, raises :class:`OmlxShimError`.
+
+        Returns ``(tokens, stats)`` with ``stats['k'] == spec_k`` so the orchestrator can compare
+        accept-rate / throughput across ``spec_k`` settings.
+        """
+        await self.start()
+        k = self.spec_k if spec_k is None else int(spec_k)
+        if k < 1:
+            raise OmlxShimError(f"spec_k must be >= 1 (got {k})")
+        spec_generate_k_fn, spec_generate_fn = _import_qwen35_spec_k()
+        self._active += 1
+        try:
+            if k == 1:
+                # bit-identical to the existing single-draft path (parity-gated in
+                # parity/qwen35_mtp_spec_test.py); use spec_generate directly.
+                return spec_generate_fn(self._runtime, mtp, embed, head, prompt_ids,
+                                        max_new=max_new, eos_id=eos_id)
+            if spec_generate_k_fn is None:
+                raise OmlxShimError(
+                    f"spec_k={k} needs quanta.qwen35.spec.spec_generate_k (in-flight task #149); "
+                    "fall back to spec_k=1 or wait for the sibling agent to merge")
+            return spec_generate_k_fn(self._runtime, mtp, embed, head, prompt_ids,
+                                      k=k, max_new=max_new, eos_id=eos_id)
+        finally:
+            self._active -= 1
+
+
+def load_qwen35_batched_engine(model_name: str, *, max_batch: int = 32, spec_k: int = 1,
+                               **_: Any) -> Qwen35BatchedEngine:
+    """Factory for an agentic-loop Qwen3.5 deployment (batched + multi-step MTP).
+
+    Refuses non-Qwen3.5 artifacts loudly (rule 6 — never guess a decode convention): the batched
+    runtime is Qwen3.5-specific (its ``step_batch`` threads the GDN recurrent state + GQA KV cache
+    per stream), so a Nemotron / Kimi / DSV4 artifact routed here would crash later with an
+    AttributeError from the runtime mismatch."""
+    info = detect_quanta_artifact(model_name)
+    if info is None:
+        raise OmlxShimError(f"not a quanta artifact: {model_name}")
+    mt = (info.model_type or "")
+    if not (mt.startswith("qwen3_5") or mt.startswith("qwen3.5")):
+        raise OmlxShimError(
+            f"load_qwen35_batched_engine: artifact model_type={mt!r} is not Qwen3.5 "
+            "(only qwen3_5 / qwen3.5 artifacts are supported by the batched engine)")
+    return Qwen35BatchedEngine(model_name, max_batch=max_batch, spec_k=spec_k)
