@@ -241,3 +241,43 @@ def spec_generate_k(model, mtp, embed: mx.array, head: mx.array, prompt_ids,
         "max_accept": max(accept_lens) if accept_lens else 0,
         "k": k,
     }
+
+
+def spec_generate_tree(model, mtp, embed: mx.array, head: mx.array, prompt_ids,
+                       *, width: int, depth: int, max_new: int,
+                       eos_id=None) -> tuple[list[int], dict]:
+    """Tree drafting (EAGLE-2 style) over the native Qwen3.5 MTP head — **structural stub** (#157).
+
+    The per-round contract this entry point would implement, mirroring :func:`spec_generate_k` but
+    with a tree-shaped draft instead of a linear chain:
+
+      1. build a (``width``, ``depth``)-tree of drafts via :func:`quanta.spec.tree.build_tree`,
+         taking the top-``width`` MTP children of each node (the trained Qwen3.5 MTP module from
+         :mod:`quanta.qwen35.mtp`, used un-retrained);
+      2. construct the tree-causal attention mask via :func:`quanta.spec.tree.tree_causal_mask`;
+      3. verify the flat tree in **one** main forward at the current offset, with that mask applied
+         in every **gated-GQA** attention layer's SDPA call (the gated-DeltaNet layers are linear
+         and carry no traditional mask — their lossless rollback uses
+         :class:`quanta.qwen35.decode.Qwen35Cache`'s per-token snapshot ring across the accepted
+         tree path);
+      4. accept the longest greedy-matching root-to-leaf path via
+         :func:`quanta.spec.tree.longest_accepted_path`; emit accepted drafts + bonus; truncate the
+         cache to the committed offset.
+
+    EAGLE-2 reports ``mean_accept ≈ 3.5–4.5`` at ``width=4, depth=2``; lossless because the main
+    model still arbitrates every emitted token (CLAUDE.md rule 4).
+
+    **Status — structural piece only (this commit).** The tree-build + mask + acceptance primitives
+    are in place and parity-tested model-free in ``parity/tree_spec_test.py``. The verify-side
+    plumbing — passing a tree-causal mask through Qwen3.5's gated-GQA path and extending the GDN
+    snapshot ring's rollback to consume an *accepted tree path* (not a chain) — is the per-model
+    follow-on and is NOT included here. This entry point raises ``NotImplementedError`` with the
+    follow-on named, so the contract is callable / importable but cannot silently produce wrong
+    output (CLAUDE.md rule 6). Fall back to :func:`spec_generate_k` for now.
+    """
+    del model, mtp, embed, head, prompt_ids, width, depth, max_new, eos_id
+    raise NotImplementedError(
+        "qwen35.spec_generate_tree: structural piece in place (see quanta.spec.tree). "
+        "Per-Qwen3.5 attention-mask plumbing (gated-GQA mask + GDN snapshot-ring rollback across "
+        "tree paths) is the follow-on task — fall back to spec_generate_k(k=width) until that lands."
+    )
