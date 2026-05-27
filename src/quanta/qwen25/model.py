@@ -73,18 +73,30 @@ class Qwen25Model(nn.Module):
             self.lm_head = nn.Linear(cfg.hidden_size, cfg.vocab_size, bias=False)
 
     def __call__(self, token_ids: mx.array, *, caches: list[KVCache] | None = None,
-                 use_fast: bool = True, seq_hint: int | None = None) -> mx.array:
+                 use_fast: bool = True, seq_hint: int | None = None,
+                 abs_pos_start: int | None = None, last_only: bool = False) -> mx.array:
         """Forward ``[B, T]`` token ids → logits ``[B, T, vocab]``.
 
         ``caches`` (one ``KVCache`` per layer) enables incremental decode; pass ``None`` for prefill.
         ``seq_hint`` lets the model see the full sequence length (for DCA / future scaling) when the
         forward is chunked — defaults to ``cache.offset + T`` per layer.
+
+        ``abs_pos_start`` / ``last_only`` mirror the packed path's signature so this bf16 reference is
+        callable from :class:`~quanta.qwen25.runtime.Qwen25ResidentModel`. ``abs_pos_start`` is mapped
+        onto ``seq_hint`` (the bf16 :class:`~quanta.qwen25.attention.Qwen25Attention` uses absolute
+        positions via ``cache.offset`` already — chunked DCA prefill needs the packed path).
+        ``last_only`` slices the residual to its last row before lm_head, matching the packed path.
         """
+        if seq_hint is None and abs_pos_start is not None and caches is None:
+            # Approximation only — chunked DCA prefill requires the packed path.
+            seq_hint = abs_pos_start + token_ids.shape[-1]
         x = self.embed_tokens(token_ids)
         for i, layer in enumerate(self.layers):
             cache = caches[i] if caches is not None else None
             x = layer(x, cache=cache, use_fast=use_fast, seq_hint=seq_hint)
         x = self.norm(x)
+        if last_only:
+            x = x[:, -1:, :]
         if self.cfg.tie_word_embeddings:
             return x @ self.embed_tokens.weight.T
         return self.lm_head(x)
