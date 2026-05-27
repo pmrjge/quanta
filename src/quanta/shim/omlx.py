@@ -699,6 +699,47 @@ class QuantaOmlxEngine(_OmlxBaseEngine):
     def get_cache_stats(self) -> dict[str, Any] | None:
         return None
 
+    # --- token accounting ------------------------------------------------------
+    def count_chat_tokens(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+        chat_template_kwargs: dict[str, Any] | None = None,
+        is_partial: bool | None = None,
+    ) -> int:
+        """Count prompt tokens after rendering ``messages`` through the tokenizer's chat template.
+
+        Mirrors :meth:`omlx.engine.batched.BatchedEngine.count_chat_tokens` — oMLX's Anthropic
+        ``/v1/messages``, OpenAI ``/v1/chat/completions``, and ``/v1/messages/count_tokens`` handlers
+        all call this method for input-token accounting + context-window validation. Without it
+        every request 500s with ``AttributeError: 'QuantaOmlxEngine' object has no attribute
+        'count_chat_tokens'`` (the gap surfaced by the task #162 smoke test against the int4-g64
+        resident Nemotron). Implementation matches the batched-engine reference: render via
+        ``apply_chat_template(messages, tokenize=False, add_generation_prompt=not is_partial)`` then
+        return ``len(tokenizer.encode(prompt))``. ``tools`` / ``chat_template_kwargs`` ride through
+        so the count reflects the same prompt the request will run on. Returns ``0`` if the
+        tokenizer isn't loaded yet or lacks ``apply_chat_template`` (defensive; the engine.start()
+        contract guarantees the tokenizer by the time the server reaches a /v1 handler)."""
+        tk = self._tokenizer
+        if tk is None or not hasattr(tk, "apply_chat_template"):
+            return 0
+        kw: dict[str, Any] = dict(chat_template_kwargs or {})
+        add_gen = not bool(is_partial)
+        try:
+            prompt = tk.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=add_gen,
+                tools=tools, **kw,
+            )
+        except TypeError:
+            # Adapter / tokenizer doesn't accept one of the kwargs — retry minimally so a
+            # missing-feature template never collapses the whole request to a 500.
+            prompt = tk.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=add_gen,
+            )
+        if not isinstance(prompt, str):
+            return 0
+        return len(tk.encode(prompt))
+
     # --- lifecycle -------------------------------------------------------------
     async def start(self) -> None:
         if self._loaded:
