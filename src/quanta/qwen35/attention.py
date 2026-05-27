@@ -98,6 +98,17 @@ class KVCache:
         v_full = dequantize_last_axis(self.v_q, self.v_s, self.v_b, self.group_size, dtype=v.dtype)
         return k_full, v_full
 
+    def _copy(self) -> "KVCache":
+        """Shallow copy for :meth:`quanta.qwen35.decode.Qwen35Cache.replicate` — shares the
+        immutable MLX array refs (both storage modes) so the replica is zero-copy; subsequent
+        ``update`` on the copy creates new concatenated arrays (MLX arrays are immutable), so the
+        original cache and every sibling replica stay untouched."""
+        new = KVCache(quantized=self.quantized, group_size=self.group_size)
+        new.k, new.v = self.k, self.v
+        new.k_q, new.k_s, new.k_b = self.k_q, self.k_s, self.k_b
+        new.v_q, new.v_s, new.v_b = self.v_q, self.v_s, self.v_b
+        return new
+
 
 def _rms(x: mx.array, w: mx.array, eps: float) -> mx.array:
     """Weighted RMSNorm over the last dim, computed in fp32 (per-head q/k norm)."""

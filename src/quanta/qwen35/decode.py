@@ -106,6 +106,20 @@ class _GDNLayerState:
             f"snapshotted. Native-MTP (k=1) rolls back ≤1 token; raise snapshot_depth for deeper "
             f"speculation rather than keeping a diverged recurrent state (rule 6).")
 
+    def _copy(self) -> "_GDNLayerState":
+        """Shallow per-layer copy for :meth:`Qwen35Cache.replicate` — shares the immutable MLX
+        array refs (conv/recurrent state + every snapshot's tensors), copies the Python int +
+        list bookkeeping so writes on the copy do not mutate this state. The snapshot list itself
+        is Python-mutable; ``list(...)`` clones the spine, the tuples it holds reference the same
+        immutable tensors (MLX arrays are immutable so divergent ``commit``/``truncate`` on the
+        copy creates new arrays only — sibling caches are unaffected)."""
+        new = _GDNLayerState(self._depth)
+        new.conv_state = self.conv_state
+        new.recurrent_state = self.recurrent_state
+        new._off = self._off
+        new._snaps = list(self._snaps)
+        return new
+
 
 class Qwen35Cache:
     """Per-layer decode cache for the Qwen3.5 hybrid: KV on full layers, recurrent state on linear.
@@ -176,6 +190,37 @@ class Qwen35Cache:
                 _kv_truncate(lc, length)
             else:
                 lc.truncate(length)
+
+    def replicate(self, b: int) -> list["Qwen35Cache"]:
+        """Return ``b`` parallel decode caches, each initially sharing this cache's prefix state.
+
+        MLX arrays are immutable, so the replicas can share references to the prefix tensors at
+        zero cost — subsequent ``update`` (KV) / ``commit`` (GDN) / ``truncate`` on any replica
+        creates new arrays only, leaving the originals (and every other replica) untouched. The
+        structural-sharing form of ``cache.replicate(B)`` for the batched tree-spec verify
+        (docs/batched_tree_verify.md): each enumerated draft path advances its own replica through
+        :meth:`Qwen35BatchedResidentModel.batch_step`, the original prefix stays read-only, and the
+        B-wide verify amortizes the routed-MoE weight reads across all B paths in one batched MoE
+        call. Handles both regime types uniformly: full-attention :class:`KVCache` and recurrent
+        :class:`_GDNLayerState` both expose ``_copy`` with the same zero-cost semantics.
+
+        The picked path's replica is discarded after the round — the commit-forward re-feeds the
+        accepted prefix through the original (un-replicated) cache, exactly as today. Gated in
+        ``parity/qwen35_batched_tree_verify_test.py``'s "cache invariance" assertion.
+        """
+        if b < 1:
+            raise ValueError(f"replicate(B) requires B >= 1 (got {b})")
+        return [self._copy() for _ in range(b)]
+
+    def _copy(self) -> "Qwen35Cache":
+        """Shallow per-layer copy: each layer's state is shared via its own ``_copy``
+        (KV cache or GDN snapshot ring); writes diverge naturally under MLX immutability."""
+        new = self.__new__(Qwen35Cache)
+        new.quantized = self.quantized
+        new.group_size = self.group_size
+        new.max_rollback = self.max_rollback
+        new.layers = [lc._copy() for lc in self.layers]
+        return new
 
 
 def _kv_truncate(cache: KVCache, length: int) -> None:

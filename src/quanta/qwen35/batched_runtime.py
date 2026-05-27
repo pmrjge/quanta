@@ -310,3 +310,93 @@ class Qwen35BatchedResidentModel:
             raise ValueError(f"batch {len(stream_token_ids)} exceeds max_batch {self.max_batch}")
         return batched_decode_step(self.layers, self.embed_w, self.norm_w, self.lm_head_w,
                                    self.cfg, stream_token_ids, stream_caches, offsets)
+
+    # --- shared-offset batched step for tree-spec batched verify ---------------
+    def batch_step(
+        self,
+        tokens: Sequence[int],
+        *,
+        caches: Sequence[Qwen35Cache],
+        offset: int,
+        capture_layer: int | None = None,
+    ) -> tuple[mx.array, mx.array | None]:
+        """One batched decode step with a SHARED offset across all ``B = len(tokens)`` streams —
+        the verify shape :func:`quanta.qwen35.spec.batch_verify` drives for batched tree-spec
+        (docs/batched_tree_verify.md). Returns ``(logits [B,1,vocab], captured [B,1,hidden] or None)``.
+
+        Mirrors :meth:`quanta.dsv4.batched_runtime.DSV4BatchedResidentModel.batch_step` but on
+        Qwen3.5's 2-D hidden ``[B, 1, hidden]`` (vs DSV4's HC 4-D ``[B, 1, hc, dim]``) and over
+        the hybrid mixer schedule (GDN linear-attn layers + GQA full-attn layers, by
+        ``cfg.is_linear_attention(i)``). Each replica's cache mutates independently — the linear-
+        layer recurrent state and the full-layer KV grow per-replica under MLX immutability so
+        sibling replicas never see each other's writes.
+
+        Differences from :meth:`step_batch`:
+
+        * single position (``T == 1``) per call — the spec's verify loops :math:`depth+1` calls;
+        * every stream shares ``offset`` (replicas built from the same prefix advance lock-step);
+        * optionally captures one layer's residual ``[B, 1, hidden]`` for the MTP feature.
+
+        Reuses the same per-stream mixer (``_gdn_step_through_cache`` / ``_gqa_step_through_cache``)
+        + batched MoE pattern as :func:`batched_decode_step`; no new attention / MoE code.
+        Numerically equivalent to running each stream through the single-stream runtime at the same
+        offset with its own cache — gated model-free in ``parity/qwen35_batched_tree_verify_test.py``.
+        """
+        b = len(tokens)
+        if b < 1:
+            raise ValueError("batch_step needs >= 1 stream")
+        if b > self.max_batch:
+            raise ValueError(f"batch_step: B={b} exceeds max_batch={self.max_batch}")
+        if len(caches) != b:
+            raise ValueError(
+                f"batch_step: len(caches)={len(caches)} != len(tokens)={b}"
+            )
+        # Each replica must already sit at the shared offset (rule 6 — no silent drift): the verify
+        # loop only makes sense when every stream advances the same absolute position.
+        for s, cache in enumerate(caches):
+            if cache.offset != offset:
+                raise ValueError(
+                    f"batch_step: caches[{s}].offset={cache.offset} != offset={offset} "
+                    f"(all B replicas must sit at the shared verify offset)"
+                )
+        if capture_layer is not None and not 0 <= capture_layer < self.num_layers:
+            raise ValueError(
+                f"batch_step: capture_layer={capture_layer} not in [0, {self.num_layers})"
+            )
+
+        # Per-stream embed in ONE indexing op (same as batched_decode_step).
+        ids_b = mx.array([int(t) for t in tokens], dtype=mx.int32)              # [B]
+        h_b = self.embed_w[ids_b][:, None].astype(mx.bfloat16)                  # [B, 1, hidden]
+        hs: list[mx.array] = [h_b[i:i + 1] for i in range(b)]                   # B × [1,1,hidden]
+
+        captured: mx.array | None = None
+        seq_hint = offset + 1                                                   # YaRN pin (shared)
+
+        for layer_i, blk in enumerate(self.layers):
+            # 1) per-stream mixer step — bounded B-loop, rule-3 OK. GDN / GQA work is vectorized
+            # inside each call; each cache mutates per-replica (immutability isolates siblings).
+            after_mixer: list[mx.array] = []
+            for s in range(b):
+                lc = caches[s][layer_i]
+                if blk.is_linear:
+                    out_s = _gdn_step_through_cache(blk, lc, hs[s])
+                else:
+                    out_s = _gqa_step_through_cache(blk, lc, hs[s], seq_hint)
+                after_mixer.append(out_s)
+
+            # 2) stack → batched MoE → split (the win: ONE qwen35_moe call over [B,1,hidden]).
+            stacked = mx.concatenate(after_mixer, axis=0) if b > 1 else after_mixer[0]   # [B,1,hidden]
+            h_post_norm = blk.post_attention_layernorm(stacked)
+            moe_out = blk.mlp(h_post_norm, sparse=True)
+            stacked = stacked + moe_out
+            if capture_layer is not None and layer_i == capture_layer:
+                captured = stacked                                                       # [B,1,hidden]
+            hs = [stacked[i:i + 1] for i in range(b)]
+
+            mx.eval(stacked)                                                             # per-layer eval
+
+        # Final norm + lm_head over the stacked [B,1,hidden] — one matmul.
+        final = mx.concatenate(hs, axis=0) if b > 1 else hs[0]                           # [B,1,hidden]
+        final = mx.fast.rms_norm(final, self.norm_w.astype(final.dtype), self.cfg.norm_eps)
+        logits = final @ self.lm_head_w.T.astype(final.dtype)                            # [B,1,vocab]
+        return logits, captured
