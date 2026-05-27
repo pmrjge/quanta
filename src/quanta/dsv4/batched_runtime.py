@@ -1,0 +1,324 @@
+"""Batched (B > 1) DSV4-Flash decode runtime — Design A: per-stream caches, batched MoE.
+
+This is the multi-stream sibling of :class:`quanta.dsv4.runtime.DSV4ResidentModel` for concurrent
+agentic-loop serving. The single-stream model is the **parity reference**; this runtime is a
+*wrapper* that reuses its load path and per-layer parameters unchanged, then replicates the
+single-stream decode-block at the right granularity so the bandwidth-bound MoE is amortized across
+``B`` simultaneous streams.
+
+Why a wrapper: rule-8 (one layer resident at a time at load) is satisfied by the existing
+``DSV4ResidentModel.__init__``; the inner :class:`DSV4ResidentModel` instance is the resident
+copy. Prefill is delegated to its ``__call__`` (parity-correct by construction). Decode is split
+per layer into two sub-blocks (Design A):
+
+  1. **Per-stream attention sub-block** (loop over the B streams) — ``hc_pre → attn_norm →
+     decode_step_dense / decode_step_compressed(cache=stream b, offset=offset[b]) → hc_post``.
+     The per-stream KV caches are unavoidable (they hold each stream's growing latent stream /
+     compressed stream / raw ring), so this loop is correctness-essential. ``B`` is bounded by
+     ``max_batch`` (typically 32), so 43 layers × B = ≤ ~1400 attention calls per token is the
+     allowed kind of bounded coarse loop (rule-3 forbids per-token/per-expert/per-hidden loops on
+     hot paths; per-stream is acceptable — same shape, same code, just a small set of caches).
+
+  2. **Batched FFN/MoE sub-block** — stack the post-attention HC residuals to ``[B,1,hc,dim]``,
+     then ``hc_pre → ffn_norm → dsv4_moe`` ONCE on the stacked tensor. ``dsv4_moe`` reshapes
+     ``[B,1,dim] → [B,dim]`` and routes ``B*topk`` slots through ``mx.gather_mm`` in one call —
+     **shared expert weight reads are amortized across all B**, and routed expert weight reads
+     amortize naturally as more slots land on the same expert (the bandwidth win the B-loop
+     unlocks). Output is split back to per-stream ``[1,1,hc,dim]`` for the next layer.
+
+Per-stream sampling / eos / admission live in :mod:`quanta.dsv4.batched_generate`; this module
+exposes only the multi-stream forward.
+
+Numerical equivalence to the single-stream runtime is gated MODEL-FREE in
+``parity/dsv4_batched_test.py``: B identical prompts/streams must produce bit-identical logits to
+the single-stream ``DSV4ResidentModel`` (Design A is output-equivalent to single-stream by
+construction — the only batched op is the MoE FFN, which is itself batched-aware already).
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import mlx.core as mx
+
+from quanta.dsv4.attention import _rms_w
+from quanta.dsv4.decode import DSV4Cache, decode_step_compressed, decode_step_dense
+from quanta.dsv4.hyper import hc_expand, hc_post, hc_pre
+from quanta.dsv4.moe import dsv4_moe
+from quanta.dsv4.runtime import DSV4ResidentModel
+
+
+class DSV4BatchedResidentModel:
+    """Multi-stream RAM-resident DSV4-Flash runtime — batched MoE amortized over B concurrent streams.
+
+    The model is loaded ONCE (by the inner :class:`DSV4ResidentModel`) and shared across all
+    streams. Each stream owns its own :class:`DSV4Cache` and its own decode position (``offset``);
+    the inner model's per-layer params, embeddings, final HC head, norms and LM head are read-only
+    and shared. ``max_batch`` is a soft ceiling — every batched call must satisfy ``B ≤ max_batch``
+    or it fails loudly (rule-6).
+
+    ``packed_experts`` and ``load_mtp`` are forward-compatible flags. Today the inner
+    :class:`DSV4ResidentModel` uses dequantized bf16 expert stacks via ``mx.gather_mm`` (DSV4 source
+    weights are fp4 → dequantized at load to bf16 stacks); ``packed_experts=True`` is accepted for
+    callers that intend to swap in the int4-packed gather_qmm path once it lands — the surface does
+    not change. ``load_mtp=True`` materializes the native MTP block params on
+    ``self.mtp_params`` so callers can drive a spec-decode loop alongside the batched main forward;
+    the batched runtime itself does not consume the MTP head.
+    """
+
+    def __init__(
+        self,
+        art_dir: str | Path,
+        *,
+        max_batch: int = 32,
+        packed_experts: bool = True,
+        load_mtp: bool = False,
+        n_layers: int | None = None,
+    ) -> None:
+        if max_batch < 1:
+            raise ValueError(f"max_batch must be >= 1, got {max_batch}")
+        # Single-stream inner is the parity reference (and the only resident-load path).
+        inner = DSV4ResidentModel(art_dir, n_layers=n_layers)
+        mtp_params: dict | None = None
+        if load_mtp:
+            # The MTP block params live in the artifact; load and cast / eval to match the rest of
+            # the resident state. The batched runtime exposes them for spec-decode callers; the
+            # main batched forward does not invoke the MTP head (which would require per-stream
+            # captures and is the orchestrator's job).
+            mtp_params = inner.art.mtp(0)
+            mx.eval(list(mtp_params.values()))
+            inner.art.release()
+            mx.clear_cache()
+        self._init_from_inner(inner, max_batch=max_batch, packed_experts=packed_experts,
+                              mtp_params=mtp_params)
+
+    @classmethod
+    def from_inner(cls, inner, *, max_batch: int = 32, packed_experts: bool = True,
+                   mtp_params: dict | None = None) -> "DSV4BatchedResidentModel":
+        """Build a batched runtime around an EXISTING single-stream-shaped inner (parity tests).
+
+        The inner must expose the :class:`DSV4ResidentModel` surface this runtime consumes:
+        ``.cfg`` / ``.num_layers`` / ``.embed_w`` / ``.lm_head_w`` / ``.layers`` / ``._head`` /
+        ``._rope`` / ``__call__(token_ids, caches=, offset=)``. The model-free parity gate uses a
+        tiny fake inner over random params so it can prove batched == single-stream WITHOUT loading
+        a real artifact (rule-6: never silently couple test correctness to checkpoint I/O)."""
+        obj = cls.__new__(cls)
+        obj._init_from_inner(inner, max_batch=max_batch, packed_experts=packed_experts,
+                             mtp_params=mtp_params)
+        return obj
+
+    def _init_from_inner(self, inner, *, max_batch: int, packed_experts: bool,
+                         mtp_params: dict | None) -> None:
+        """Common init: bind the inner + mirror its surface so callers can drop a batched model in
+        wherever a single-stream one is expected (same ``.cfg``/``.num_layers``/``.embed_w``/...)."""
+        if max_batch < 1:
+            raise ValueError(f"max_batch must be >= 1, got {max_batch}")
+        self._inner = inner
+        self.max_batch = int(max_batch)
+        self.packed_experts = bool(packed_experts)
+        self.cfg = inner.cfg
+        self.num_layers = inner.num_layers
+        self.embed_w = inner.embed_w
+        self.lm_head_w = inner.lm_head_w
+        self.layers = inner.layers
+        self.mtp_params = mtp_params
+
+    # --- convenience pass-throughs --------------------------------------------
+    def make_cache(self) -> DSV4Cache:
+        """A fresh per-stream decode cache (one ``_LayerCache`` per attention block)."""
+        return DSV4Cache(self.num_layers)
+
+    # --- prefill --------------------------------------------------------------
+    def prefill(self, prompt_ids: mx.array, cache: DSV4Cache) -> mx.array:
+        """Seed ``cache`` with ``prompt_ids`` (single-stream prefill via the parity-correct
+        single-stream forward) and return the final-position logits ``[1, T, vocab]``.
+
+        The DSV4 decode-stepper has no batched cache-fill, so the prompt is consumed by stepping
+        each token through the single-stream decode path (the exact pattern
+        :func:`quanta.dsv4.generate.generate` uses). This routes through the inner model's
+        ``__call__`` which is the parity reference — the same code the single-stream gate
+        validates — so prefill is byte-for-byte single-stream-equivalent."""
+        ids = prompt_ids if isinstance(prompt_ids, mx.array) else mx.array(prompt_ids)
+        ids = ids.reshape(-1)
+        if ids.shape[0] == 0:
+            raise ValueError("prefill: empty prompt_ids (need >= 1 token to seed the cache)")
+        return self._inner(ids, caches=cache, offset=0)
+
+    # --- per-layer batched decode block ---------------------------------------
+    def _attn_per_stream(
+        self,
+        h_stream: mx.array,
+        p: dict,
+        layer_id: int,
+        cache: DSV4Cache,
+        offset: int,
+    ) -> mx.array:
+        """One stream's attention sub-block: ``hc_pre → attn_norm → decode_step → hc_post``.
+
+        Mirrors the attention half of :meth:`DSV4ResidentModel._decode_block` exactly. The stepper
+        is chosen by ``cfg.compress_ratio(layer_id)`` (dense for ratio==0, compressed otherwise).
+        ``h_stream`` is ``[1,1,hc,dim]`` — one stream, one token.
+        """
+        cfg = self.cfg
+        eps, hc, iters, heps = cfg.norm_eps, cfg.hc_mult, cfg.hc_sinkhorn_iters, cfg.hc_eps
+        step = decode_step_dense if cfg.compress_ratio(layer_id) == 0 else decode_step_compressed
+
+        # RoPE cos/sin for absolute positions [0, offset+1) — single-stream's cache, reused since
+        # RoPE depends only on position, not on the stream's KV.
+        cos, sin = self._inner._rope(layer_id, offset + 1)
+
+        res = h_stream
+        x, post, comb = hc_pre(
+            h_stream, p["hc_attn_fn"], p["hc_attn_scale"], p["hc_attn_base"],
+            hc, iters, eps, heps,
+        )
+        x = _rms_w(x, p["attn_norm"], eps)
+        x = step(x, p["attn"], cfg, layer_id, cache, cos, sin, offset)
+        return hc_post(x, res, post, comb)
+
+    def _ffn_batched(
+        self,
+        h_stack: mx.array,
+        ids_stack: mx.array,
+        p: dict,
+        layer_id: int,
+    ) -> mx.array:
+        """Batched FFN/MoE sub-block on the stacked post-attention residuals.
+
+        ``h_stack``: ``[B,1,hc,dim]`` — all streams' post-attention HC residuals stacked.
+        ``ids_stack``: ``[B,1]`` — the streams' input token ids (hash-routing key for the early
+        layers; ignored by score-routing layers). One ``dsv4_moe`` call processes all B streams —
+        ``B*topk`` slots in a single ``mx.gather_mm`` over the (shared) expert stacks, and ONE
+        shared-expert matmul over the stacked input. Output ``[B,1,hc,dim]`` shape-equivalent to
+        running each stream individually and stacking the results.
+        """
+        cfg = self.cfg
+        eps, hc, iters, heps = cfg.norm_eps, cfg.hc_mult, cfg.hc_sinkhorn_iters, cfg.hc_eps
+
+        res = h_stack
+        x, post, comb = hc_pre(
+            h_stack, p["hc_ffn_fn"], p["hc_ffn_scale"], p["hc_ffn_base"],
+            hc, iters, eps, heps,
+        )
+        x = _rms_w(x, p["ffn_norm"], eps)
+        x = dsv4_moe(x, p["router"], p["experts"], p["shared"], cfg, layer_id, ids_stack)
+        return hc_post(x, res, post, comb)
+
+    # --- batched decode step --------------------------------------------------
+    def step_batch(
+        self,
+        stream_token_ids: list[mx.array],
+        caches: list[DSV4Cache],
+        offsets: list[int],
+    ) -> list[mx.array]:
+        """Advance ``B`` streams by one decode step each — Design A: per-stream attention + batched MoE.
+
+        ``stream_token_ids[b]``: the next token id(s) for stream ``b`` (``[1]`` or ``[T_b]`` if a
+        stream is replaying a tail). ``caches[b]``: stream ``b``'s :class:`DSV4Cache`.
+        ``offsets[b]``: the absolute position of ``stream_token_ids[b][0]`` in stream ``b``.
+
+        Returns ``[1, T_b, vocab]`` logits per stream. Each layer is processed as:
+
+          1. Per-stream attention (loop b): grow ``caches[b]`` and emit ``[1,1,hc,dim]`` per stream.
+             Multi-token inputs (``T_b > 1``) are stepped position-by-position through the same
+             stepper the single-stream runtime uses, so the cache stays in lock-step with the
+             single-stream path.
+          2. Stack to ``[B,1,hc,dim]``, batched MoE, split.
+
+        Numerically equivalent to running each stream through the single-stream model in isolation:
+        per-stream attention is the same code on the same cache, batched MoE is the same code that
+        ``dsv4_moe(x [B,1,dim])`` runs in the single-stream prefill path. Validated model-free in
+        ``parity/dsv4_batched_test.py``.
+        """
+        b = len(stream_token_ids)
+        if b == 0:
+            raise ValueError("step_batch: empty stream batch (need >= 1 stream)")
+        if b > self.max_batch:
+            raise ValueError(f"step_batch: B={b} exceeds max_batch={self.max_batch}")
+        if len(caches) != b:
+            raise ValueError(
+                f"step_batch: len(caches)={len(caches)} != len(stream_token_ids)={b}"
+            )
+        if len(offsets) != b:
+            raise ValueError(
+                f"step_batch: len(offsets)={len(offsets)} != len(stream_token_ids)={b}"
+            )
+        # Per-stream cache offsets must match the declared offsets (rule-6 — never silently let a
+        # stream drift): each stream's cache offset is the absolute position of its NEXT token.
+        for s, (cache, off) in enumerate(zip(caches, offsets, strict=True)):
+            if cache.offset != off:
+                raise ValueError(
+                    f"step_batch: stream {s} cache.offset={cache.offset} != declared offset={off}"
+                )
+
+        # Normalize each stream's token ids to a [1, T_b] mx.array; track each T_b for the unstack.
+        stream_ids: list[mx.array] = []
+        seq_lens: list[int] = []
+        for s, ids in enumerate(stream_token_ids):
+            arr = ids if isinstance(ids, mx.array) else mx.array(ids)
+            arr = arr.reshape(1, -1)
+            if arr.shape[1] == 0:
+                raise ValueError(f"step_batch: stream {s} has empty token_ids")
+            stream_ids.append(arr)
+            seq_lens.append(int(arr.shape[1]))
+
+        # Per-stream HC residual stream (initial embed expansion) — [1, T_b, hc, dim] per stream.
+        stream_h: list[mx.array] = [
+            hc_expand(self.embed_w[arr].astype(mx.bfloat16), self.cfg.hc_mult)
+            for arr in stream_ids
+        ]
+
+        # Per-stream output collectors (one [hc, dim] per position, stacked at the end).
+        stream_outs: list[list[mx.array]] = [[] for _ in range(b)]
+
+        # Step position-by-position across all streams. T_max is the longest stream's input length;
+        # streams with shorter inputs simply stop participating once they've exhausted their tokens.
+        # This is the bounded outer loop the single-stream runtime also uses (one per input token).
+        t_max = max(seq_lens)
+        for t in range(t_max):
+            # Streams active at position t (those whose input is at least t+1 tokens long).
+            active = [s for s in range(b) if t < seq_lens[s]]
+            # Per-stream input slice + absolute position for the active set.
+            slice_ids = [stream_ids[s][:, t:t + 1] for s in active]               # each [1,1]
+            slice_off = [offsets[s] + t for s in active]
+            slice_h = [stream_h[s][:, t:t + 1] for s in active]                   # each [1,1,hc,dim]
+
+            for i, p in enumerate(self.layers):
+                # (1) Per-stream attention — grows each stream's cache by exactly one position.
+                slice_h = [
+                    self._attn_per_stream(slice_h[k], p, i, caches[active[k]], slice_off[k])
+                    for k in range(len(active))
+                ]
+                # (2) Stack -> batched MoE -> split. The stack/split is the seam: shared-expert
+                # weight bytes amortize across all active streams in this one MoE call.
+                h_stack = mx.concatenate(slice_h, axis=0)                          # [B_act,1,hc,dim]
+                ids_stack = mx.concatenate(slice_ids, axis=0)                      # [B_act,1]
+                h_stack = self._ffn_batched(h_stack, ids_stack, p, i)
+                # split back per-stream (shape [1,1,hc,dim] each).
+                slice_h = [h_stack[k:k + 1] for k in range(len(active))]
+
+            # Materialize this position's grown caches + residuals (one eval per token, all streams).
+            mx.eval([*slice_h])
+
+            # Accumulate this token's [hc, dim] residual on the right stream's output list.
+            for k, s in enumerate(active):
+                stream_outs[s].append(slice_h[k][0, 0])
+
+        # Reduce per-stream residual stacks to logits — final HC head + norm + lm_head, applied per
+        # stream so the head matmul stays at ``[T_b, vocab]`` (no padding waste).
+        out_logits: list[mx.array] = []
+        for s in range(b):
+            h_s = mx.stack(stream_outs[s], axis=0)[None]                          # [1, T_b, hc, dim]
+            out_logits.append(self._inner._head(h_s))
+        return out_logits
+
+    # --- direct __call__ mirroring single-stream surface ----------------------
+    def __call__(
+        self,
+        stream_token_ids: list[mx.array],
+        *,
+        caches: list[DSV4Cache],
+        offsets: list[int],
+    ) -> list[mx.array]:
+        """Alias of :meth:`step_batch` — supports the batched generator's uniform call surface."""
+        return self.step_batch(stream_token_ids, caches, offsets)
