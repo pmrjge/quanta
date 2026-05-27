@@ -223,9 +223,121 @@ def _mtp_top_w(logits_row: mx.array, width: int) -> list[int]:
     return [int(idx[i].item()) for i in range(width)]
 
 
+def batch_verify(model, cache: DSV4Cache, cur: int, paths: list[list[int]],
+                 *, depth: int, q: int, last_layer: int
+                 ) -> tuple[int, int, list[int], mx.array]:
+    """**B-wide batched verify** of ``B = len(paths)`` candidate draft paths against the main model.
+
+    The :func:`spec_generate_tree`'s ``batched=True`` hot loop. Replicates the prefix decode cache
+    ``B`` times (structural sharing via :meth:`DSV4Cache.replicate` — zero-cost under MLX's
+    immutable arrays), then advances all ``B`` replicas through :meth:`DSV4BatchedResidentModel.batch_step`
+    one tree-position at a time — every verify position is ONE batched-MoE call over all ``B``
+    candidates, vs ``W ** D`` sequential per-path forwards in the non-batched form. Output is
+    bit-identical to the sequential form (same paths considered, same longest-matching-prefix
+    selection, same commit-forward); only the verify cost economy changes (see
+    docs/batched_tree_verify.md for the cost table).
+
+    Inputs:
+
+    * ``model`` — a :class:`quanta.dsv4.batched_runtime.DSV4BatchedResidentModel` (the only
+      runtime with the ``batch_step`` API). Single-stream models lack ``batch_step`` and will fail
+      loudly (rule 6).
+    * ``cache`` — the prefix decode cache (un-replicated, read-only here).
+    * ``cur`` — the verified token at position ``q + 1`` (verify root).
+    * ``paths`` — ``B = W ** D`` candidate draft paths, each of length ``depth``.
+    * ``q`` — current consumed position (``cache.offset = q + 1``).
+    * ``last_layer`` — the layer index whose HC residual to capture for the next MTP build.
+
+    Returns ``(best_j, best_bonus, best_path, best_hidden)``:
+
+    * ``best_j`` — accepted-draft count for the best path, in ``[0, depth]``.
+    * ``best_bonus`` — main-model greedy token at the first un-accepted tree position (BFS-leftmost
+      tie-break, matching the sequential form).
+    * ``best_path`` — the candidate path that achieved ``best_j``.
+    * ``best_hidden`` — main hidden ``[1, 1, hc, dim]`` at the last-accepted position along
+      ``best_path`` — the ``prev_hidden`` for the next round's MTP tree-build.
+
+    The replicas are discarded after pick; the commit-forward (in :func:`spec_generate_tree`) re-feeds
+    ``[cur, *best_path[:best_j]]`` through the ORIGINAL (un-replicated) cache, exactly as today.
+    """
+    if not hasattr(model, "batch_step"):
+        raise TypeError(
+            "batch_verify needs a model with .batch_step (DSV4BatchedResidentModel). Single-stream "
+            "DSV4ResidentModel does not implement it; use spec_generate_tree(..., batched=False) or "
+            "construct a DSV4BatchedResidentModel via .from_inner around your single-stream model."
+        )
+    b = len(paths)
+    if b < 1:
+        raise ValueError(f"batch_verify needs >= 1 path (got {b})")
+    if any(len(p) != depth for p in paths):
+        raise ValueError(f"batch_verify: every path must have length depth={depth}; got "
+                         f"lengths {[len(p) for p in paths]}")
+    if cache.offset != q + 1:
+        raise ValueError(f"batch_verify: cache.offset={cache.offset} != q+1={q + 1} "
+                         f"(prefix cache must sit at verify-root position)")
+
+    # Per-path verify sequence: each [cur, *path_drafts] of length depth+1 — same as sequential.
+    verify_seqs: list[list[int]] = [[cur, *p] for p in paths]
+
+    # Structural-sharing replication: B caches all referencing the prefix arrays (no copy cost).
+    replicas = cache.replicate(b)
+
+    # Drive depth+1 batched steps. At step t every replica reads its own row t of verify_seqs (a
+    # different draft token across replicas) and writes that position's KV into its own (now
+    # diverged) suffix. The MoE call runs ONCE over the stacked [B,1,hc,dim] — the win.
+    per_pos_logits: list[mx.array] = []                   # depth+1 × [B, 1, vocab]
+    per_pos_hidden: list[mx.array | None] = []            # depth+1 × [B, 1, hc, dim]
+    for t in range(depth + 1):
+        toks = [seq[t] for seq in verify_seqs]
+        logits_t, hidden_t = model.batch_step(
+            tokens=toks, caches=replicas, offset=q + 1 + t, capture_layer=last_layer,
+        )
+        per_pos_logits.append(logits_t)
+        per_pos_hidden.append(hidden_t)
+    # Single eval at the end — covers logits + every captured hidden + every replica's grown state.
+    mx.eval(*per_pos_logits, *(h for h in per_pos_hidden if h is not None))
+
+    # --- interpret outputs row-by-row (cheap Python loop over B ≤ ~64) -------
+    # bp[t][b] = main-model greedy at verify position t for replica b — argmaxed once per (t, b).
+    bp: list[list[int]] = []
+    for t in range(depth + 1):
+        argmax_t = mx.argmax(per_pos_logits[t][:, 0], axis=-1)                  # [B]
+        mx.eval(argmax_t)
+        bp.append([int(argmax_t[k].item()) for k in range(b)])
+
+    # BFS-leftmost tie-break == sequential form: walk paths in build_tree order, keep STRICT improvement.
+    best_j = -1
+    best_bonus = cur                                       # sentinel; overwritten on first path
+    best_path: list[int] = []
+    best_hidden_b = 0                                      # row of per_pos_hidden to pluck
+    for k in range(b):
+        path_k = paths[k]
+        # bp[i][k] = greedy at position i for stream k = the token that should follow verify_seqs[k][i].
+        # path_k[i] is accepted iff bp[i][k] == path_k[i].
+        j = 0
+        while j < depth and path_k[j] == bp[j][k]:
+            j += 1
+        if j > best_j:
+            best_j = j
+            best_bonus = bp[j][k]
+            best_path = path_k
+            best_hidden_b = k
+
+    # Materialize the picked replica's last-accepted-position hidden as the next prev_hidden.
+    if per_pos_hidden[best_j] is None:                     # capture_layer was out of range; caller's bug
+        raise RuntimeError(
+            f"batch_verify: capture_layer={last_layer} did not return a captured hidden "
+            f"(every batch_step at depth t={best_j} returned None). Spec loop relies on the MTP "
+            f"feature; refusing to silently drop it (rule 6).")
+    best_hidden = per_pos_hidden[best_j][best_hidden_b:best_hidden_b + 1]       # [1,1,hc,dim]
+
+    return best_j, best_bonus, best_path, best_hidden
+
+
 def spec_generate_tree(model, mtp, embed: mx.array, head: mx.array, prompt_ids,
                        *, width: int, depth: int, max_new: int,
-                       eos_id: int | None = None) -> tuple[list[int], dict]:
+                       eos_id: int | None = None,
+                       batched: bool = False) -> tuple[list[int], dict]:
     """**W-parallel chain-verify** tree drafting over the native DSV4 MTP head — lossless (#157).
 
     Each round drafts a ``(width, depth)`` tree from the MTP head, enumerates the ``W ** D``
@@ -258,15 +370,28 @@ def spec_generate_tree(model, mtp, embed: mx.array, head: mx.array, prompt_ids,
     that collapses the ``W ** D`` sequential forwards into ONE batched forward.
 
     Returns ``(tokens, stats)`` where ``stats`` reports ``mean_accept`` (tokens emitted per round),
-    ``rounds``, ``max_accept``, ``width``, ``depth``, and ``paths_per_round`` (= ``W ** D``).
+    ``rounds``, ``max_accept``, ``width``, ``depth``, ``paths_per_round`` (= ``W ** D``), and
+    ``batched`` (the opt-in flag's value for this run, for stat collation).
     Mirrors :func:`spec_generate_k`'s eos / max_new semantics. ``width=1`` degenerates to a chain
     (= :func:`spec_generate_k` with ``k=depth``) and short-circuits to that proven path.
+
+    ``batched=True`` (opt-in; default ``False``) replaces the per-path ``W ** D`` sequential verify
+    forwards with ONE ``B = W ** D`` batched forward via :func:`batch_verify` — the routed-MoE
+    weight reads amortize across all ``B`` candidate paths, dropping cost-per-accepted-token
+    roughly in line with chained ``spec_generate_k`` (see docs/batched_tree_verify.md for the
+    economics). Output is bit-identical to ``batched=False`` (same paths considered, same selection,
+    same commit-forward); only verify cost changes. Requires ``model`` to be a
+    :class:`quanta.dsv4.batched_runtime.DSV4BatchedResidentModel` (the only runtime with
+    ``batch_step``); single-stream :class:`DSV4ResidentModel` callers must keep ``batched=False``
+    or wrap their inner via ``DSV4BatchedResidentModel.from_inner``.
     """
     if width < 1 or depth < 1:
         raise ValueError(f"width must be >= 1, depth must be >= 1 (got width={width}, depth={depth})")
     if width == 1:
         # A width-1 tree is a length-``depth`` chain — defer to the proven chained spec_generate_k
-        # rather than reinvent its accept/rollback logic here.
+        # rather than reinvent its accept/rollback logic here. ``batched`` has no effect on a
+        # chain (no path-level fan-out to batch), so the short-circuit ignores the flag and the
+        # gate ``test_width1_matches_spec_generate_k`` covers it for both flag values.
         return spec_generate_k(model, mtp, embed, head, prompt_ids,
                                k=depth, max_new=max_new, eos_id=eos_id)
 
@@ -309,43 +434,53 @@ def spec_generate_tree(model, mtp, embed: mx.array, head: mx.array, prompt_ids,
                            width=width, depth=depth)
         paths = enumerate_paths(draft.parents, draft.tokens)  # W^D paths of length D each
 
-        # --- per-path verify with cache snapshot/restore ---
-        # Track the best path's (accept length, bonus token, last-accepted-position hidden, the
-        # path itself). Captured during verify BEFORE the round-end truncate — those tensors are
-        # already materialized; the cache truncate doesn't invalidate them.
-        best_j = -1
-        best_bonus = cur                                  # safe sentinel; overwritten on first path
-        best_path: list[int] = []
-        best_hidden = prev_hidden
+        if batched:
+            # --- B-wide batched verify (one batched forward per tree position) ---
+            # The replicas advance lock-step under ``model.batch_step``; the original ``caches`` is
+            # NOT mutated (zero-cost structural-sharing replication keeps the prefix read-only).
+            # The commit-forward below re-feeds the accepted prefix through ``caches`` — same as
+            # the sequential form. Output is bit-identical to the per-path verify.
+            best_j, best_bonus, best_path, best_hidden = batch_verify(
+                model, caches, cur, paths, depth=depth, q=q, last_layer=last,
+            )
+        else:
+            # --- per-path sequential verify with cache snapshot/restore ---
+            # Track the best path's (accept length, bonus token, last-accepted-position hidden, the
+            # path itself). Captured during verify BEFORE the round-end truncate — those tensors are
+            # already materialized; the cache truncate doesn't invalidate them.
+            best_j = -1
+            best_bonus = cur                              # safe sentinel; overwritten on first path
+            best_path = []
+            best_hidden = prev_hidden
 
-        for path_drafts in paths:
-            verify_seq = [cur, *path_drafts]
-            vlog, vcaps = model(mx.array(verify_seq), caches=caches, offset=q + 1,
-                                capture_layers=(last,))
-            bpred = mx.argmax(vlog[0], axis=-1)            # [depth+1]
-            mx.eval(bpred, vcaps[last])
-            bp = [int(bpred[i].item()) for i in range(depth + 1)]
+            for path_drafts in paths:
+                verify_seq = [cur, *path_drafts]
+                vlog, vcaps = model(mx.array(verify_seq), caches=caches, offset=q + 1,
+                                    capture_layers=(last,))
+                bpred = mx.argmax(vlog[0], axis=-1)        # [depth+1]
+                mx.eval(bpred, vcaps[last])
+                bp = [int(bpred[i].item()) for i in range(depth + 1)]
 
-            # Longest matching prefix of ``path_drafts`` against ``bp[:depth]``.
-            # ``bp[i]`` is the main-greedy at verify position ``i`` = the token that should follow
-            # ``verify_seq[i]``; so a draft ``path_drafts[i]`` is accepted iff
-            # ``bp[i] == path_drafts[i]``.
-            j = 0
-            while j < depth and path_drafts[j] == bp[j]:
-                j += 1
+                # Longest matching prefix of ``path_drafts`` against ``bp[:depth]``.
+                # ``bp[i]`` is the main-greedy at verify position ``i`` = the token that should follow
+                # ``verify_seq[i]``; so a draft ``path_drafts[i]`` is accepted iff
+                # ``bp[i] == path_drafts[i]``.
+                j = 0
+                while j < depth and path_drafts[j] == bp[j]:
+                    j += 1
 
-            if j > best_j:
-                best_j = j
-                best_bonus = bp[j]
-                best_path = path_drafts
-                best_hidden = vcaps[last][j][None, None]   # hidden at last accepted draft / cur
+                if j > best_j:
+                    best_j = j
+                    best_bonus = bp[j]
+                    best_path = path_drafts
+                    best_hidden = vcaps[last][j][None, None]   # hidden at last accepted draft / cur
 
-            # Roll back the cache so the next path verifies from the same round-start state. KV
-            # slice + compressor pooling remainder restore + indexer state — DSV4Cache.truncate
-            # handles all three regimes uniformly (gated in parity/dsv4_decode_attn_test.py).
-            # Within-bound rollback is guaranteed because max_rollback was sized to depth + 1 at
-            # make_caches time.
-            caches.truncate(q + 1)
+                # Roll back the cache so the next path verifies from the same round-start state. KV
+                # slice + compressor pooling remainder restore + indexer state — DSV4Cache.truncate
+                # handles all three regimes uniformly (gated in parity/dsv4_decode_attn_test.py).
+                # Within-bound rollback is guaranteed because max_rollback was sized to depth + 1 at
+                # make_caches time.
+                caches.truncate(q + 1)
 
         # --- commit the best path ---
         # Re-feed [cur, *best_path[:best_j]] starting at offset q+1 to advance the cache to the
@@ -383,4 +518,5 @@ def spec_generate_tree(model, mtp, embed: mx.array, head: mx.array, prompt_ids,
         "width": width,
         "depth": depth,
         "paths_per_round": paths_per_round,
+        "batched": batched,
     }

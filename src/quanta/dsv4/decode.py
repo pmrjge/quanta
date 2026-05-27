@@ -237,6 +237,27 @@ class _LayerCache:
             self._ckv_b = self._ckv_b[:, :keep]
 
 
+def _layer_shallow_copy(lc: _LayerCache) -> _LayerCache:
+    """Per-layer shallow copy that shares array references with ``lc`` (lossless under MLX's
+    immutable arrays: subsequent ``append_kv`` / ``truncate_kv`` create new arrays, leaving the
+    originals — and any other shallow-copy sibling — untouched). Drives
+    :meth:`DSV4Cache.replicate` for the batched tree-spec verify (docs/batched_tree_verify.md)."""
+    new = _LayerCache(quantized=lc.quantized, group_size=lc.group_size,
+                      max_rollback=lc.max_rollback)
+    new.ratio = lc.ratio
+    new._kv_bf16 = lc._kv_bf16
+    new._kv_q = lc._kv_q
+    new._kv_s = lc._kv_s
+    new._kv_b = lc._kv_b
+    new._ckv_bf16 = lc._ckv_bf16
+    new._ckv_q = lc._ckv_q
+    new._ckv_s = lc._ckv_s
+    new._ckv_b = lc._ckv_b
+    new.ikv = lc.ikv
+    new.ring = lc.ring
+    return new
+
+
 class DSV4Cache:
     """Decode cache for a DSV4 attention stack: one :class:`_LayerCache` per attention block.
 
@@ -255,6 +276,34 @@ class DSV4Cache:
             _LayerCache(quantized=quantized, group_size=group_size, max_rollback=max_rollback)
             for _ in range(n_layers)
         ]
+
+    def replicate(self, b: int) -> list["DSV4Cache"]:
+        """Return ``b`` parallel decode caches, each initially sharing this cache's prefix state.
+
+        MLX arrays are immutable, so the replicas can share references to the prefix tensors at
+        zero cost — subsequent ``append_kv`` / ``append_ckv`` / ``truncate`` on any replica creates
+        new arrays only, leaving the originals (and every other replica) untouched. This is the
+        structural-sharing form of ``cache.replicate(B)`` for the batched tree-spec verify
+        (docs/batched_tree_verify.md): each enumerated draft path advances its own replica, the
+        original prefix stays read-only, and the B-wide verify amortizes the routed-MoE weight reads
+        across all B paths in one batched MoE call (via :class:`DSV4BatchedResidentModel.batch_step`).
+
+        The picked path's replica is discarded after the round — the commit-forward re-feeds the
+        accepted prefix through the original (un-replicated) cache, exactly as today. So nothing of
+        the replica state is persisted past the round, and the original cache is bit-identical to
+        what a sequential per-path verify would have left it at (gated in
+        ``parity/dsv4_batched_tree_verify_test.py``'s "cache invariance" assertion).
+        """
+        if b < 1:
+            raise ValueError(f"replicate(B) requires B >= 1 (got {b})")
+        return [self._copy() for _ in range(b)]
+
+    def _copy(self) -> "DSV4Cache":
+        """Shallow per-layer copy of every ``_LayerCache`` (array references shared; MLX
+        immutability makes divergent appends/truncates lossless)."""
+        new = self.__new__(DSV4Cache)
+        new.layers = [_layer_shallow_copy(lc) for lc in self.layers]
+        return new
 
     def __getitem__(self, i: int) -> _LayerCache:
         return self.layers[i]

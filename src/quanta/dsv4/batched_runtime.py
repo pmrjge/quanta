@@ -322,3 +322,92 @@ class DSV4BatchedResidentModel:
     ) -> list[mx.array]:
         """Alias of :meth:`step_batch` — supports the batched generator's uniform call surface."""
         return self.step_batch(stream_token_ids, caches, offsets)
+
+    # --- shared-offset batched step for tree-spec batched verify -------------
+    def batch_step(
+        self,
+        tokens,
+        *,
+        caches: list[DSV4Cache],
+        offset: int,
+        capture_layer: int | None = None,
+    ) -> tuple[mx.array, mx.array | None]:
+        """One batched decode step with a SHARED offset across all ``B = len(tokens)`` streams —
+        the verify shape :func:`quanta.dsv4.spec.batch_verify` drives for batched tree-spec
+        (docs/batched_tree_verify.md).
+
+        Returns ``(logits, captured)``:
+
+        * ``logits`` — ``[B, 1, vocab]`` per-stream logits at this verify position.
+        * ``captured`` — ``[B, 1, hc, dim]`` HC residual after layer ``capture_layer`` (or ``None``
+          if not requested). This is the MAIN-model hidden the spec loop carries through as
+          ``prev_hidden`` for the next MTP build.
+
+        Differences from :meth:`step_batch`:
+
+        * single position (``T == 1``) per call — the spec's verify loops :math:`depth+1` calls;
+        * every stream shares ``offset`` (replicas built from the same prefix advance lock-step),
+          where :meth:`step_batch` carries per-stream offsets for ragged agentic-loop streams;
+        * optionally captures a layer's HC residual for the MTP feature.
+
+        Reuses the same per-stream attention + batched-MoE Design-A internals (``_attn_per_stream``
+        + ``_ffn_batched``) so the per-stream attention reads the SAME ``decode_step_dense`` /
+        ``decode_step_compressed`` the single-stream runtime uses (and the MoE call is the same
+        ``dsv4_moe`` over the stacked ``[B, 1, hc, dim]`` — the bandwidth win that makes batched
+        verify cheaper than ``W^D`` sequential per-path forwards).
+
+        Numerically equivalent to running each stream through the single-stream runtime at the same
+        offset with its own cache — gated model-free in
+        ``parity/dsv4_batched_tree_verify_test.py`` against a stub main model.
+        """
+        b = len(tokens)
+        if b < 1:
+            raise ValueError("batch_step: empty stream batch (need >= 1 stream)")
+        if b > self.max_batch:
+            raise ValueError(f"batch_step: B={b} exceeds max_batch={self.max_batch}")
+        if len(caches) != b:
+            raise ValueError(
+                f"batch_step: len(caches)={len(caches)} != len(tokens)={b}"
+            )
+        # Each replica must already sit at the shared offset (fail loud — rule 6 / no silent drift):
+        # the verify loop only makes sense when every stream advances the same absolute position.
+        for s, cache in enumerate(caches):
+            if cache.offset != offset:
+                raise ValueError(
+                    f"batch_step: caches[{s}].offset={cache.offset} != offset={offset} "
+                    f"(all B replicas must sit at the shared verify offset)"
+                )
+        if capture_layer is not None and not 0 <= capture_layer < self.num_layers:
+            raise ValueError(
+                f"batch_step: capture_layer={capture_layer} not in [0, {self.num_layers})"
+            )
+
+        cfg = self.cfg
+        # Per-stream input ids + HC residual init — same surface as step_batch, just for T=1.
+        ids_b = mx.array([int(t) for t in tokens], dtype=mx.int32)[:, None]    # [B, 1]
+        slice_h: list[mx.array] = [
+            hc_expand(self.embed_w[ids_b[k:k + 1]].astype(mx.bfloat16), cfg.hc_mult)
+            for k in range(b)
+        ]                                                                       # B × [1,1,hc,dim]
+
+        captured: mx.array | None = None
+        for i, p in enumerate(self.layers):
+            # 1) per-stream attention through the replica's own cache (bounded B-loop, rule-3 OK).
+            slice_h = [
+                self._attn_per_stream(slice_h[k], p, i, caches[k], offset) for k in range(b)
+            ]
+            # 2) stack → batched MoE → split (the routed/shared expert weight reads amortize over
+            # all B streams in ONE dsv4_moe call — the win batched verify exists to harvest).
+            h_stack = mx.concatenate(slice_h, axis=0)                           # [B,1,hc,dim]
+            h_stack = self._ffn_batched(h_stack, ids_b, p, i)
+            if capture_layer is not None and i == capture_layer:
+                captured = h_stack                                              # [B,1,hc,dim]
+            slice_h = [h_stack[k:k + 1] for k in range(b)]
+
+        # Materialize this step's grown caches + residuals (one eval per token, rule-8 boundary).
+        mx.eval(*slice_h)
+
+        # Final HC head + norm + lm_head over the stacked [B,1,hc,dim] — single matmul.
+        final_h = mx.concatenate(slice_h, axis=0)                               # [B,1,hc,dim]
+        logits = self._inner._head(final_h)                                     # [B,1,vocab]
+        return logits, captured
