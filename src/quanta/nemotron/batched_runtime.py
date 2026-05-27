@@ -220,6 +220,52 @@ class NemotronBatchedResidentModel:
     def lm_head_w(self) -> mx.array:
         return self._inner.lm_head_w
 
+    # --- spec-contract state factory ------------------------------------------
+    def make_caches(self, *, max_rollback: int = 8) -> tuple[list, list, list]:
+        """Return a fresh ``(caches, ssm, conv)`` triple ready for the spec contract.
+
+        :func:`quanta.nemotron.spec._capture_state` calls this; without it the spec module
+        falls back to ``(caches=[None]*n, ssm=None, conv=None)`` and :func:`replicate_state`
+        propagates ``None`` ssm/conv through to :meth:`batch_step` where ``ssm_s[i]`` becomes
+        ``NoneType.__getitem__`` — the failure on the in-tree real-parity run before this
+        adapter was wired.
+
+        ``max_rollback`` (default 8) sizes each attention KV cache's rollback window:
+        :func:`quanta.nemotron.spec.spec_generate_tree` rolls back ``depth + 1`` tokens
+        between per-path verifies, so ``max_rollback >= depth + 1`` is required and 8
+        comfortably covers the docs/batched_tree_verify.md envelope (``W ** D`` paths over
+        ``W, D <= 4``). Builds the per-attention-layer caches inline rather than via the
+        module-level :func:`make_stream_state` so the rollback budget is honored — the
+        Mamba ssm/conv state lists start ``[None] * n`` (the prefill fills them in)."""
+        kinds = self._inner.cfg.layers_block_type
+        caches = [KVCache(max_rollback=max_rollback) if k == "attention" else None
+                  for k in kinds]
+        ssm = [None] * len(kinds)
+        conv = [None] * len(kinds)
+        return caches, ssm, conv
+
+    # --- single-stream __call__ delegating to inner ---------------------------
+    def __call__(self, token_ids, *, caches=None, ssm=None, conv=None, offset=0,
+                 capture_layers=None, use_fast=True, compiled=True):
+        """Single-stream forward — delegate to the inner :class:`NemotronResidentModel`.
+
+        Accepts the uniform spec contract (``offset=`` + ``capture_layers=`` kwargs matching
+        :func:`quanta.nemotron.spec._forward`). The inner derives the absolute position from
+        each KV cache's internal counter — Mamba layers are offset-free and the GQA layers
+        read ``cache.offset`` — so we accept ``offset`` as a contract parameter and
+        intentionally **do not** forward it to the inner. ``capture_layers`` IS forwarded —
+        the inner's adapter wires per-layer hidden capture for native-MTP speculation
+        (returns ``(logits, caps_dict)`` instead of the legacy ``(logits, ssm, conv)``).
+
+        Used by :func:`quanta.nemotron.spec.spec_generate_tree` for the prefill + per-path-
+        verify + commit-replay paths regardless of ``batched=`` value (only the per-position
+        verify in the ``batched=True`` branch dispatches via :meth:`batch_step`). Use
+        :meth:`step_batch` directly for the multi-stream batched-decode surface (per-stream
+        offsets); use :meth:`batch_step` for the shared-offset spec-verify surface."""
+        del offset                                                    # noqa: F841 — see docstring
+        return self._inner(token_ids, caches=caches, ssm=ssm, conv=conv,
+                           capture_layers=capture_layers, use_fast=use_fast, compiled=compiled)
+
     # --- single-stream prefill (delegate) --------------------------------------
     def prefill(self, prompt_ids: mx.array, state: tuple[list, list, list]) -> mx.array:
         """Run a single-stream chunked prefill, filling the given per-stream state in place.

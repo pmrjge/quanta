@@ -312,16 +312,18 @@ class DSV4BatchedResidentModel:
             out_logits.append(self._inner._head(h_s))
         return out_logits
 
-    # --- direct __call__ mirroring single-stream surface ----------------------
-    def __call__(
-        self,
-        stream_token_ids: list[mx.array],
-        *,
-        caches: list[DSV4Cache],
-        offsets: list[int],
-    ) -> list[mx.array]:
-        """Alias of :meth:`step_batch` — supports the batched generator's uniform call surface."""
-        return self.step_batch(stream_token_ids, caches, offsets)
+    # --- single-stream __call__ delegating to inner ---------------------------
+    def __call__(self, token_ids, *, caches=None, offset=0, capture_layers=None):
+        """Single-stream forward — delegate to the inner :class:`DSV4ResidentModel`.
+
+        Same signature as :meth:`DSV4ResidentModel.__call__` so the batched runtime is a true
+        drop-in (the class docstring's promise). The prefill + per-path-verify + commit-replay
+        paths inside :func:`quanta.dsv4.spec.spec_generate_tree` use this single-stream surface
+        regardless of ``batched=`` value (only the per-position verify in the ``batched=True``
+        branch dispatches via :meth:`batch_step`). Use :meth:`step_batch` directly for the
+        multi-stream batched-decode surface (per-stream offsets); use :meth:`batch_step` for
+        the shared-offset spec-verify surface."""
+        return self._inner(token_ids, caches=caches, offset=offset, capture_layers=capture_layers)
 
     # --- shared-offset batched step for tree-spec batched verify -------------
     def batch_step(

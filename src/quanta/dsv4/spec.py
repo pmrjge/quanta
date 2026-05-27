@@ -337,7 +337,7 @@ def batch_verify(model, cache: DSV4Cache, cur: int, paths: list[list[int]],
 def spec_generate_tree(model, mtp, embed: mx.array, head: mx.array, prompt_ids,
                        *, width: int, depth: int, max_new: int,
                        eos_id: int | None = None,
-                       batched: bool = False) -> tuple[list[int], dict]:
+                       batched: bool = True) -> tuple[list[int], dict]:
     """**W-parallel chain-verify** tree drafting over the native DSV4 MTP head — lossless (#157).
 
     Each round drafts a ``(width, depth)`` tree from the MTP head, enumerates the ``W ** D``
@@ -358,32 +358,33 @@ def spec_generate_tree(model, mtp, embed: mx.array, head: mx.array, prompt_ids,
     and is the natural drop-in target for the planned batched verify (B = ``W ** D`` in ONE forward
     via :mod:`quanta.dsv4.batched_runtime`) that flips the economics in tree drafting's favor.
 
-    **Economics.** This implementation runs ``W ** D + 1`` main-model forwards per round
-    (``W ** D`` per-path verifies + 1 commit-forward to advance the cache to the committed offset).
-    At ``W=2, D=2`` that is 5 forwards; ``mean_accept`` is bounded by ``depth + 1``, so PER ACCEPTED
-    TOKEN this is ~2–3× the cost of :func:`spec_generate_k` (chained k=2: 1 forward at
-    ``mean_accept ≈ 2.78``). USE :func:`spec_generate_k` FOR ACTUAL DECODE SPEEDUP UNTIL THE
-    BATCHED-VERIFY OR SINGLE-FORWARD TREE-MASK FORM LANDS. This entry point is kept for (a) lossless
-    contract correctness — it admits a ``(W, D)`` tree on DSV4 without per-regime mask plumbing;
-    (b) interface uniformity with the hybrid-model paths (Qwen3.5 / Nemotron) — same call site;
-    (c) the natural follow-on batched-verify integration via :mod:`quanta.dsv4.batched_runtime`
-    that collapses the ``W ** D`` sequential forwards into ONE batched forward.
+    **Economics.** Per round: ``W ** D`` per-position batched verifies (one batched main-model
+    forward in the default ``batched=True`` path) + 1 commit-forward to advance the cache to the
+    committed offset. At ``W=2, D=2`` the per-position verify is a ``B=4`` stacked forward.
+    Real-model parity + bench (``parity/dsv4_batched_tree_verify_real.py``, commit 5 of
+    ``docs/batched_tree_verify.md``) measured at ``max_new=64`` with native MTP:
+
+      * ``spec_generate_k(k=2)``: 175.67s, 0.36 tok/s, mean_accept 2.52/3
+      * ``spec_generate_tree(W=2,D=2, batched=False)``: 486.39s, 0.13 tok/s, mean_accept 2.74/3
+      * ``spec_generate_tree(W=2,D=2, batched=True)``: 46.65s, 1.37 tok/s, mean_accept 2.74/3
+
+    → batched-tree is **3.77× chained k=2** and **10.43× sequential tree** while keeping the
+    higher accept rate. ``batched=True`` is the default since commit 5 landed; ``batched=False``
+    stays as the proven reference path for parity bisection.
 
     Returns ``(tokens, stats)`` where ``stats`` reports ``mean_accept`` (tokens emitted per round),
     ``rounds``, ``max_accept``, ``width``, ``depth``, ``paths_per_round`` (= ``W ** D``), and
-    ``batched`` (the opt-in flag's value for this run, for stat collation).
-    Mirrors :func:`spec_generate_k`'s eos / max_new semantics. ``width=1`` degenerates to a chain
+    ``batched`` (the flag's value for this run, for stat collation). Mirrors
+    :func:`spec_generate_k`'s eos / max_new semantics. ``width=1`` degenerates to a chain
     (= :func:`spec_generate_k` with ``k=depth``) and short-circuits to that proven path.
 
-    ``batched=True`` (opt-in; default ``False``) replaces the per-path ``W ** D`` sequential verify
-    forwards with ONE ``B = W ** D`` batched forward via :func:`batch_verify` — the routed-MoE
-    weight reads amortize across all ``B`` candidate paths, dropping cost-per-accepted-token
-    roughly in line with chained ``spec_generate_k`` (see docs/batched_tree_verify.md for the
-    economics). Output is bit-identical to ``batched=False`` (same paths considered, same selection,
-    same commit-forward); only verify cost changes. Requires ``model`` to be a
-    :class:`quanta.dsv4.batched_runtime.DSV4BatchedResidentModel` (the only runtime with
-    ``batch_step``); single-stream :class:`DSV4ResidentModel` callers must keep ``batched=False``
-    or wrap their inner via ``DSV4BatchedResidentModel.from_inner``.
+    ``batched=True`` (default) replaces the per-path ``W ** D`` sequential verify forwards with ONE
+    ``B = W ** D`` batched forward via :func:`batch_verify` — the routed-MoE weight reads amortize
+    across all ``B`` candidate paths. Output is bit-identical to ``batched=False`` (real-model
+    parity gated at ``W=2, D=2, max_new=32`` — see the parity script linked above). Requires
+    ``model`` to be a :class:`quanta.dsv4.batched_runtime.DSV4BatchedResidentModel` (the only
+    runtime with ``batch_step``); single-stream :class:`DSV4ResidentModel` callers must pass
+    ``batched=False`` or wrap their inner via ``DSV4BatchedResidentModel.from_inner``.
     """
     if width < 1 or depth < 1:
         raise ValueError(f"width must be >= 1, depth must be >= 1 (got width={width}, depth={depth})")

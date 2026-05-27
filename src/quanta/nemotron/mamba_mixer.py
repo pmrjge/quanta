@@ -71,22 +71,41 @@ class MambaMixer(nn.Module):
         b, t, _ = x.shape
         a = -mx.exp(self.A_log)
         z, xbc, dt = self._split(self.in_proj(x))
-        if conv_state is None:  # prefill
+        if conv_state is None:  # fresh prefill (chunked SSD)
             xbc_pre = xbc
             xbc = _silu(causal_conv1d(xbc, self.conv_weight, self.conv_bias))
             xs, bm, cm = self._split_xbc(xbc, b, t)
             dt = _softplus(dt + self.dt_bias)
             y, state = self._prefill(xs, dt, a, bm, cm, state)
-            conv_state = xbc_pre[:, -(self.k - 1) :]  # for decode continuation
-        else:  # decode step (t == 1)
-            conv_out, conv_state = causal_conv1d_step(xbc[:, 0], self.conv_weight, conv_state, self.conv_bias)
-            xs, bm, cm = self._split_xbc(_silu(conv_out)[:, None], b, 1)
-            dt = _softplus(dt + self.dt_bias)
+            conv_state = xbc_pre[:, -(self.k - 1) :]   # for decode continuation
+        else:
+            # Mid-stream continuation: use the **same per-token step ops** as the t==1
+            # decode path for every t in [0..T-1]. Chunked SSD with ``state_in`` is
+            # mathematically equivalent but the chunk-major reductions diverge from the
+            # per-token step ops in bf16 (~7-bit mantissa) — measured ~22% argmax-match
+            # against :meth:`quanta.nemotron.batched_runtime.NemotronBatchedResidentModel.batch_step`
+            # (which always steps per-token), see commit 5 of docs/batched_tree_verify.md.
+            # batch_step calls ``blk(...)`` with t=1 per replica → this branch matches it
+            # by construction by using the exact same ``causal_conv1d_step`` + ``ssd_step``
+            # ops in the same order, just T times. The Python loop is bounded by ``depth+1``
+            # (W^D verify chain length, typically 2–3) — the kind of bounded per-token
+            # spec-verify loop CLAUDE.md rule 3 explicitly permits (the unbounded forbidden
+            # form is over tokens-of-the-output or experts-per-token, neither apply here).
             if state is None:
                 state = mx.zeros((b, self.h, self.n, self.p), dtype=x.dtype)
+            dt_all = _softplus(dt + self.dt_bias)
             step_fn = ssd_step_fused if FUSED_SSD_STEP else ssd_step
-            y, state = step_fn(xs[:, 0], dt[:, 0], a, bm[:, 0], cm[:, 0], self.D, state)
-            y = y[:, None]
+            ys: list[mx.array] = []
+            for ti in range(t):
+                conv_out, conv_state = causal_conv1d_step(
+                    xbc[:, ti], self.conv_weight, conv_state, self.conv_bias,
+                )
+                xs_t, bm_t, cm_t = self._split_xbc(_silu(conv_out)[:, None], b, 1)
+                y_t, state = step_fn(
+                    xs_t[:, 0], dt_all[:, ti], a, bm_t[:, 0], cm_t[:, 0], self.D, state,
+                )
+                ys.append(y_t[:, None])
+            y = ys[0] if t == 1 else mx.concatenate(ys, axis=1)
         y = y.reshape(b, t, self.d_inner)
         y = self.norm(y * _silu(z))  # gated RMSNorm: gate before norm+weight
         return self.out_proj(y), state, conv_state

@@ -457,7 +457,7 @@ def batch_verify(model, state, cur: int, paths: list[list[int]],
 
 def spec_generate_tree(model, mtp, embed: mx.array, head: mx.array, prompt_ids,
                        *, width: int, depth: int, max_new: int,
-                       eos_id=None, batched: bool = False) -> tuple[list[int], dict]:
+                       eos_id=None, batched: bool = True) -> tuple[list[int], dict]:
     """**W-parallel chain-verify** tree drafting over the native Nemotron-H MTP head — lossless,
     hybrid-safe (task #157).
 
@@ -480,31 +480,32 @@ def spec_generate_tree(model, mtp, embed: mx.array, head: mx.array, prompt_ids,
     hybrid stack by keeping each path's forward sequential (every layer always sees a contiguous
     chain) at the cost of more forwards per round.
 
-    **Economics.** This implementation runs ``W ** D`` per-path verifies + 1 replay-forward per
-    round to advance the committed state. At ``W=2, D=2`` that is 5 forwards; EAGLE-2 reports
-    ``mean_accept ≈ 3.5–4.5`` at those settings, so PER ACCEPTED TOKEN this is ~3–4× the cost of
-    :func:`spec_generate_k` (chained k=2 on Nemotron: 1–2 forwards at ``mean_accept ≈ 2.78``).
-    USE :func:`spec_generate_k` FOR ACTUAL DECODE SPEEDUP — Nemotron's Mamba-dominant stack is
-    especially unforgiving of extra forwards. This entry point is kept for (a) lossless contract
-    correctness — the only form that admits a ``(W, D)`` tree on a Mamba-dominant architecture;
-    (b) future batched-verify (B=``W ** D``) via :mod:`quanta.nemotron.batched_runtime`, which
-    would collapse the per-path forwards into ONE batched forward and could net a real win at
-    hybrid; that integration is not done here (it touches the batched stepper).
+    **Economics.** Per round: ``W ** D`` per-position batched verifies (one batched main-model
+    forward in the default ``batched=True`` path) + 1 replay-forward to advance the committed
+    state. Real-model parity is gated by ``parity/nemotron_batched_tree_verify_real.py``
+    (commit 5 of ``docs/batched_tree_verify.md``): **bit-identical** 32-token streams between
+    ``batched=True`` and ``batched=False`` at ``W=2, D=2`` on the int4-g64 resident Nemotron-H.
+
+    The Nemotron baked artifact does **not** ship native MTP weights (0 ``mtp.*`` keys in the
+    manifest), so the bench runs at the random-MTP accept floor (``mean_accept ≈ 1/W``) where the
+    ``W ** D`` paths all reduce to a single accepted bonus per round — there's no W^D fan-out to
+    amortize, so batched and sequential are within ~1% wall-clock at the floor. The lossless
+    contract still holds, and once a native MTP head is trained / baked the W^D weight-amortization
+    will kick in (mirrors the DSV4 result: 10.43× sequential tree at native-MTP accept rates).
 
     Returns ``(tokens, stats)`` where ``stats`` reports ``mean_accept``, ``rounds``, ``max_accept``,
-    ``width``, ``depth``, ``paths_per_round`` (= ``W ** D``), and ``batched`` (the opt-in flag's
-    value for this run, for stat collation). Mirrors :func:`spec_generate_k`'s eos / max_new
-    semantics. ``width=1`` degenerates to a chain (= :func:`spec_generate_k` with ``k=depth``) and
-    short-circuits to that proven path.
+    ``width``, ``depth``, ``paths_per_round`` (= ``W ** D``), and ``batched`` (the flag's value for
+    this run, for stat collation). Mirrors :func:`spec_generate_k`'s eos / max_new semantics.
+    ``width=1`` degenerates to a chain (= :func:`spec_generate_k` with ``k=depth``) and short-
+    circuits to that proven path.
 
-    ``batched=True`` (opt-in; default ``False``) replaces the per-path ``W ** D`` sequential verify
+    ``batched=True`` (default since commit 5) replaces the per-path ``W ** D`` sequential verify
     forwards with ONE ``B = W ** D`` batched forward via :func:`batch_verify` — the routed-MoE
-    weight reads amortize across all ``B`` candidate paths, dropping cost-per-accepted-token
-    roughly in line with chained ``spec_generate_k`` (see docs/batched_tree_verify.md for the
-    economics). Output is bit-identical to ``batched=False`` (same paths considered, same selection,
-    same commit-replay); only verify cost changes. Requires ``model`` to be a
-    :class:`quanta.nemotron.batched_runtime.NemotronBatchedResidentModel` (the only runtime with
-    ``batch_step``); single-stream :class:`NemotronResidentModel` callers must keep ``batched=False``.
+    weight reads amortize across all ``B`` candidate paths. Output is bit-identical to
+    ``batched=False`` (real-parity gated as above); only verify cost changes. Requires ``model`` to
+    be a :class:`quanta.nemotron.batched_runtime.NemotronBatchedResidentModel` (the only runtime
+    with ``batch_step``); single-stream :class:`NemotronResidentModel` callers must pass
+    ``batched=False``.
     """
     if width < 1 or depth < 1:
         raise ValueError(f"width must be >= 1, depth must be >= 1 (got width={width}, depth={depth})")

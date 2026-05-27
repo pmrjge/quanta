@@ -26,15 +26,14 @@ Asserts:
 
 Run:  ``uv run --with numpy python -m parity.nemotron_batched_tree_verify_test``
 
-Deferred (GPU/memory-available session) — docstring-only entry per ``parity/dsv4_int4_ppl.py``:
-
-  * **Real-model parity** — load the resident baked Nemotron-H + native MTP, run
-    ``spec_generate_tree(W=2, D=2, batched=True)`` vs ``=False`` on a real prompt, assert tokens
-    match bit-for-bit (SDPA + sorted-MoE may reorder reductions; fall back to
-    ``argmax_match >= 0.99``).
-  * **Throughput bench** — measure tok/s for ``spec_generate_k(k=2)`` vs
-    ``spec_generate_tree(W=2, D=2, batched=False)`` vs ``=True``; expected economics in
-    ``docs/batched_tree_verify.md``'s table.
+Real-model parity + bench: ``parity/nemotron_batched_tree_verify_real.py`` (commit 5 of
+``docs/batched_tree_verify.md``) — gates both branches against the resident int4-g64 Nemotron-H.
+Measured: **bit-identical** 32-token streams between ``batched=False`` and ``batched=True`` at
+``W=2, D=2``. The Nemotron baked artifact has 0 native MTP keys, so the bench runs at the
+random-MTP accept floor and the W^D weight-amortization gain only kicks in once a native MTP head
+is trained / baked (mirrors the DSV4 result: 10.43× sequential tree at native-MTP accept rates).
+This bit-identical gate is what motivated flipping ``batched=True`` to default in
+:func:`quanta.nemotron.spec.spec_generate_tree`.
 """
 
 from __future__ import annotations

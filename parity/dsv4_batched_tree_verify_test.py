@@ -27,17 +27,12 @@ Asserts:
 
 Run:  ``uv run --with numpy python -m parity.dsv4_batched_tree_verify_test``
 
-Deferred (GPU/memory-available session) — written into this docstring per the same docstring-only
-pattern as ``parity/dsv4_int4_ppl.py``:
-
-  * **Real-model parity** — load the resident baked DSV4 + native MTP, run
-    ``spec_generate_tree(W=2, D=2, batched=True)`` vs ``=False`` on a real prompt, assert tokens
-    match bit-for-bit (SDPA + sorted-MoE may reorder reductions; if needed, fall back to
-    ``argmax_match >= 0.99``).
-  * **Throughput bench** — measure tok/s for ``spec_generate_k(k=2)`` vs
-    ``spec_generate_tree(W=2, D=2, batched=False)`` vs ``=True``; expected economics in
-    ``docs/batched_tree_verify.md``'s table (batched should reach ≥ chained's throughput while
-    keeping the higher accept rate).
+Real-model parity + throughput bench: ``parity/dsv4_batched_tree_verify_real.py`` (commit 5 of
+``docs/batched_tree_verify.md``) — gates both branches against the resident baked DSV4 + native
+MTP head. Measured: bit-identical 32 tokens at ``W=2, D=2`` and 64-token bench shows
+``batched=True`` at 1.37 tok/s = **3.77× chained k=2** and **10.43× sequential tree**, with the
+same mean_accept (2.74/3) — the result that motivated flipping ``batched=True`` to default in
+:func:`quanta.dsv4.spec.spec_generate_tree`.
 """
 
 from __future__ import annotations

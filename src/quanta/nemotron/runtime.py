@@ -127,15 +127,27 @@ class NemotronResidentModel:
             self._cmix = cmix
         return self._cmix
 
-    def __call__(self, token_ids, *, caches=None, ssm=None, conv=None, use_fast=True, compiled=True):
+    def __call__(self, token_ids, *, caches=None, ssm=None, conv=None,
+                 capture_layers=None, use_fast=True, compiled=True):
         """Logits ``[1, t, vocab]`` + updated mamba state lists. All-``None`` state ⇒ fresh prefill.
-        At decode (``t == 1``) the mamba/moe mixers run through compiled fused graphs by default."""
+        At decode (``t == 1``) the mamba/moe mixers run through compiled fused graphs by default.
+
+        ``capture_layers`` (iterable of ``int`` layer indices or ``None``) is the adapter promised
+        by :func:`quanta.nemotron.spec._forward` for native-MTP speculation: when set, the
+        per-layer post-residual hidden state ``h`` is captured *after* layer ``i`` for every
+        ``i in capture_layers``, and the return shape switches to ``(logits, caps_dict)`` (mirrors
+        :class:`quanta.dsv4.runtime.DSV4ResidentModel`'s capture contract). Default ``None``
+        preserves the legacy ``(logits, ssm, conv)`` return for all existing callers (generate
+        loop, oMLX engine, plain k=2 spec which only needs the next-token logits).
+        """
         h = self.embed_w[token_ids][None].astype(mx.bfloat16)
         n = len(self.layers)
         caches = caches if caches is not None else [None] * n
         ssm = ssm if ssm is not None else [None] * n
         conv = conv if conv is not None else [None] * n
         cmix = self._decode_mixers() if (compiled and h.shape[1] == 1) else None
+        capture_set = set(int(i) for i in capture_layers) if capture_layers else None
+        caps: dict[int, mx.array] = {} if capture_set is not None else None  # type: ignore[assignment]
         for i, blk in enumerate(self.layers):
             if cmix is not None and blk.kind == "mamba":
                 y, ssm[i], conv[i] = cmix[i](blk.norm(h), ssm[i], conv[i])
@@ -144,5 +156,14 @@ class NemotronResidentModel:
                 h = h + cmix[i](blk.norm(h))
             else:
                 h, ssm[i], conv[i] = blk(h, cache=caches[i], ssm_state=ssm[i], conv_state=conv[i], use_fast=use_fast)
+            if capture_set is not None and i in capture_set:
+                # Strip the leading batch-1 dim — match the ``[T, hidden]`` capture shape
+                # convention used by :class:`quanta.dsv4.runtime.DSV4ResidentModel` and
+                # consumed by :func:`quanta.nemotron.spec.spec_generate_tree` as
+                # ``caps[last][-1][None, None] -> [1, 1, hidden]`` for the MTP feature.
+                caps[i] = h[0]
         h = mx.fast.rms_norm(h, self.norm_f.astype(h.dtype), self.cfg.norm_eps)
-        return (h @ self.lm_head_w.T), ssm, conv
+        logits = h @ self.lm_head_w.T
+        if caps is not None:
+            return logits, caps
+        return logits, ssm, conv
