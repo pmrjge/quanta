@@ -47,11 +47,17 @@ class NemotronMTPModule(nn.Module):
     norm (the state a subsequent MTP module would chain on, mirroring DeepSeek-V3 sequential MTP), and
     ``logits`` is ``final_layernorm`` → shared LM head. The embedding/head matrices are the target
     model's (frozen, caller-held) — passed per call, never owned here (the EAGLE frozen-embed/head
-    convention)."""
+    convention).
 
-    def __init__(self, cfg: NemotronHConfig) -> None:
+    ``draft_topk`` (optional): if set, the moe sub-block routes through fewer experts than the main
+    model (``1 <= draft_topk <= cfg.num_experts_per_tok``). The main-model verify path is unchanged
+    (still cfg.num_experts_per_tok), so the drafter is cheaper without affecting losslessness —
+    only the *speed* trade-off."""
+
+    def __init__(self, cfg: NemotronHConfig, *, draft_topk: int | None = None) -> None:
         super().__init__()
         self.cfg = cfg
+        self.draft_topk = draft_topk
         h = cfg.hidden_size
         self.enorm = nn.RMSNorm(h, eps=cfg.norm_eps)
         self.hnorm = nn.RMSNorm(h, eps=cfg.norm_eps)
@@ -68,20 +74,32 @@ class NemotronMTPModule(nn.Module):
         return self.eh_proj(mx.concatenate([e, hid], axis=-1))
 
     def __call__(self, prev_hidden: mx.array, token_emb: mx.array, head: mx.array, *,
-                 offset: int = 0, use_fast: bool = True) -> tuple[mx.array, mx.array]:
+                 offset: int = 0, use_fast: bool = True,
+                 return_hidden: bool = False) -> tuple[mx.array, mx.array]:
         """One MTP draft step. ``prev_hidden`` / ``token_emb``: ``[B,T,hidden]`` (the main model's hidden
         at the predicting positions, and the embedding of the next token); ``head``: the shared LM-head
         matrix ``[vocab, hidden]``. Returns ``(logits [B,T,vocab], new_hidden [B,T,hidden])``.
+
+        ``return_hidden`` (default False, equivalent to the original surface): when True, the returned
+        ``new_hidden`` is the SAME-shape tensor the function consumes as ``prev_hidden`` — the post-block
+        residual stream that a subsequent chained MTP step can feed in as its own ``prev_hidden`` (the
+        multi-step k>=2 path; see :func:`quanta.nemotron.spec.spec_generate_k`). When False the second
+        element is the same tensor (preserves the legacy two-tuple return) — the kwarg only changes
+        intent / semantic, never the underlying value.
 
         The attention sub-block runs stateless (``cache=None``) over the given window — for a single
         drafted token (``T == 1``) that is a length-1 causal self-attention, and the main model verifies
         every draft, so the window/offset convention is a *speed* lever, never a correctness one
         (CLAUDE.md rule 4; same convention as :func:`quanta.dsv4.mtp.mtp_forward`)."""
         x = self._fuse(prev_hidden, token_emb)
-        x, _, _ = self.attn_block(x, cache=None, use_fast=use_fast)   # x + attn(norm(x))
-        x, _, _ = self.moe_block(x)                                   # x + moe(norm(x))  (stateless)
+        x, _, _ = self.attn_block(x, cache=None, use_fast=use_fast)              # x + attn(norm(x))
+        x, _, _ = self.moe_block(x, topk_override=self.draft_topk)               # x + moe(norm(x))
         normed = self.final_layernorm(x)
         logits = normed @ head.T.astype(normed.dtype)
+        # return_hidden is documented-intent only: both branches expose the post-block residual stream
+        # (which IS the chaining feature). Kept as a kwarg so callers chaining k>=2 drafts can mark the
+        # intent at the call site (mirrors the DSV4 surface).
+        _ = return_hidden  # explicit no-op: signature surface for chained drafting
         return logits, x
 
 
@@ -94,18 +112,33 @@ class NemotronMTP:
     each module's params. The call surface is uniform with the dsv4/glm drafters —
     ``mtp(prev_hidden, token_emb, head) -> (logits, new_hidden)`` — so the spec loop and the model-free
     test stub mirror it. Holds no state across calls; the shared ``embed``/``head`` are the target
-    model's and are threaded in by the caller."""
+    model's and are threaded in by the caller.
 
-    def __init__(self, cfg: NemotronHConfig) -> None:
+    ``draft_topk`` (optional): if set, propagates to every held :class:`NemotronMTPModule` so the moe
+    sub-block of every chained draft step routes through fewer experts (lighter drafter)."""
+
+    def __init__(self, cfg: NemotronHConfig, *, draft_topk: int | None = None) -> None:
         self.cfg = cfg
+        self.draft_topk = draft_topk
         n = max(1, int(getattr(cfg, "num_nextn_predict_layers", 1)))
-        self.modules: list[NemotronMTPModule] = [NemotronMTPModule(cfg) for _ in range(n)]
+        self.modules: list[NemotronMTPModule] = [
+            NemotronMTPModule(cfg, draft_topk=draft_topk) for _ in range(n)
+        ]
 
     @property
     def module(self) -> NemotronMTPModule:
         """The single MTP head (Nemotron ships exactly one)."""
         return self.modules[0]
 
+    def set_draft_topk(self, draft_topk: int | None) -> None:
+        """Update ``draft_topk`` on this holder AND on every held :class:`NemotronMTPModule` (so the
+        propagated state stays consistent between holder and sub-blocks)."""
+        self.draft_topk = draft_topk
+        for m in self.modules:
+            m.draft_topk = draft_topk
+
     def __call__(self, prev_hidden: mx.array, token_emb: mx.array, head: mx.array, *,
-                 offset: int = 0, use_fast: bool = True) -> tuple[mx.array, mx.array]:
-        return self.module(prev_hidden, token_emb, head, offset=offset, use_fast=use_fast)
+                 offset: int = 0, use_fast: bool = True,
+                 return_hidden: bool = False) -> tuple[mx.array, mx.array]:
+        return self.module(prev_hidden, token_emb, head, offset=offset, use_fast=use_fast,
+                           return_hidden=return_hidden)

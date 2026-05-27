@@ -31,11 +31,21 @@ from quanta.nemotron.config import NemotronHConfig
 
 
 class KVCache:
-    """Plain GQA KV cache: stores ``[B, n_kv, S, head_dim]`` k/v, grows along the seq axis."""
+    """Plain GQA KV cache: stores ``[B, n_kv, S, head_dim]`` k/v, grows along the seq axis.
 
-    def __init__(self) -> None:
+    Speculative-decode rollback (``truncate(length)``) slices both streams cleanly along the seq axis
+    — per-position storage makes the rolled-back state bit-identical to a fresh cache fed only those
+    ``length`` positions. ``max_rollback`` declares the deepest rollback the cache will accept for
+    multi-step spec-decode (``k`` MTP drafts → rollback up to ``k`` tokens); a deeper ``truncate``
+    fails LOUD (rule 6: never silently keep a diverged state). For ``max_rollback == 0`` (the
+    plain-decode default) the cache rejects every shrinking truncate."""
+
+    def __init__(self, *, max_rollback: int = 1) -> None:
+        if max_rollback < 0:
+            raise ValueError(f"max_rollback {max_rollback} < 0")
         self.k: mx.array | None = None
         self.v: mx.array | None = None
+        self.max_rollback = int(max_rollback)
 
     @property
     def offset(self) -> int:
@@ -48,6 +58,28 @@ class KVCache:
             self.k = mx.concatenate([self.k, k], axis=2)
             self.v = mx.concatenate([self.v, v], axis=2)
         return self.k, self.v
+
+    def truncate(self, length: int) -> None:
+        """Roll the cache back to exactly ``length`` cached positions (drop the rolled-back tail).
+        Slicing along the seq axis is lossless (per-position storage). Fails LOUD if the rollback
+        depth exceeds ``max_rollback`` (rule 6) — the cache must not silently retain a diverged
+        state past its declared rollback budget."""
+        if length < 0:
+            raise ValueError(f"truncate length {length} < 0")
+        cur = self.offset
+        if length >= cur:
+            return
+        drop = cur - length
+        if drop > self.max_rollback:
+            raise ValueError(
+                f"truncate({length}) rolls back {drop} tokens from offset {cur}, exceeding "
+                f"max_rollback={self.max_rollback}. Multi-step spec-decode needs the cache built "
+                f"with max_rollback >= k (the per-round chained-draft depth).")
+        if length == 0:
+            self.k = self.v = None
+            return
+        self.k = self.k[:, :, :length]
+        self.v = self.v[:, :, :length]
 
 
 def _causal_mask(q_len: int, kv_len: int, dtype: mx.Dtype) -> mx.array:

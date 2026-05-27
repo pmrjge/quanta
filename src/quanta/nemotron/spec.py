@@ -1,33 +1,53 @@
-"""Native MTP self-speculative decoding for Nemotron-H — lossless, 1 draft head.
+"""Native MTP self-speculative decoding for Nemotron-H — lossless, 1 draft head + multi-step k>=2.
 
 Nemotron-H ships ONE native MTP head (``num_nextn_predict_layers == 1``; two stacked sub-blocks, see
-:mod:`quanta.nemotron.mtp`), so each round drafts exactly **one** token. The structure mirrors
+:mod:`quanta.nemotron.mtp`), so each round drafts exactly **one** token with :func:`spec_generate`.
+:func:`spec_generate_k` extends this to ``k >= 2`` by CHAINING the single MTP head against its own
+post-block hidden — each round drafts ``k`` tokens in series (off-distribution past step 1 → chained-
+accept rate drops, but verify amortizes over a longer window). The structure mirrors
 :mod:`quanta.dsv4.spec` / :mod:`quanta.glm.spec` (k == 1):
 
-  1. draft 1 token with the MTP head from ``(main hidden at p, embed[token_{p+1}])`` → ``token_{p+2}``;
-  2. verify both in **one** main-model forward over ``[cur, draft]`` at the current offset;
-  3. accept the draft iff it equals the main model's greedy token there, and always emit the bonus
-     (the main model's greedy token at the next position);
-  4. roll the per-attention-layer KV caches and the Mamba recurrence state back to drop a rejected
-     draft, so the decode state is bit-identical to never having fed it.
+  1. draft k tokens with the MTP head: step 0 uses main hidden at p; steps 1..k-1 chain on the MTP
+     block's OWN post-block hidden;
+  2. verify all ``k + 1`` tokens (``[cur, d_1, ..., d_k]``) in **one** main-model forward at the
+     current offset;
+  3. accept the longest greedy-matching prefix (largest ``j`` such that ``d_i == greedy(cur, d_1, ...,
+     d_{i-1})`` for all ``i in [1, j]``), and always emit the bonus (the main model's greedy token at
+     the first unverified position);
+  4. roll the per-attention-layer KV caches and the Mamba recurrence state back so the post-round
+     state is bit-identical to having only fed ``[cur, d_1, ..., d_j]``.
 
-Every emitted token is the main model's own ``argmax`` (the draft is kept only when it *matches* that
-argmax; the bonus is the argmax outright), so the output is **bit-identical to plain greedy decode**
-(CLAUDE.md rule 4 / losslessness) regardless of MTP quality — the head changes only *speed*. ``stats``
-reports ``mean_accept`` (mean tokens emitted per main forward; 1 = no speedup, 2 = every draft
-accepted) and ``rounds``.
+Every emitted token is the main model's own ``argmax`` (each kept draft *matches* that argmax; the
+bonus is the argmax outright), so the output is **bit-identical to plain greedy decode** (CLAUDE.md
+rule 4 / losslessness) regardless of MTP quality — the head changes only *speed*. ``stats`` reports
+``mean_accept`` (mean tokens emitted per **round**; ``1`` = no chained draft kept on any round,
+``k+1`` = every chained draft kept; perfect-chain rounds run one main forward, partial-reject rounds
+run two — verify + a bounded re-run that advances the recurrent state) and ``rounds``.
+
+**Rollback (the hard part for hybrid Mamba).** The KV cache (attention layers) is per-position and
+slices losslessly. The Mamba recurrence state ``(ssm, conv)`` is a *summary* of every consumed token
+— it cannot be sliced. For ``k >= 2`` we **snapshot** the ``(ssm, conv)`` lists BEFORE each verify
+forward (cheap: ``list(...)`` is O(layers), MLX arrays are immutable so the captured references stay
+bit-exact); on partial acceptance (``j < k``) we restore the snapshot AND re-run the main model on
+just the accepted prefix ``[cur, d_1, ..., d_j]`` to advance state to the committed offset. The
+re-run also re-grows the (truncated-back) KV cache to the committed length, so the post-round state
+is bit-exact. ``j == k`` (perfect chain) avoids the re-run; ``j == 0`` (all rejected) re-runs only
+``[cur]``. For ``k == 1`` :func:`spec_generate_k` delegates to :func:`spec_generate` so the
+parity-tested single-step path is unchanged.
 
 Consumed contracts (siblings — not reimplemented here):
 
 * The resident Nemotron model — ``model(token_ids, *, caches, ssm, conv, offset, capture_layers)``
   returning ``logits`` or ``(logits, {layer: hidden})``; the hybrid threads per-layer KV caches
-  (attention) + ``(ssm, conv)`` (mamba) state, and ``model.cfg`` / ``model.num_layers``. The Nemotron
-  hybrid rolls back a rejected draft by **re-running** the accepted window from the verified offset
-  (the recurrent Mamba/KV state is reconstructed by the model — the spec loop drives ``offset`` only).
+  (attention) + ``(ssm, conv)`` (mamba) state, and ``model.cfg`` / ``model.num_layers``. The
+  per-attention-layer KV cache must be built with ``max_rollback >= k`` (see
+  :func:`quanta.nemotron.generate.attn_caches`) — a deeper truncate fails LOUD (rule 6).
 * :class:`quanta.nemotron.mtp.NemotronMTP` — the MTP draft head, called as
-  ``mtp(prev_hidden, token_emb, head) -> (logits, new_hidden)``.
+  ``mtp(prev_hidden, token_emb, head) -> (logits, new_hidden)``. The MTP's optional ``draft_topk``
+  attribute makes the routed moe sub-block lighter than the main model's (the speed lever).
 
-Gated model-free (stub main model + stub MTP) in ``parity/nemotron_mtp_spec_test.py``.
+Gated model-free (stub main model + stub MTP) in ``parity/nemotron_mtp_spec_test.py`` for ``k=1``,
+``k=2`` and ``k=3`` (perfect/wrong MTPs, eos stops, k=1 shim, cache rollback pattern).
 """
 
 from __future__ import annotations
@@ -188,3 +208,131 @@ def _rollback(model, caches, length: int) -> None:
                 f"per-layer cache {type(c).__name__} has no truncate(); cannot drop a rejected draft "
                 f"losslessly (rule 6 — wire a real-model rollback adapter before spec-decoding it)")
         c.truncate(length)
+
+
+def spec_generate_k(model, mtp, embed: mx.array, head: mx.array, prompt_ids,
+                    *, k: int, max_new: int, eos_id=None) -> tuple[list[int], dict]:
+    """Multi-step lossless native-MTP self-speculation: chain ``k`` draft tokens per round.
+
+    ``k == 1`` delegates to :func:`spec_generate` (the parity-tested single-step path) — bit-identical
+    to it on the same inputs. ``k >= 2`` chains the single MTP head against its OWN post-block hidden:
+    step 0 uses ``prev_hidden`` (the main model's last-layer hidden at the predicting position); step
+    ``i in [1, k)`` feeds the MTP's own ``new_hidden`` from step ``i-1``. The main model verifies all
+    ``k + 1`` tokens ``[cur, d_1, ..., d_k]`` in ONE forward; the accepted prefix is the longest
+    sequence of drafts that match the main model's greedy next-token at each position. Bonus is the
+    main model's greedy next-token at the first unverified position. Lossless by construction (the
+    main model is the arbiter), so the output is bit-identical to greedy decode regardless of MTP
+    quality. ``stats['mean_accept']`` is the mean tokens emitted **per round** (``1`` = no speedup
+    on every round; ``k + 1`` = every chained draft accepted on every round); the wall-clock speedup
+    on partial-reject rounds is HALF that ratio because the rollback path runs a second main forward
+    (the re-run advances the recurrent state) — so for the wall-clock speedup ceiling, compare against
+    a baseline of ``1`` token-per-forward, not ``mean_accept``.
+
+    Rollback (the hybrid-aware part for ``k >= 2``):
+    * ``j == k`` (all drafts accepted): no rollback; verify state already matches the committed offset.
+      One main forward per round, ``k + 1`` tokens emitted.
+    * ``j < k``: restore ``(ssm, conv)`` from the pre-verify snapshot, truncate the cache back to the
+      pre-verify offset, then RE-RUN the main model on ``[cur, d_1, ..., d_j]`` so the recurrent
+      state + KV are bit-exact at the committed offset. The re-run is bounded by ``j + 1 <= k`` tokens
+      — one main forward, no inner Python loop. TWO main forwards per such round (verify + re-run),
+      ``j + 1`` tokens emitted. ``eos_id`` (an ``int``, a collection, or ``None``) stops generation
+      at the first emitted stop id (inclusive), matching greedy's eos stop."""
+    if k < 1:
+        raise ValueError(f"spec_generate_k k={k} must be >= 1")
+    if k == 1:                                                  # parity-tested single-step path
+        return spec_generate(model, mtp, embed, head, prompt_ids,
+                             max_new=max_new, eos_id=eos_id)
+
+    last = model.cfg.num_hidden_layers - 1
+    prompt_ids = list(prompt_ids)
+    if not prompt_ids:
+        raise ValueError("spec_generate_k needs a non-empty prompt")
+    stop = _as_stop_set(eos_id)
+    caches, ssm, conv = _capture_state(model)
+
+    # --- prefill: verified token at position q = len(prompt)-1, plus its feature ---
+    logits, caps = _forward(model, mx.array(prompt_ids), caches=caches, ssm=ssm, conv=conv,
+                            offset=0, capture_layers=(last,))
+    mx.eval(logits) if caps is None else mx.eval(logits, caps[last])
+    q = len(prompt_ids) - 1
+    prev_hidden = caps[last][-1][None, None]            # [1,1,hidden] main hidden at position q
+    cur = int(mx.argmax(logits[0, -1]).item())          # verified token at q+1
+    out = [cur]
+    accept_lens: list[int] = []
+    stopped = cur in stop
+
+    while len(out) < max_new and not stopped:
+        # --- chain k drafts (step 0 uses main hidden; steps 1..k-1 feed MTP's own post-block hidden) ---
+        drafts: list[int] = []
+        h_mtp = prev_hidden                                          # rolling MTP feature
+        tok = cur
+        for _ in range(k):                                           # bounded chain (k <= max_rollback)
+            token_emb = embed[tok][None, None].astype(h_mtp.dtype)   # [1,1,hidden]
+            dlog, h_mtp = mtp(h_mtp, token_emb, head, return_hidden=True)
+            tok = int(mx.argmax(dlog[0, 0]).item())
+            drafts.append(tok)
+
+        # --- snapshot recurrent state pre-verify (Mamba can't be sliced; restore on partial reject) ---
+        ssm_pre = list(ssm) if ssm is not None else None
+        conv_pre = list(conv) if conv is not None else None
+        pre_offset = q + 1                                            # cache offset before verify
+
+        # --- verify all k+1 tokens in ONE main forward over [cur, d_1, ..., d_k] at offset q+1 ---
+        verify_in = [cur, *drafts]
+        vlog, vcaps = _forward(model, mx.array(verify_in), caches=caches, ssm=ssm, conv=conv,
+                               offset=pre_offset, capture_layers=(last,))
+        bpred = mx.argmax(vlog[0], axis=-1)                          # [k+1]
+        mx.eval(bpred) if vcaps is None else mx.eval(bpred, vcaps[last])
+        gpreds = [int(bpred[i].item()) for i in range(k + 1)]
+
+        # --- longest greedy-matching prefix: j drafts accepted, 0 <= j <= k ---
+        j = 0
+        for i in range(k):
+            if drafts[i] == gpreds[i]:
+                j += 1
+            else:
+                break
+        bonus = gpreds[j]
+
+        # --- commit: append accepted drafts (d_1..d_j) and the bonus (j+1 tokens this round) ---
+        for i in range(j):
+            out.append(drafts[i])
+        out.append(bonus)
+        accept_lens.append(j + 1)
+
+        # --- rollback: keep [cur, d_1..d_j] (target offset pre_offset + j + 1); re-run on j < k ---
+        if j < k:
+            # restore recurrent state; truncate cache to pre-verify offset; re-run accepted prefix
+            if ssm_pre is not None:
+                for i in range(len(ssm)):
+                    ssm[i] = ssm_pre[i]
+            if conv_pre is not None:
+                for i in range(len(conv)):
+                    conv[i] = conv_pre[i]
+            _rollback(model, caches, pre_offset)
+            replay = [cur, *drafts[:j]]                              # j + 1 tokens (1 <= len <= k)
+            rlog, rcaps = _forward(model, mx.array(replay), caches=caches, ssm=ssm, conv=conv,
+                                   offset=pre_offset, capture_layers=(last,))
+            mx.eval(rlog) if rcaps is None else mx.eval(rlog, rcaps[last])
+            prev_hidden = rcaps[last][-1][None, None]                # hidden at the LAST committed pos
+        else:                                                         # perfect chain — verify state OK
+            prev_hidden = vcaps[last][j][None, None]                  # hidden at the j-th = k-th input pos
+
+        q = q + j + 1                                                 # advance over j drafts + bonus
+        cur = bonus
+        if bonus in stop or any(drafts[i] in stop for i in range(j)):
+            stopped = True
+
+    out = out[:max_new]
+    if stop:                                                          # terminate at first eos (inclusive)
+        for i, t in enumerate(out):
+            if t in stop:
+                out = out[: i + 1]
+                break
+    return out, {
+        "rounds": len(accept_lens),
+        "tokens": len(out),
+        "mean_accept": (sum(accept_lens) / len(accept_lens)) if accept_lens else 0.0,
+        "max_accept": max(accept_lens) if accept_lens else 0,
+        "k": k,
+    }

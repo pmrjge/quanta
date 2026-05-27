@@ -1,4 +1,4 @@
-"""Lossless gate for Nemotron-H native-MTP spec-decode (#40): spec_generate reproduces greedy decode.
+"""Lossless gate for Nemotron-H native-MTP spec-decode (#40 / k=1, #148 / multi-step k>=2).
 
 MODEL-FREE — builds a STUB main model + a STUB MTP head over a tiny vocab (like the DSV4 / GLM / EAGLE
 fake-runtime spec tests), with a stub decode cache supporting ``truncate`` / ``offset``. No checkpoint,
@@ -7,11 +7,11 @@ makes losslessness hold for ANY MTP quality (the head only changes *speed*), thi
 draft → verify → accept-or-bonus → rollback LOGIC, not the real weights.
 
 The stub main model is a deterministic next-token chain ``g(t) = t + STEP`` with a clear argmax on that
-token, so greedy decode is well-defined; over a verify window ``[cur, draft]`` it returns ``g(cur)``
-then ``g(draft)`` per position (exactly what the rollback logic consumes), and a per-position hidden
-capture so the feature plumbing is exercised. The stub embedding table is one-hot, so the stub MTP can
-recover ``cur`` from the ``token_emb`` vector it is handed (the real MTP signature passes the embedding
-*vector*, not the id). Asserts:
+token, so greedy decode is well-defined; over a verify window ``[cur, d_1, ..., d_k]`` it returns
+``g(cur), g(d_1), ..., g(d_k)`` per position (exactly what the chained-accept + rollback logic
+consumes), and a per-position hidden capture so the feature plumbing is exercised. The stub embedding
+table is one-hot, so the stub MTP can recover the next-token id from the ``token_emb`` vector it is
+handed (the real MTP signature passes the embedding *vector*, not the id). Asserts:
   (1) ``spec_generate`` output is BIT-IDENTICAL to a plain greedy reference decode on the same stub
       main model (losslessness — the core invariant), for a perfect MTP AND a wrong MTP;
   (2) a correct-drafting MTP makes accept length maximal (every draft accepted ⇒ ``mean_accept`` → 2)
@@ -21,19 +21,18 @@ recover ``cur`` from the ``token_emb`` vector it is handed (the real MTP signatu
       accepted positions, never the rejected draft) and still matches greedy;
   (4) eos stops generation (inclusive), matching greedy's eos stop, for both perfect and wrong MTP and
       for eos given as an int and as a set.
+  (5) ``spec_generate_k(k=1)`` is bit-identical to ``spec_generate`` (the shim contract).
+  (6) ``spec_generate_k(k=2/k=3)`` is bit-identical to greedy for perfect AND wrong MTP, with
+      ``mean_accept`` → ``k+1`` on perfect (every chained draft accepted) and ≈ 1 on wrong (verify
+      arbitrates losslessly regardless), and eos stops match greedy's stop.
 
     uv run --with numpy python -m parity.nemotron_mtp_spec_test
 
     # deferred (needs the resident Nemotron model — do NOT run while another large job is resident):
-    #   real MTP accept-rate / decode-speedup benchmark for #40 against NemotronResidentModel + the
-    #   baked MTP head (NemotronMTP filled from the mtp.layers.0/1 tensors), asserting spec == greedy
-    #   on real prose and reporting mean_accept, e.g.:
-    #     model = NemotronResidentModel("~/models/NVIDIA-Nemotron-3-Super-120B-A12B-quanta_int4g64")
-    #     mtp   = load_nemotron_mtp(model.art, model.cfg)   # fills NemotronMTP from mtp.* tensors
-    #     embed, head = model.embed_w, model.lm_head_w
-    #     toks, st = spec_generate(model, mtp, embed, head, prompt_ids, max_new=256,
-    #                              eos_id=model.cfg.eos_token_id)
-    #     assert toks == greedy(model, prompt_ids, 256)     # losslessness on real weights
+    #   real MTP accept-rate / decode-speedup benchmark for #40 / #148 against NemotronResidentModel
+    #   + the baked MTP head (NemotronMTP filled from the mtp.layers.0/1 tensors), asserting
+    #   spec == greedy on real prose and reporting mean_accept for k in {1, 2, 3} (see
+    #   ``parity/nemotron_mtp_k_bench.py``).
 """
 
 from __future__ import annotations
@@ -42,7 +41,7 @@ from types import SimpleNamespace
 
 import mlx.core as mx
 
-from quanta.nemotron.spec import spec_generate
+from quanta.nemotron.spec import spec_generate, spec_generate_k
 
 VOCAB = 64
 DIM = VOCAB      # one-hot embedding: embed[t] has argmax t, so the stub MTP recovers the id
@@ -127,23 +126,34 @@ class _StubMainModel:
 
 class _PerfectMTP:
     """A drafter that always predicts the main model's greedy token from the handed ``token_emb`` (the
-    one-hot embedding of ``cur``) → every draft is accepted → mean_accept rises to 2. Mirrors the real
-    surface ``mtp(prev_hidden, token_emb, head) -> (logits, new_hidden)``; ignores ``prev_hidden``
-    content (only the *next* token determines the draft here). Returns a dummy ``new_hidden``."""
+    one-hot embedding of the just-seen token) → every draft is accepted → mean_accept rises to 2 at
+    k=1, ``k+1`` at multi-step ``k>=2`` (each chained step keeps proposing the greedy continuation).
+    Mirrors the real surface ``mtp(prev_hidden, token_emb, head, *, return_hidden=False) -> (logits,
+    new_hidden)``; ignores ``prev_hidden`` content (only the just-seen token determines the draft
+    here). Returns a dummy ``new_hidden`` of correct ``[1, 1, hidden]`` shape so the multi-step
+    chained-MTP path has something to feed back as ``prev_hidden`` on step ``i>=1``."""
 
-    def __call__(self, prev_hidden, token_emb, head):
+    def __call__(self, prev_hidden, token_emb, head, *, return_hidden=False):
         cur = int(mx.argmax(token_emb[0, 0]).item())          # recover the id from the one-hot embedding
-        return _row(_greedy_next(cur))[None, None], prev_hidden  # [1,1,vocab], dummy new_hidden
+        # dummy new_hidden of correct [1,1,HIDDEN] shape (the chained-draft loop feeds it back as
+        # prev_hidden — content is ignored by the stub, only shape matters)
+        new_hidden = mx.zeros((1, 1, HIDDEN), dtype=mx.float32)
+        _ = return_hidden                                     # signature surface only (mirrors real MTP)
+        return _row(_greedy_next(cur))[None, None], new_hidden
 
 
 class _WrongMTP:
     """A drafter that always proposes a token the main model would NOT pick → every draft is rejected
-    → mean_accept ≈ 1, yet the output is still bit-identical to greedy (the verify guarantees it)."""
+    → mean_accept ≈ 1, yet the output is still bit-identical to greedy (the verify guarantees it).
+    At multi-step ``k>=2`` every chained draft is still wrong (the chain's previous wrong token only
+    makes the next chained draft more off-distribution), so mean_accept stays ≈ 1."""
 
-    def __call__(self, prev_hidden, token_emb, head):
+    def __call__(self, prev_hidden, token_emb, head, *, return_hidden=False):
         cur = int(mx.argmax(token_emb[0, 0]).item())
         wrong = (_greedy_next(cur) + 1) % VOCAB               # != greedy(cur)
-        return _row(wrong)[None, None], prev_hidden
+        new_hidden = mx.zeros((1, 1, HIDDEN), dtype=mx.float32)
+        _ = return_hidden
+        return _row(wrong)[None, None], new_hidden
 
 
 def _greedy_reference(model: _StubMainModel, prompt, max_new: int, eos_id=None) -> list[int]:
@@ -245,6 +255,88 @@ def run() -> None:
     good = spec_es == greedy_e
     ok = ok and good
     print(f"  [{'OK' if good else 'FAIL'}] eos (set) stops: spec==greedy={good}")
+
+    # --- multi-step k>=2 (spec_generate_k) ---------------------------------------------------------
+    # (5) k=1 shim: spec_generate_k(k=1) must be BIT-IDENTICAL to spec_generate (delegate contract)
+    spec_k1_p, st_k1_p = spec_generate_k(_StubMainModel(), _PerfectMTP(), EMBED, HEAD, prompt,
+                                          k=1, max_new=MAXN, eos_id=None)
+    spec_k1_w, st_k1_w = spec_generate_k(_StubMainModel(), _WrongMTP(), EMBED, HEAD, prompt,
+                                          k=1, max_new=MAXN, eos_id=None)
+    good = spec_k1_p == spec_p and spec_k1_w == spec_w and st_k1_p["k"] == 1 and st_k1_w["k"] == 1
+    ok = ok and good
+    print(f"  [{'OK' if good else 'FAIL'}] k=1 shim: spec_generate_k(k=1)==spec_generate "
+          f"perfect={spec_k1_p == spec_p} wrong={spec_k1_w == spec_w}")
+
+    for K in (2, 3):
+        # (6a) perfect MTP at k=K: bit-identical to greedy AND mean_accept rises to K+1
+        mp_k = _StubMainModel()
+        spec_kp, st_kp = spec_generate_k(mp_k, _PerfectMTP(), EMBED, HEAD, prompt,
+                                          k=K, max_new=MAXN, eos_id=None)
+        # perfect chain keeps producing the greedy continuation → every chained draft accepted; the
+        # exact mean depends on how the final partial round lands (MAXN may interrupt a full-K chain),
+        # but the all-accepted ceiling is K+1 and we should be at or near it.
+        full_chain = all(a == K + 1 for a in st_kp.get("_accept_lens", []) or [])
+        accept_ok = st_kp["mean_accept"] >= K + 1 - 1e-9                       # exact K+1 on full rounds
+        good = (spec_kp == greedy and accept_ok
+                and st_kp["max_accept"] == K + 1 and st_kp["k"] == K)
+        ok = ok and good
+        print(f"  [{'OK' if good else 'FAIL'}] perfect MTP k={K}: spec==greedy={spec_kp == greedy} "
+              f"mean_accept={st_kp['mean_accept']:.2f} (≈{K + 1}) max={st_kp['max_accept']} "
+              f"rounds={st_kp['rounds']} fullchain={full_chain}")
+        # a perfect drafter at k=K must verify FAR less often than greedy emits — speed lever check
+        n_main_k = len(mp_k.calls)
+        good = n_main_k < len(spec_kp)
+        ok = ok and good
+        print(f"  [{'OK' if good else 'FAIL'}] perfect MTP k={K} fewer main forwards than tokens: "
+              f"forwards={n_main_k} tokens={len(spec_kp)}")
+
+        # (6b) wrong MTP at k=K: still bit-identical to greedy (verify arbitrates losslessly), and
+        #     mean_accept ≈ 1 (only bonuses are emitted; every chained draft is rejected).
+        mw_k = _StubMainModel()
+        spec_kw, st_kw = spec_generate_k(mw_k, _WrongMTP(), EMBED, HEAD, prompt,
+                                          k=K, max_new=MAXN, eos_id=None)
+        good = spec_kw == greedy and abs(st_kw["mean_accept"] - 1.0) < 1e-9 and st_kw["k"] == K
+        ok = ok and good
+        print(f"  [{'OK' if good else 'FAIL'}] wrong MTP k={K}: spec==greedy={spec_kw == greedy} "
+              f"mean_accept={st_kw['mean_accept']:.2f} (≈1)")
+
+        # rollback budget: each rejected-chain round truncates ONCE (back to pre-verify offset), and
+        # the cache's in-flight peak is K tokens beyond expect_off (the full chained-draft window).
+        expect_off_k = len(prompt) + len(spec_kw) - 1
+        rb_trunc = len(mw_k.cache.truncations) == st_kw["rounds"]
+        rb_final = mw_k.cache.offset == expect_off_k
+        rb_peak = mw_k.cache.max_len == expect_off_k + K
+        good = rb_trunc and rb_final and rb_peak
+        ok = ok and good
+        print(f"  [{'OK' if good else 'FAIL'}] wrong MTP k={K} rollback: truncations="
+              f"{len(mw_k.cache.truncations)} (rounds={st_kw['rounds']}) final={mw_k.cache.offset} "
+              f"(expect {expect_off_k}) peak={mw_k.cache.max_len} (expect {expect_off_k + K})")
+
+        # the perfect MTP at k=K accepts every draft → NEVER truncates (no rollback path entered).
+        good = len(mp_k.cache.truncations) == 0
+        ok = ok and good
+        print(f"  [{'OK' if good else 'FAIL'}] perfect MTP k={K} never rolls back: truncations="
+              f"{len(mp_k.cache.truncations)}")
+
+        # (6c) eos stops generation at k=K — perfect AND wrong must match greedy's eos stop
+        spec_kpe, _ = spec_generate_k(_StubMainModel(), _PerfectMTP(), EMBED, HEAD, prompt,
+                                       k=K, max_new=MAXN, eos_id=EOS)
+        spec_kwe, _ = spec_generate_k(_StubMainModel(), _WrongMTP(), EMBED, HEAD, prompt,
+                                       k=K, max_new=MAXN, eos_id=EOS)
+        good = spec_kpe == greedy_e and spec_kwe == greedy_e
+        ok = ok and good
+        print(f"  [{'OK' if good else 'FAIL'}] eos k={K} stops: perfect={spec_kpe == greedy_e} "
+              f"wrong={spec_kwe == greedy_e}")
+
+    # k validation: spec_generate_k(k=0) must raise (rule 6 — no silent k<1 fallthrough)
+    raised = False
+    try:
+        spec_generate_k(_StubMainModel(), _PerfectMTP(), EMBED, HEAD, prompt,
+                        k=0, max_new=MAXN, eos_id=None)
+    except ValueError:
+        raised = True
+    ok = ok and raised
+    print(f"  [{'OK' if raised else 'FAIL'}] spec_generate_k(k=0) raises ValueError: {raised}")
 
     print("PASS" if ok else "FAIL")
     if not ok:

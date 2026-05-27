@@ -47,9 +47,24 @@ class NemotronLatentMoE(nn.Module):
     def set_experts(self, up: mx.array, down: mx.array) -> None:
         self.up_stack, self.down_stack = up, down
 
-    def _route(self, xf: mx.array) -> tuple[mx.array, mx.array]:
+    def _resolve_topk(self, topk_override: int | None) -> int:
+        """Resolve the routing top-k for this call: ``topk_override`` if given (validated against
+        cfg.num_experts_per_tok), else cfg.num_experts_per_tok. Used by the MTP draft head to route
+        through FEWER experts than the main model (lighter drafter) while the main verify path stays
+        at cfg.num_experts_per_tok. Fails LOUD on out-of-bounds (rule 6)."""
+        if topk_override is None:
+            return self.cfg.num_experts_per_tok
+        if not isinstance(topk_override, int):
+            raise TypeError(f"topk_override must be int, got {type(topk_override).__name__}")
+        if not 1 <= topk_override <= self.cfg.num_experts_per_tok:
+            raise ValueError(
+                f"topk_override={topk_override} out of bounds [1, "
+                f"{self.cfg.num_experts_per_tok}] (cfg.num_experts_per_tok)")
+        return topk_override
+
+    def _route(self, xf: mx.array, topk_override: int | None = None) -> tuple[mx.array, mx.array]:
         assert self.cfg.n_group == 1 and self.cfg.topk_group == 1, "group routing unsupported"
-        topk = self.cfg.num_experts_per_tok
+        topk = self._resolve_topk(topk_override)
         logits = xf.astype(mx.float32) @ self.gate_weight.astype(mx.float32).T
         scores = mx.sigmoid(logits)
         choice = scores + self.e_score_correction_bias.astype(mx.float32)[None]
@@ -60,9 +75,11 @@ class NemotronLatentMoE(nn.Module):
         return idx, w * self.cfg.routed_scaling_factor
 
     def _routed_chunk(self, lat_c: mx.array, idx_c: mx.array, w_c: mx.array) -> mx.array:
-        """Top-k routed expert output for a latent chunk ``[nc, latent]`` → ``[nc, latent]``."""
-        nc = lat_c.shape[0]
-        topk, lat = self.cfg.num_experts_per_tok, self.cfg.moe_latent_size
+        """Top-k routed expert output for a latent chunk ``[nc, latent]`` → ``[nc, latent]``.
+        ``topk`` is inferred from ``idx_c`` (== ``idx_c.shape[1]``) so this is correct for both the
+        main-model topk and any MTP ``topk_override``."""
+        nc, topk = idx_c.shape
+        lat = self.cfg.moe_latent_size
         col = lat_c[:, :, None]  # [nc, latent, 1]
         mc = nc * topk
         exp = idx_c.reshape(-1)
@@ -73,11 +90,14 @@ class NemotronLatentMoE(nn.Module):
         d = d[:, :, 0].reshape(nc, topk, lat)
         return mx.sum(d.astype(mx.float32) * w_c[:, :, None], axis=1).astype(lat_c.dtype)
 
-    def __call__(self, x: mx.array) -> mx.array:
+    def __call__(self, x: mx.array, *, topk_override: int | None = None) -> mx.array:
+        """Forward MoE. ``topk_override``: if set, route through that many experts (must be
+        ``1 <= k <= cfg.num_experts_per_tok``); used by the MTP draft head for a lighter drafter
+        while the main-model verify stays at cfg.num_experts_per_tok."""
         b, t, hd = x.shape
         n = b * t
         xf = x.reshape(n, hd)
-        idx, w = self._route(xf)
+        idx, w = self._route(xf, topk_override=topk_override)
         lat = self.fc1_latent_proj(xf)
         chunk = self.token_chunk if self.token_chunk and self.token_chunk > 0 else n
         multi = n > chunk
@@ -123,9 +143,22 @@ class NemotronQuantizedMoE(nn.Module):
         """``up``/``down``: dicts ``{packed, scale, bias}`` of stacked ``[E,*]`` quantized experts."""
         self._up, self._down = up, down
 
-    def _route(self, xf: mx.array) -> tuple[mx.array, mx.array]:
+    def _resolve_topk(self, topk_override: int | None) -> int:
+        """Resolve the routing top-k for this call (validated, fail-loud — mirrors
+        :class:`NemotronLatentMoE`)."""
+        if topk_override is None:
+            return self.cfg.num_experts_per_tok
+        if not isinstance(topk_override, int):
+            raise TypeError(f"topk_override must be int, got {type(topk_override).__name__}")
+        if not 1 <= topk_override <= self.cfg.num_experts_per_tok:
+            raise ValueError(
+                f"topk_override={topk_override} out of bounds [1, "
+                f"{self.cfg.num_experts_per_tok}] (cfg.num_experts_per_tok)")
+        return topk_override
+
+    def _route(self, xf: mx.array, topk_override: int | None = None) -> tuple[mx.array, mx.array]:
         assert self.cfg.n_group == 1 and self.cfg.topk_group == 1, "group routing unsupported"
-        topk = self.cfg.num_experts_per_tok
+        topk = self._resolve_topk(topk_override)
         logits = xf.astype(mx.float32) @ self.gate_weight.astype(mx.float32).T
         scores = mx.sigmoid(logits)
         choice = scores + self.e_score_correction_bias.astype(mx.float32)[None]
@@ -142,8 +175,10 @@ class NemotronQuantizedMoE(nn.Module):
                              group_size=self.group_size, bits=self.bits)[:, 0, :]
 
     def _routed_chunk(self, lat_c: mx.array, idx_c: mx.array, w_c: mx.array) -> mx.array:
-        nc = lat_c.shape[0]
-        topk, lat = self.cfg.num_experts_per_tok, self.cfg.moe_latent_size
+        """``topk`` inferred from ``idx_c`` (== ``idx_c.shape[1]``) so the chunk works for both the
+        main-model topk and any MTP ``topk_override``."""
+        nc, topk = idx_c.shape
+        lat = self.cfg.moe_latent_size
         mc = nc * topk
         exp = idx_c.reshape(-1)
         tok = mx.repeat(mx.arange(nc, dtype=mx.int32), topk)
@@ -152,11 +187,13 @@ class NemotronQuantizedMoE(nn.Module):
         d = d.reshape(nc, topk, lat)
         return mx.sum(d.astype(mx.float32) * w_c[:, :, None], axis=1).astype(lat_c.dtype)
 
-    def __call__(self, x: mx.array) -> mx.array:
+    def __call__(self, x: mx.array, *, topk_override: int | None = None) -> mx.array:
+        """Quantized MoE forward. ``topk_override``: if set, route through that many experts (must be
+        ``1 <= k <= cfg.num_experts_per_tok``); used by the MTP draft head for a lighter drafter."""
         b, t, hd = x.shape
         n = b * t
         xf = x.reshape(n, hd)
-        idx, w = self._route(xf)
+        idx, w = self._route(xf, topk_override=topk_override)
         lat = self.fc1_latent_proj(xf)
         chunk = self.token_chunk if self.token_chunk and self.token_chunk > 0 else n
         multi = n > chunk

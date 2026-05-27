@@ -69,14 +69,17 @@ class NemotronBlock(nn.Module):
         self.norm = nn.RMSNorm(cfg.hidden_size, eps=cfg.norm_eps)
         self.mixer = _MIXER[kind](cfg)
 
-    def __call__(self, x, *, cache=None, ssm_state=None, conv_state=None, use_fast=True):
+    def __call__(self, x, *, cache=None, ssm_state=None, conv_state=None, use_fast=True,
+                 topk_override: int | None = None):
+        """``topk_override`` (moe layers only): if set, route through that many experts instead of
+        cfg.num_experts_per_tok — used by the MTP draft head's moe sub-block for a lighter drafter."""
         h = self.norm(x)
         if self.kind == "mamba":
             y, ssm_state, conv_state = self.mixer(h, state=ssm_state, conv_state=conv_state)
         elif self.kind == "attention":
             y = self.mixer(h, cache=cache, use_fast=use_fast)
         else:  # moe (stateless)
-            y = self.mixer(h)
+            y = self.mixer(h, topk_override=topk_override) if topk_override is not None else self.mixer(h)
         return x + y, ssm_state, conv_state
 
 
@@ -90,17 +93,22 @@ class NemotronModel(nn.Module):
         self.norm_f = nn.RMSNorm(cfg.hidden_size, eps=cfg.norm_eps)
         self.lm_head = nn.Linear(cfg.hidden_size, cfg.vocab_size, bias=False)
 
-    def __call__(self, token_ids, *, caches=None, ssm=None, conv=None, use_fast=True):
+    def __call__(self, token_ids, *, caches=None, ssm=None, conv=None, use_fast=True,
+                 topk_override: int | None = None):
         """Logits for ``token_ids`` ``[t]`` → ``[1, t, vocab]``, plus the updated mamba state
         lists ``(ssm, conv)``. ``caches`` (per-attention-layer KV caches) grow in place. With all
         of ``caches``/``ssm``/``conv`` ``None`` this is a fresh prefill; pass the prior state to
         continue (one token at a time for decode). Mamba ``conv_state=None`` ⇒ chunked prefill;
-        a real (zero-initialised) ``conv_state`` ⇒ the O(1) step recurrence."""
+        a real (zero-initialised) ``conv_state`` ⇒ the O(1) step recurrence.
+
+        ``topk_override`` (moe layers only): route through that many experts instead of
+        cfg.num_experts_per_tok — used by the MTP draft head's sub-blocks for a lighter drafter."""
         h = self.embed_tokens(token_ids)[None]  # [1, t, hidden]
         n = len(self.layers)
         caches = caches if caches is not None else [None] * n
         ssm = ssm if ssm is not None else [None] * n
         conv = conv if conv is not None else [None] * n
         for i, blk in enumerate(self.layers):
-            h, ssm[i], conv[i] = blk(h, cache=caches[i], ssm_state=ssm[i], conv_state=conv[i], use_fast=use_fast)
+            h, ssm[i], conv[i] = blk(h, cache=caches[i], ssm_state=ssm[i], conv_state=conv[i],
+                                     use_fast=use_fast, topk_override=topk_override)
         return self.lm_head(self.norm_f(h)), ssm, conv

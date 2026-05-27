@@ -21,18 +21,20 @@ from quanta.nemotron.attention import KVCache
 from quanta.nemotron.model import NemotronModel
 
 
-def attn_caches(model: NemotronModel) -> list:
-    """One KV cache per attention layer (``None`` on mamba/moe layers)."""
-    return [KVCache() if k == "attention" else None for k in model.cfg.layers_block_type]
+def attn_caches(model: NemotronModel, *, max_rollback: int = 1) -> list:
+    """One KV cache per attention layer (``None`` on mamba/moe layers). ``max_rollback`` is the
+    deepest rollback each KV cache will accept (k=1 native MTP → 1; multi-step k>=2 needs k)."""
+    return [KVCache(max_rollback=max_rollback) if k == "attention" else None
+            for k in model.cfg.layers_block_type]
 
 
-def decode_state(model: NemotronModel) -> tuple[list, list, list]:
+def decode_state(model: NemotronModel, *, max_rollback: int = 1) -> tuple[list, list, list]:
     """From-scratch per-layer stepping state: KV cache on attention, **zero** conv-state on mamba
     (so the O(1) step path engages from token 0), ``None`` ssm-state (the step inits it to zero)."""
     cfg = model.cfg
     conv0 = mx.zeros((1, cfg.conv_kernel - 1, cfg.mamba_conv_dim))
     kinds = cfg.layers_block_type
-    caches = attn_caches(model)
+    caches = attn_caches(model, max_rollback=max_rollback)
     ssm = [None] * len(kinds)
     conv = [conv0 if k == "mamba" else None for k in kinds]
     return caches, ssm, conv
