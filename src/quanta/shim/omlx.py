@@ -252,9 +252,14 @@ def _default_runtime_loader(root: Path) -> tuple[RuntimeLike, TokenizerLike]:
         from quanta.qwen35.tokenizer import Qwen35Tokenizer
 
         return Qwen35ResidentModel(root), _RenderChatAdapter(Qwen35Tokenizer.from_pretrained(str(root)))
+    if mt == "qwen2" or mt.startswith("qwen2."):  # Qwen2.5-1M (dense GQA + QKV biases + DCA)
+        from quanta.qwen25.runtime import Qwen25ResidentModel
+        from quanta.qwen25.tokenizer import Qwen25Tokenizer
+
+        return Qwen25ResidentModel(root), _RenderChatAdapter(Qwen25Tokenizer.from_pretrained(str(root)))
     raise OmlxShimError(
         f"no resident runtime for quanta artifact model_type={mt!r} "
-        "(supported: kimi, deepseek_v3, deepseek_v4, nemotron, glm, minimax, qwen3_5)"
+        "(supported: kimi, deepseek_v3, deepseek_v4, nemotron, glm, minimax, qwen2, qwen3_5)"
     )
 
 
@@ -1156,6 +1161,8 @@ class QuantaOmlxEngine(_OmlxBaseEngine):
             return _SingleTokenStepper(self._runtime,
                                        MiniMaxCache(self._runtime.num_layers, quantized=True))
         if mt.startswith("qwen3_5") or mt.startswith("qwen3.5"):  # hybrid cache needs cfg → use factory
+            return _SingleTokenStepper(self._runtime, self._runtime.make_caches())
+        if mt == "qwen2" or mt.startswith("qwen2."):  # dense Qwen2.5-1M (DCA + intra-rotated K cache)
             return _SingleTokenStepper(self._runtime, self._runtime.make_caches())
         if not mt and self._injected_runtime:
             # standalone / injected runtime with no artifact model_type (tests, embedding the engine

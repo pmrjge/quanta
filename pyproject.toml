@@ -36,6 +36,13 @@ quanta-omlx = "quanta.omlx_patch:main"
 requires = ["uv_build>=0.11.13,<0.12.0"]
 build-backend = "uv_build"
 
+# Ship the oMLX-autopatch ``.pth`` + helper module to ``site-packages/`` root, so any Python
+# process with quanta installed arms the import-hook before oMLX modules load — ``omlx serve``
+# then routes quanta artifacts to ``QuantaOmlxEngine`` without needing the ``quanta-omlx`` wrapper.
+# Files in ``pth_data/`` land at the purelib (site-packages) root via PEP 491 data tagging.
+[tool.uv.build-backend]
+data = { purelib = "pth_data" }
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 

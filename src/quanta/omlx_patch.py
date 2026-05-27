@@ -6,7 +6,18 @@ engine_type to a factory, and (2) lazily monkeypatch two oMLX modules once they 
 ``omlx.model_discovery`` (tag quanta artifacts with ``engine_type='quanta'``) and
 ``omlx.engine_pool`` (route registered engine_types to their factory, owning the runtime).
 Importing this module does not import oMLX; the patch applies via an import hook when oMLX
-loads. ``main`` is the ``quanta-omlx`` console script: arm the patch, then hand off to oMLX's CLI.
+loads.
+
+Two entry points arm the patch:
+
+  * The ``quanta-omlx`` console script (:func:`main`) — explicit handoff to ``omlx.cli.main()``
+    after :func:`install`.
+  * A ``zz_quanta_omlx_autopatch.pth`` shipped to ``site-packages/`` by the wheel (see
+    ``pyproject.toml`` ``[tool.uv.build-backend].data.purelib = "pth_data"``). At every Python
+    startup, ``site.py`` processes .pth files in alphabetical order — the ``zz_`` prefix ensures
+    we run AFTER any editable-install ``quanta.pth`` that adds the source dir to ``sys.path``
+    (otherwise the autopatch helper module would fail to import ``quanta``). With this, plain
+    ``omlx serve`` Just Works — no need for the wrapper script.
 """
 
 from __future__ import annotations
