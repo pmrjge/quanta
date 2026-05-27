@@ -20,6 +20,22 @@ renders special-token markers (``</think>``, ``<|tool_calls_section_begin|>`` �
 strings, but does **not** parse the model output itself. Reasoning and tool-call extraction are
 oMLX's responsibility — its server splits ``<think>…</think>`` with its own thinking parser and reads
 tool calls via its own parsers — so we conform to oMLX's contract rather than pre-parsing here.
+
+Beyond the single-stream stepper loop, the engine also exposes two **multi-stream** entry points
+that mirror the same kwargs surface:
+
+* :meth:`QuantaOmlxEngine.batched_stream_generate` / :meth:`QuantaOmlxEngine.batched_generate` drive
+  ``B`` requests through a model-specific batched runtime (``quanta.dsv4.batched_runtime`` /
+  ``quanta.nemotron.batched_runtime`` — lazy-imported so the shim still loads when the sibling
+  modules are not yet merged). Per-stream sampling / eos / max_new are honored independently; freed
+  slots admit the next pending prompt (continuous batching), and the per-stream finished/finish-reason
+  state matches what the single-stream loop yields.
+* A ``spec_k`` kwarg on ``generate`` / ``stream_generate`` switches the single-stream loop to native
+  multi-step MTP self-speculation through ``quanta.{dsv4,nemotron}.spec.spec_generate_k`` (lazy
+  imports — DSV4's lives on main, Nemotron's is in flight). Because every emitted token is the main
+  model's own greedy/sampled token (the draft is kept only when it matches the main model's pick, and
+  the bonus is the main model's pick outright), the output is **bit-identical** to the ``spec_k == 1``
+  path regardless of MTP quality — spec changes only *speed*, never correctness.
 """
 
 from __future__ import annotations
@@ -455,12 +471,189 @@ class _SingleTokenStepper:
         return row
 
 
+# --- Reasoning-parser contract (LOCAL STUB) ---------------------------------------------------------
+# stub — replaced when #150 (Qwen oMLX shim agent) lands the formal `ReasoningParser` Protocol in
+# `quanta.shim.tool_parsers` (or `quanta.shim.parsers_contract`). We define this stub so DSV4 /
+# Nemotron code can structurally conform NOW; once the real Protocol is importable, the stub becomes
+# a no-op (the runtime check still passes — both are duck-typed Protocols over the same surface).
+#
+# AUDIT (this commit): DSV4 has no custom reasoning parser in `quanta.shim.tool_parsers` (the engine
+# emits raw ``<think>…</think>`` text and oMLX's stock ``thinking.extract_thinking`` handles it — see
+# the per-model contract docstring at the top of this file). Nemotron likewise has no custom parser
+# ("Kimi tool-patch, Nemotron none" — project memory). So the conformance surface below has nothing
+# to register today; it's plumbed only so a future parser added by either model would conform without
+# touching this file.
+try:  # prefer the formal Protocol when the Qwen agent (#150) has landed it
+    from quanta.shim.tool_parsers import ReasoningParser as _ReasoningParser  # type: ignore[attr-defined]
+except ImportError:  # stub Protocol — same surface as the eventual real one
+    class _ReasoningParser(Protocol):
+        """Minimal reasoning-parser contract used until #150 lands the formal Protocol.
+
+        A reasoning parser, given the model's raw output, returns ``(reasoning, content)`` — the
+        ``<think>…</think>`` body and the remainder. Mirrors :func:`omlx.api.thinking.extract_thinking`
+        so a quanta parser can be a drop-in replacement for the stock one when the model's markup is
+        non-standard (DSV4 / Nemotron currently use the stock markup, so neither registers here)."""
+
+        def extract(self, text: str) -> tuple[str, str]: ...
+
+
+def _conformant_reasoning_parsers() -> tuple[_ReasoningParser, ...]:
+    """Return the tuple of reasoning parsers the engine knows about for DSV4 / Nemotron — currently
+    empty (both use oMLX's stock parser). When #150 lands, the formal Protocol replaces ``_ReasoningParser``
+    and any model-specific parser registered in :mod:`quanta.shim.tool_parsers` would be added here.
+    The contract conformance check (the ``hasattr`` below) stays exact under both Protocols."""
+    parsers: tuple[_ReasoningParser, ...] = ()
+    for p in parsers:  # pragma: no cover - empty today; enforces shape when populated
+        if not hasattr(p, "extract"):
+            raise OmlxShimError(
+                f"reasoning parser {type(p).__name__} does not conform to ReasoningParser (no .extract)")
+    return parsers
+
+
+# --- Batched-decode sessions ------------------------------------------------------------------------
+class _BatchedSession(Protocol):
+    """Per-engine batched decode session, fronts a model-specific batched runtime.
+
+    The session is a thin adapter over ``quanta.{dsv4,nemotron}.batched_runtime`` (lazy-imported, so
+    the shim still loads when the sibling modules are not merged). It owns ``capacity`` slots, each
+    holding one in-flight request's decode state; the engine drives admission / step / release while
+    sampling / eos / detok stay per-stream in :meth:`QuantaOmlxEngine.batched_stream_generate`.
+
+    ``capacity`` is the static batch size the underlying runtime was built for; the engine never
+    admits more concurrent streams than that. ``num_layers`` is forwarded for parity with the
+    single-stream stepper's surface.
+    """
+
+    capacity: int
+    num_layers: int
+
+    def admit(self, slot: int, prompt_ids: list[int]) -> mx.array: ...
+    def step_batch(self, slot_to_token: dict[int, int]) -> dict[int, mx.array]: ...
+    def release(self, slot: int) -> None: ...
+
+
+class _DSV4BatchedSession:
+    """Batched decode session for DeepSeek-V4-Flash — wraps :class:`quanta.dsv4.batched_runtime.DSV4BatchedResidentModel`.
+
+    The wrapped runtime owns ``capacity`` decode caches (one per slot) and a single fused forward
+    that steps a vector of ``(slot, token)`` pairs through every layer. The session is a thin shim:
+    ``admit`` seeds a slot's cache by stepping the prompt one token at a time (bounded memory — never
+    materializes ``[1,T,vocab]`` for a long prompt, matching the single-stream :class:`_DSV4Stepper`);
+    ``step_batch`` calls the batched runtime once per decode tick with the alive slots' tokens;
+    ``release`` frees a slot so the next pending prompt can be admitted (continuous batching).
+
+    Lazy-imports ``quanta.dsv4.batched_runtime`` so the shim still loads when the sibling agent's
+    branch hasn't merged yet — calling ``_DSV4BatchedSession(...)`` is the failure point if the module
+    is missing (loud, per rule 6), not module import."""
+
+    def __init__(self, root: str | Path | None = None, *, capacity: int,
+                 runtime: Any | None = None) -> None:
+        if runtime is None:
+            from quanta.dsv4 import batched_runtime as _dbr  # lazy: sibling agent #145
+
+            if root is None:
+                raise OmlxShimError("DSV4BatchedSession: artifact root required when runtime is unset")
+            self._rt = _dbr.DSV4BatchedResidentModel(root, batch_size=capacity)
+        else:
+            self._rt = runtime
+        self.capacity = capacity
+        self.num_layers = getattr(self._rt, "num_layers", 0)
+
+    def admit(self, slot: int, prompt_ids: list[int]) -> mx.array:
+        if not prompt_ids:
+            raise OmlxShimError("DSV4 batched admit got an empty prompt")
+        if not 0 <= slot < self.capacity:
+            raise OmlxShimError(f"DSV4 batched admit slot {slot} out of range [0, {self.capacity})")
+        row = self._rt.prefill_slot(slot, prompt_ids)
+        mx.eval(row)
+        return row
+
+    def step_batch(self, slot_to_token: dict[int, int]) -> dict[int, mx.array]:
+        if not slot_to_token:
+            return {}
+        return self._rt.step_batch(slot_to_token)
+
+    def release(self, slot: int) -> None:
+        self._rt.free_slot(slot)
+
+
+class _NemotronBatchedSession:
+    """Batched decode session for Nemotron-H — wraps :class:`quanta.nemotron.batched_runtime.NemotronBatchedResidentModel`.
+
+    Same contract as :class:`_DSV4BatchedSession`, but the underlying runtime threads the hybrid's
+    per-layer state (KV cache on attention layers, ``(ssm, conv)`` on mamba) per slot. The wrapper is
+    state-free: the batched runtime owns the per-slot state; the session only routes admit / step /
+    release into it. Lazy-imports ``quanta.nemotron.batched_runtime`` so the shim still loads when
+    the sibling agent's branch hasn't merged yet."""
+
+    def __init__(self, root: str | Path | None = None, *, capacity: int,
+                 runtime: Any | None = None) -> None:
+        if runtime is None:
+            from quanta.nemotron import batched_runtime as _nbr  # lazy: sibling agent #146
+
+            if root is None:
+                raise OmlxShimError("NemotronBatchedSession: artifact root required when runtime is unset")
+            self._rt = _nbr.NemotronBatchedResidentModel(root, batch_size=capacity)
+        else:
+            self._rt = runtime
+        self.capacity = capacity
+        self.num_layers = getattr(self._rt, "num_layers", 0)
+
+    def admit(self, slot: int, prompt_ids: list[int]) -> mx.array:
+        if not prompt_ids:
+            raise OmlxShimError("Nemotron batched admit got an empty prompt")
+        if not 0 <= slot < self.capacity:
+            raise OmlxShimError(
+                f"Nemotron batched admit slot {slot} out of range [0, {self.capacity})")
+        row = self._rt.prefill_slot(slot, prompt_ids)
+        mx.eval(row)
+        return row
+
+    def step_batch(self, slot_to_token: dict[int, int]) -> dict[int, mx.array]:
+        if not slot_to_token:
+            return {}
+        return self._rt.step_batch(slot_to_token)
+
+    def release(self, slot: int) -> None:
+        self._rt.free_slot(slot)
+
+
+@dataclass(slots=True)
+class _StreamState:
+    """Per-stream state for the batched decode loop — isolates sampler / eos / detok / RNG / generated
+    history so one stream finishing doesn't poison its slot-mate's history. ``next_key`` provides a
+    fresh PRNG subkey per step (None for global RNG when ``rng`` is None, matching the single-stream
+    loop's reproducibility contract)."""
+
+    prompt_ids: list[int]
+    max_tokens: int
+    temperature: float
+    top_p: float
+    top_k: int
+    min_p: float
+    repetition_penalty: float
+    frequency_penalty: float
+    presence_penalty: float
+    eos: set[int]
+    stop: list[str] | None
+    rng: mx.array | None
+    detok: "_Detok"
+    generated: list[int]
+
+    def next_key(self) -> mx.array | None:
+        if self.rng is None:
+            return None
+        self.rng, sub = mx.random.split(self.rng)
+        return sub
+
+
 class QuantaOmlxEngine(_OmlxBaseEngine):
     """oMLX ``BaseEngine`` backed by the quanta resident runtime (model-specific decode stepper)."""
 
     def __init__(self, model_name: str, *, runtime: RuntimeLike | None = None,
                  tokenizer: TokenizerLike | None = None, runtime_loader=None,
-                 output_cls: type[Any] = OmlxGenerationOutput, eos_token_ids: set[int] | None = None) -> None:
+                 output_cls: type[Any] = OmlxGenerationOutput, eos_token_ids: set[int] | None = None,
+                 batched_session: Any | None = None) -> None:
         self._model_name = model_name
         self._root = Path(model_name).expanduser().resolve(strict=False)
         self._runtime = runtime
@@ -471,6 +664,8 @@ class QuantaOmlxEngine(_OmlxBaseEngine):
         self._eos = set(eos_token_ids or ())
         self._loaded = runtime is not None and tokenizer is not None
         self._active = 0
+        # injected batched session (tests / advanced callers); None ⇒ built lazily on first use.
+        self._batched_session = batched_session
 
     # --- BaseEngine properties -------------------------------------------------
     @property
@@ -541,11 +736,31 @@ class QuantaOmlxEngine(_OmlxBaseEngine):
                               repetition_penalty: float = 1.0, frequency_penalty: float = 0.0,
                               presence_penalty: float = 0.0, seed: int | None = None,
                               stop: list[str] | None = None, **kwargs: Any) -> AsyncIterator[Any]:
+        """Stream tokens for ``prompt``; yields one ``output_cls`` chunk per emitted token.
+
+        ``spec_k`` (default 1): when ``>1``, route the single-stream loop through
+        :meth:`_dispatch_spec_k` (``quanta.{dsv4,nemotron}.spec.spec_generate_k``) for multi-step MTP
+        self-speculation. Output is **bit-identical** to ``spec_k == 1`` greedy regardless of
+        ``spec_k`` (the spec verify arbitrates losslessly — the head only changes *speed*); spec
+        currently requires ``temperature == 0`` (greedy verify) and yields one bulk chunk at the end,
+        since spec emits the full token list in one call rather than per-step. The trade-off:
+        ``spec_k > 1`` reduces main-model forwards per emitted token (1 forward → up to ``k+1``
+        tokens) at the cost of one extra MTP forward per round.
+        """
         await self.start()
         add_bos = bool(kwargs.pop("add_bos", True))
         allow_special = bool(kwargs.pop("allow_special", False))
         quantized_kv = bool(kwargs.pop("quantized_kv", True))  # int8 latent KV by default (ppl-gated)
+        spec_k = int(kwargs.pop("spec_k", 1))
+        if spec_k < 1:
+            raise OmlxShimError(f"spec_k must be >= 1 (got {spec_k})")
         prompt_ids = self._encode(prompt, add_bos=add_bos, allow_special=allow_special)
+        if spec_k > 1:
+            async for chunk in self._stream_via_spec(prompt_ids=prompt_ids, spec_k=spec_k,
+                                                    max_tokens=max_tokens, temperature=temperature,
+                                                    stop=stop):
+                yield chunk
+            return
         stepper = self._make_stepper(quantized_kv=quantized_kv)
         logits_row = stepper.prefill(prompt_ids)  # [vocab] at the last prompt position
         rng = mx.random.key(seed) if seed is not None else None  # per-request PRNG -> reproducible sampling
@@ -585,6 +800,71 @@ class QuantaOmlxEngine(_OmlxBaseEngine):
         finally:
             self._active -= 1
 
+    async def _stream_via_spec(self, *, prompt_ids: list[int], spec_k: int, max_tokens: int,
+                                temperature: float, stop: list[str] | None) -> AsyncIterator[Any]:
+        """Multi-step MTP path used when ``spec_k > 1``: call ``spec_generate_k`` once, detok the
+        full result, then yield ONE final chunk (spec returns the full token list in one shot, so
+        per-token streaming would require an additional callback the sibling spec API doesn't
+        expose). The output text is the same as the ``spec_k == 1`` greedy path under the same
+        prompt + eos (losslessness); the only observable difference is timing + a single output
+        chunk instead of one per token.
+
+        Sampling beyond greedy is not yet supported through spec — the spec verify pins each emitted
+        token to the main model's ``argmax``, so non-zero temperature on this path would silently
+        diverge from the requested distribution (rule 6: never silently emit something different
+        from what the caller asked for)."""
+        if temperature > 0.0:
+            raise OmlxShimError(
+                "spec_k>1 currently supports only greedy decode (temperature=0); spec verify pins "
+                "each emitted token to the main model's argmax")
+        # spec_generate_k's eos_id contract differs by model (DSV4: ``int | None``; Nemotron: also a
+        # collection via ``_as_stop_set``). To stay compatible with both, pass the full set when there
+        # are multiple stop ids (Nemotron handles it; DSV4 ignores it which is harmless under the
+        # post-spec EOS-trim below); pass an int when there's exactly one (DSV4 accepts; Nemotron
+        # treats it as a single-element stop set). ``None`` when ``self._eos`` is empty.
+        if not self._eos:
+            eos_id: Any = None
+        elif len(self._eos) == 1:
+            eos_id = next(iter(self._eos))
+        else:
+            eos_id = set(self._eos)
+        self._active += 1
+        try:
+            raw_tokens = self._dispatch_spec_k(prompt_ids=prompt_ids, spec_k=spec_k,
+                                                max_new=max_tokens, eos_id=eos_id)
+            # Defensive EOS-trim — even if spec_generate_k didn't honor our eos_id (e.g. it was a set
+            # passed to a DSV4-style ``int | None`` signature), we trim at the first EOS in our own
+            # stop set so the chunk we yield always matches the single-stream ``spec_k == 1`` path.
+            cut_idx = None
+            for i, tok in enumerate(raw_tokens):
+                if tok in self._eos:
+                    cut_idx = i + 1   # inclusive: keep the eos in the token list, drop nothing after
+                    break
+            tokens = raw_tokens[:cut_idx] if cut_idx is not None else list(raw_tokens)
+            finished, reason = False, None
+            detok = _Detok(self._tokenizer)
+            for tok in tokens:
+                if tok in self._eos:
+                    finished, reason = True, "stop"
+                    break  # eos itself has no visible text
+                detok.add(tok)
+            text = detok.text
+            if not finished and stop:
+                cut = _earliest_stop(text, stop)
+                if cut is not None:
+                    text, finished, reason = text[:cut], True, "stop"
+            if not finished:
+                # spec asked for max_new tokens; if we got back fewer than max_new without an eos,
+                # spec already exhausted its budget internally — still a "length" termination from
+                # the caller's perspective (no clean eos was reached).
+                finished, reason = True, "length"
+            yield self._output_cls(
+                text=text, tokens=list(tokens), prompt_tokens=len(prompt_ids),
+                completion_tokens=len(tokens), new_text=text,
+                finish_reason=reason, finished=finished)
+        finally:
+            self._active -= 1
+
     async def chat(self, messages: list[dict[str, Any]], **kwargs: Any) -> Any:
         tmpl_kw = self._pop_template_kwargs(kwargs)  # thinking/enable_thinking/... -> template, not sampler
         prompt, templated = self._format(messages, kwargs.pop("tools", None), tmpl_kw)
@@ -599,6 +879,182 @@ class QuantaOmlxEngine(_OmlxBaseEngine):
         kwargs.setdefault("allow_special", templated)
         async for out in self.stream_generate(prompt, **kwargs):
             yield out
+
+    # --- batched generation (DSV4 / Nemotron) ----------------------------------
+    async def batched_generate(self, prompts: Sequence[str], **kwargs: Any) -> list[Any]:
+        """Drive ``len(prompts)`` requests through the batched runtime; return the final per-stream
+        ``output_cls`` for each, in the same order as ``prompts``.
+
+        Per-request kwargs may be passed positionally via ``per_request`` (a list of dicts, one per
+        prompt, override the shared sampler/eos/max_new); shared ``**kwargs`` are applied to every
+        request that does not override. Equivalent to running ``generate(prompt, **req_kwargs)`` on
+        each prompt independently *modulo* the shared batched runtime — the per-stream outputs are
+        order-equivalent (rule 4: a batched optimization is output-equivalent to the naive path,
+        gated by ``parity/{dsv4,nemotron}_omlx_engine_test.py``)."""
+        outs: dict[int, Any] = {}
+        async for idx, chunk in self.batched_stream_generate(prompts, **kwargs):
+            # keep the most-recent chunk per stream — the final ``finished=True`` chunk replaces any
+            # earlier partials, and an early break (consumer cancelled) leaves the most-recent partial
+            # in place rather than dropping the stream entirely.
+            outs[idx] = chunk
+        return [outs.get(i, self._output_cls(text="", finish_reason="length")) for i in range(len(prompts))]
+
+    async def batched_stream_generate(self, prompts: Sequence[str], *,
+                                      per_request: Sequence[dict[str, Any]] | None = None,
+                                      max_tokens: int = 256, temperature: float = 0.0,
+                                      top_p: float = 0.9, top_k: int = 0, min_p: float = 0.0,
+                                      repetition_penalty: float = 1.0, frequency_penalty: float = 0.0,
+                                      presence_penalty: float = 0.0,
+                                      stop: list[str] | None = None,
+                                      **kwargs: Any) -> AsyncIterator[tuple[int, Any]]:
+        """Multi-stream decoder: drive up to ``capacity`` concurrent requests through the batched
+        runtime; yield ``(stream_idx, output_cls)`` per emitted token.
+
+        ``prompts``: ordered prompts (``len(prompts)`` may exceed ``capacity`` — extra prompts are
+        admitted as slots free up; this is the continuous-batching surface). ``per_request``: a list
+        of dicts (one per prompt) overriding the shared sampler / ``eos`` / ``max_tokens`` /
+        ``seed`` / ``stop`` for that stream — anything not in the dict falls back to the kwarg
+        default. The yielded ``stream_idx`` is the index into ``prompts``.
+
+        Per-stream sampling / eos / max_new are independent (the engine builds one PRNG key + one
+        :class:`_Detok` per stream); freed slots admit the next pending prompt. ``spec_k`` is NOT
+        forwarded — multi-step MTP is single-stream only today (the spec verify drives one main
+        forward at a time; batching it across streams is a separate optimization)."""
+        if not prompts:
+            return
+        await self.start()
+        per_request = list(per_request or [])
+        if per_request and len(per_request) != len(prompts):
+            raise OmlxShimError(
+                f"per_request length {len(per_request)} != len(prompts) {len(prompts)}")
+        capacity = int(kwargs.pop("batch_size", min(len(prompts), 8)))
+        if capacity < 1:
+            raise OmlxShimError(f"batched_stream_generate: batch_size must be >= 1 (got {capacity})")
+        capacity = min(capacity, len(prompts))
+        session = self._make_batched_session(capacity=capacity)
+        capacity = session.capacity  # the session may clamp to its own static batch_size
+        # per-stream config (sampler / eos / stop / max_new / seed / detok)
+        streams = [self._build_stream_state(prompts[i], per_request[i] if per_request else None,
+                                            kwargs=kwargs, default_max=max_tokens,
+                                            default_temperature=temperature, default_top_p=top_p,
+                                            default_top_k=top_k, default_min_p=min_p,
+                                            default_rep=repetition_penalty,
+                                            default_freq=frequency_penalty,
+                                            default_pres=presence_penalty, default_stop=stop)
+                   for i in range(len(prompts))]
+        # match single-stream semantics: a stream with max_tokens<=0 emits nothing — never even
+        # admitted. Done before allocating sessions so a request for ``max_tokens=0`` is a no-op.
+        pending = [i for i in range(len(prompts)) if streams[i].max_tokens > 0]
+        slot_owner: dict[int, int] = {}      # slot -> stream idx
+        slot_logits: dict[int, mx.array] = {}
+        free_slots = list(range(capacity))
+        if not pending:
+            return
+        self._active += 1
+        try:
+            while pending or slot_owner:
+                # admit as many pending streams as we have free slots for
+                while pending and free_slots:
+                    sidx = pending.pop(0)
+                    slot = free_slots.pop(0)
+                    slot_owner[slot] = sidx
+                    slot_logits[slot] = session.admit(slot, streams[sidx].prompt_ids)
+                if not slot_owner:
+                    break
+                # sample one token per alive slot from its prefilled / stepped logits row
+                emit_tokens: dict[int, int] = {}
+                for slot, sidx in slot_owner.items():
+                    st = streams[sidx]
+                    tok = self._sample(slot_logits[slot], st.temperature, st.top_k, st.top_p,
+                                       st.min_p, st.repetition_penalty, st.frequency_penalty,
+                                       st.presence_penalty, st.generated, st.next_key())
+                    emit_tokens[slot] = tok
+                # yield per-stream chunks; mark finished streams to release after the yields
+                to_release: list[int] = []
+                for slot, sidx in list(slot_owner.items()):
+                    tok = emit_tokens[slot]
+                    st = streams[sidx]
+                    st.generated.append(tok)
+                    finished, reason, new_text = False, None, ""
+                    if tok in st.eos:
+                        finished, reason = True, "stop"
+                    else:
+                        new_text = st.detok.add(tok)
+                    text = st.detok.text
+                    if not finished and st.stop:
+                        cut = _earliest_stop(text, st.stop)
+                        if cut is not None:
+                            start = len(text) - len(new_text)
+                            new_text = text[start:cut] if cut > start else ""
+                            text, finished, reason = text[:cut], True, "stop"
+                    if not finished and len(st.generated) >= st.max_tokens:
+                        finished, reason = True, "length"
+                    chunk = self._output_cls(
+                        text=text, tokens=list(st.generated), prompt_tokens=len(st.prompt_ids),
+                        completion_tokens=len(st.generated), new_text=new_text,
+                        finish_reason=reason, finished=finished)
+                    yield sidx, chunk
+                    if finished:
+                        to_release.append(slot)
+                # step the still-alive slots; release the finished ones (freeing their slot for
+                # the next pending prompt — continuous batching).
+                alive_tokens = {slot: tok for slot, tok in emit_tokens.items() if slot not in to_release}
+                if alive_tokens:
+                    new_logits = session.step_batch(alive_tokens)
+                    if set(new_logits.keys()) != set(alive_tokens.keys()):
+                        raise OmlxShimError(
+                            f"batched runtime returned logits for slots {sorted(new_logits)} "
+                            f"but step_batch was called with {sorted(alive_tokens)}")
+                    slot_logits.update(new_logits)
+                for slot in to_release:
+                    session.release(slot)
+                    slot_owner.pop(slot, None)
+                    slot_logits.pop(slot, None)
+                    free_slots.append(slot)
+        finally:
+            # release any slots still held (e.g. cancelled mid-stream / consumer broke early) —
+            # never leak a slot, which would silently starve the next batched_stream_generate call
+            # for that engine (rule 6: no silent failures).
+            for slot in list(slot_owner):
+                try:
+                    session.release(slot)
+                except Exception:  # pragma: no cover - best-effort cleanup
+                    pass
+            self._active -= 1
+
+    def _build_stream_state(self, prompt: str, overrides: dict[str, Any] | None, *,
+                            kwargs: dict[str, Any], default_max: int, default_temperature: float,
+                            default_top_p: float, default_top_k: int, default_min_p: float,
+                            default_rep: float, default_freq: float, default_pres: float,
+                            default_stop: list[str] | None) -> "_StreamState":
+        """Build the per-stream state for one batched stream — keeps sampler / eos / max_new / seed /
+        detok / generated isolated between streams so a finished slot can be released independently."""
+        ov = overrides or {}
+        add_bos = bool(ov.get("add_bos", kwargs.get("add_bos", True)))
+        allow_special = bool(ov.get("allow_special", kwargs.get("allow_special", False)))
+        prompt_ids = self._encode(prompt, add_bos=add_bos, allow_special=allow_special)
+        stream_eos: set[int] = set(self._eos)
+        if "eos_token_ids" in ov:
+            stream_eos = {int(t) for t in ov["eos_token_ids"]}
+        if "eos_id" in ov and ov["eos_id"] is not None:
+            stream_eos.add(int(ov["eos_id"]))
+        seed = ov.get("seed", kwargs.get("seed"))
+        return _StreamState(
+            prompt_ids=prompt_ids,
+            max_tokens=int(ov.get("max_tokens", default_max)),
+            temperature=float(ov.get("temperature", default_temperature)),
+            top_p=float(ov.get("top_p", default_top_p)),
+            top_k=int(ov.get("top_k", default_top_k)),
+            min_p=float(ov.get("min_p", default_min_p)),
+            repetition_penalty=float(ov.get("repetition_penalty", default_rep)),
+            frequency_penalty=float(ov.get("frequency_penalty", default_freq)),
+            presence_penalty=float(ov.get("presence_penalty", default_pres)),
+            eos=stream_eos,
+            stop=list(ov.get("stop", default_stop) or []) or None,
+            rng=mx.random.key(int(seed)) if seed is not None else None,
+            detok=_Detok(self._tokenizer),
+            generated=[],
+        )
 
     # --- internals -------------------------------------------------------------
     @staticmethod
@@ -666,6 +1122,65 @@ class QuantaOmlxEngine(_OmlxBaseEngine):
             # model_type, so an unrecognized one still fails loud below (rule 6 — no mis-routing).
             return _SingleTokenStepper(self._runtime, None)
         raise OmlxShimError(f"no decode stepper for quanta artifact model_type={mt!r}")
+
+    def _make_batched_session(self, *, capacity: int) -> _BatchedSession:
+        """Build the engine's batched decode session for this artifact's model class (``model_type``).
+
+        Only DSV4 and Nemotron expose a batched runtime today (#145/#146); other model classes fail
+        loud here (rule 6) until their batched runtime is implemented — never silently fall back to
+        a serial loop pretending to be batched (the caller would think it has ``B`` concurrent slots
+        when it actually has one). When a session was injected at engine construction (tests /
+        advanced callers), it is returned as-is."""
+        if self._batched_session is not None:
+            return self._batched_session
+        mt = self.model_type or ""
+        if mt.startswith("deepseek_v4"):
+            self._batched_session = _DSV4BatchedSession(self._root, capacity=capacity)
+            return self._batched_session
+        if mt.startswith("nemotron"):
+            self._batched_session = _NemotronBatchedSession(self._root, capacity=capacity)
+            return self._batched_session
+        raise OmlxShimError(
+            f"no batched runtime for quanta artifact model_type={mt!r} (DSV4 / Nemotron only)")
+
+    def _dispatch_spec_k(self, *, prompt_ids: list[int], spec_k: int, max_new: int,
+                         eos_id: Any) -> list[int]:
+        """Dispatch a single-stream request to native MTP self-speculation (``spec_k > 1``).
+
+        Lazy-imports ``quanta.{dsv4,nemotron}.spec.spec_generate_k`` so the engine compiles even when
+        the sibling agents (#148 for Nemotron) haven't merged yet — the failure point is the call,
+        not the module import. The runtime must expose ``mtp``, ``embed_w``, ``lm_head_w`` for spec
+        to call into the head; the engine refuses loudly if any is missing (rule 6 — never silently
+        emit a non-spec stream while the caller asked for spec)."""
+        mt = self.model_type or ""
+        rt = self._runtime
+        for attr in ("mtp", "embed_w", "lm_head_w"):
+            if not hasattr(rt, attr):
+                raise OmlxShimError(
+                    f"spec_k>1 requires runtime.{attr} (MTP head + embed + lm_head); missing on "
+                    f"{type(rt).__name__}")
+        if mt.startswith("deepseek_v4"):
+            from quanta.dsv4 import spec as _spec  # lazy: spec_generate_k landed on main earlier
+
+            fn = getattr(_spec, "spec_generate_k", None)
+            if fn is None:
+                raise OmlxShimError("quanta.dsv4.spec.spec_generate_k missing — rebuild the DSV4 module")
+            tokens, _stats = fn(rt, rt.mtp, rt.embed_w, rt.lm_head_w, prompt_ids,
+                                max_new=max_new, eos_id=eos_id, k=spec_k)
+            return [int(t) for t in tokens]
+        if mt.startswith("nemotron"):
+            from quanta.nemotron import spec as _spec  # lazy: spec_generate_k in flight (#148)
+
+            fn = getattr(_spec, "spec_generate_k", None)
+            if fn is None:
+                raise OmlxShimError(
+                    "quanta.nemotron.spec.spec_generate_k not yet available — rebuild the Nemotron "
+                    "module (sibling agent #148)")
+            tokens, _stats = fn(rt, rt.mtp, rt.embed_w, rt.lm_head_w, prompt_ids,
+                                max_new=max_new, eos_id=eos_id, k=spec_k)
+            return [int(t) for t in tokens]
+        raise OmlxShimError(
+            f"spec_k>1 not wired for quanta artifact model_type={mt!r} (DSV4 / Nemotron only)")
 
     def _sample(self, logits: mx.array, temperature: float, top_k: int, top_p: float, min_p: float,
                 rep: float, freq: float, pres: float, prev: Sequence[int],
