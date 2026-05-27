@@ -54,6 +54,8 @@ from __future__ import annotations
 
 import mlx.core as mx
 
+from quanta.spec.tree import build_tree, enumerate_paths
+
 
 def _as_stop_set(eos_id) -> set[int]:
     """Normalize ``eos_id`` (an ``int``, a collection, or ``None``) into a set of stop ids."""
@@ -338,40 +340,184 @@ def spec_generate_k(model, mtp, embed: mx.array, head: mx.array, prompt_ids,
     }
 
 
+def _mtp_top_w(logits_row: mx.array, width: int) -> list[int]:
+    """Top-``width`` token ids from a ``[vocab]`` MTP logit row, most-likely first.
+
+    Used by :func:`spec_generate_tree` to seed the BFS tree-build. For the canonical
+    ``width ∈ {2, 4, 8}`` and Nemotron's vocab, a single ``argsort`` is trivially cheap (~µs)."""
+    if width == 1:
+        return [int(mx.argmax(logits_row).item())]
+    idx = mx.argsort(-logits_row.astype(mx.float32))     # descending order
+    return [int(idx[i].item()) for i in range(width)]
+
+
 def spec_generate_tree(model, mtp, embed: mx.array, head: mx.array, prompt_ids,
                        *, width: int, depth: int, max_new: int,
                        eos_id=None) -> tuple[list[int], dict]:
-    """Tree drafting (EAGLE-2 style) over the native Nemotron-H MTP head — **structural stub** (#157).
+    """**W-parallel chain-verify** tree drafting over the native Nemotron-H MTP head — lossless,
+    hybrid-safe (task #157).
 
-    The per-round contract this entry point would implement, mirroring :func:`spec_generate_k` but
-    with a tree-shaped draft instead of a linear chain:
+    Each round drafts a ``(width, depth)`` tree from the MTP head, enumerates the ``W ** D``
+    root-to-leaf draft paths, and verifies each as a chain ``[cur, *path_drafts]`` through the main
+    model — with the per-attention-layer KV caches AND the (un-sliceable) Mamba ``(ssm, conv)``
+    recurrent state rolled back losslessly between paths via the snapshot-replay pattern already
+    used by :func:`spec_generate_k`. The longest greedy-matching prefix across paths is committed
+    (accepted drafts + bonus); a final replay re-feeds the accepted prefix to advance state to the
+    committed offset. Output is **bit-identical to plain greedy decode** for any MTP quality
+    (CLAUDE.md rule 4) — the head only changes which candidate set is presented to verify, never
+    which tokens commit.
 
-      1. build a (``width``, ``depth``)-tree of drafts via :func:`quanta.spec.tree.build_tree`,
-         taking the top-``width`` MTP children of each node (the trained Nemotron MTP from
-         :mod:`quanta.nemotron.mtp`, used un-retrained);
-      2. construct the tree-causal attention mask via :func:`quanta.spec.tree.tree_causal_mask`;
-      3. verify the flat tree in **one** main forward at the current offset, with that mask applied
-         in every **attention** layer's SDPA call;
-      4. accept the longest greedy-matching root-to-leaf path via
-         :func:`quanta.spec.tree.longest_accepted_path`; emit accepted drafts + bonus; roll the
-         per-attention KV caches AND the (un-sliceable) Mamba SSM/conv state back to the committed
-         offset via the snapshot-replay pattern already used by :func:`spec_generate_k`.
+    Why W-parallel chain verify and not the single-forward tree-causal-mask form (EAGLE-2)?
+    Nemotron-H is an extreme hybrid: 8 GQA attention layers + **80 Mamba-2 SSM layers** (88 total).
+    A tree-causal attention mask only makes sense for the 8 attention layers — the 80 Mamba layers
+    process tokens via an O(1) recurrent state that has no causal-mask hook; feeding a BFS-
+    linearized tree to a Mamba layer in one forward would corrupt the recurrent state by mixing
+    alternative branches into the SSM summary. This entry point preserves losslessness for the
+    hybrid stack by keeping each path's forward sequential (every layer always sees a contiguous
+    chain) at the cost of more forwards per round.
 
-    EAGLE-2 reports ``mean_accept ≈ 3.5–4.5`` at ``width=4, depth=2``; lossless because the main
-    model still arbitrates every emitted token (CLAUDE.md rule 4).
+    **Economics.** This implementation runs ``W ** D`` per-path verifies + 1 replay-forward per
+    round to advance the committed state. At ``W=2, D=2`` that is 5 forwards; EAGLE-2 reports
+    ``mean_accept ≈ 3.5–4.5`` at those settings, so PER ACCEPTED TOKEN this is ~3–4× the cost of
+    :func:`spec_generate_k` (chained k=2 on Nemotron: 1–2 forwards at ``mean_accept ≈ 2.78``).
+    USE :func:`spec_generate_k` FOR ACTUAL DECODE SPEEDUP — Nemotron's Mamba-dominant stack is
+    especially unforgiving of extra forwards. This entry point is kept for (a) lossless contract
+    correctness — the only form that admits a ``(W, D)`` tree on a Mamba-dominant architecture;
+    (b) future batched-verify (B=``W ** D``) via :mod:`quanta.nemotron.batched_runtime`, which
+    would collapse the per-path forwards into ONE batched forward and could net a real win at
+    hybrid; that integration is not done here (it touches the batched stepper).
 
-    **Status — structural piece only (this commit).** The tree-build + mask + acceptance primitives
-    are in place and parity-tested model-free in ``parity/tree_spec_test.py``. The verify-side
-    plumbing — passing a tree-causal mask through Nemotron-H's hybrid (8 GQA attention layers + 80
-    Mamba-2 SSM layers) plus the snapshot-replay rollback for the Mamba state across an *accepted
-    tree path* (not a chain) — is the per-model follow-on and is NOT included here. This entry
-    point raises ``NotImplementedError`` with the follow-on named, so the contract is callable /
-    importable but cannot silently produce wrong output (CLAUDE.md rule 6). Fall back to
-    :func:`spec_generate_k` for now.
+    Returns ``(tokens, stats)`` where ``stats`` reports ``mean_accept``, ``rounds``, ``max_accept``,
+    ``width``, ``depth``, and ``paths_per_round`` (= ``W ** D``). Mirrors :func:`spec_generate_k`'s
+    eos / max_new semantics. ``width=1`` degenerates to a chain (= :func:`spec_generate_k` with
+    ``k=depth``) and short-circuits to that proven path.
     """
-    del model, mtp, embed, head, prompt_ids, width, depth, max_new, eos_id
-    raise NotImplementedError(
-        "nemotron.spec_generate_tree: structural piece in place (see quanta.spec.tree). "
-        "Per-Nemotron attention-mask plumbing (GQA + Mamba snapshot-replay rollback across tree "
-        "paths) is the follow-on task — fall back to spec_generate_k(k=width) until that lands."
-    )
+    if width < 1 or depth < 1:
+        raise ValueError(f"width must be >= 1, depth must be >= 1 (got width={width}, depth={depth})")
+    if width == 1:
+        return spec_generate_k(model, mtp, embed, head, prompt_ids,
+                               k=depth, max_new=max_new, eos_id=eos_id)
+
+    last = model.cfg.num_hidden_layers - 1
+    prompt_ids = list(prompt_ids)
+    if not prompt_ids:
+        raise ValueError("spec_generate_tree needs a non-empty prompt")
+    stop = _as_stop_set(eos_id)
+    caches, ssm, conv = _capture_state(model)
+
+    # --- prefill: verified token at q = len(prompt)-1, plus its feature ---
+    logits, caps = _forward(model, mx.array(prompt_ids), caches=caches, ssm=ssm, conv=conv,
+                            offset=0, capture_layers=(last,))
+    mx.eval(logits) if caps is None else mx.eval(logits, caps[last])
+    q = len(prompt_ids) - 1
+    prev_hidden = caps[last][-1][None, None]              # [1,1,hidden] main hidden at q
+    cur = int(mx.argmax(logits[0, -1]).item())            # verified token at q+1
+    out = [cur]
+    accept_lens: list[int] = []
+    stopped = cur in stop
+
+    paths_per_round = width ** depth
+
+    while len(out) < max_new and not stopped:
+        # --- build the (W, D) MTP draft tree ---
+        # The Nemotron MTP signature is ``mtp(prev_hidden, token_emb, head, return_hidden=True) ->
+        # (logits, new_hidden)`` — note ``token_emb`` (a pre-embedded id), NOT ``next_ids``. All
+        # ``width`` children of one parent share the SAME post-MTP hidden — the MTP head only sees
+        # parent context, not the per-child token-id branching.
+        def _expand(parent_hidden: mx.array, parent_token: int):
+            token_emb = embed[int(parent_token)][None, None].astype(parent_hidden.dtype)
+            d_log, d_h = mtp(parent_hidden, token_emb, head, return_hidden=True)
+            top = _mtp_top_w(d_log[0, 0], width)
+            return [(tok, d_h) for tok in top]
+
+        draft = build_tree(_expand, root_hidden=prev_hidden, root_token=cur,
+                           width=width, depth=depth)
+        paths = enumerate_paths(draft.parents, draft.tokens)   # W^D paths of length D each
+
+        # --- per-path verify: snapshot recurrent state ONCE at round start; restore between paths ---
+        # The Mamba ``(ssm, conv)`` state is a summary of every consumed token — it cannot be sliced
+        # like a KV cache. ``list(...)`` is O(layers); MLX arrays are immutable so captured references
+        # stay bit-exact across mutation of the live lists by intermediate path verifies.
+        ssm_round_start = list(ssm) if ssm is not None else None
+        conv_round_start = list(conv) if conv is not None else None
+        pre_offset = q + 1
+
+        best_j = -1
+        best_bonus = cur                                  # safe sentinel; overwritten on first path
+        best_path: list[int] = []
+        best_hidden = prev_hidden
+
+        for path_drafts in paths:
+            verify_in = [cur, *path_drafts]
+            vlog, vcaps = _forward(model, mx.array(verify_in), caches=caches, ssm=ssm, conv=conv,
+                                   offset=pre_offset, capture_layers=(last,))
+            bpred = mx.argmax(vlog[0], axis=-1)            # [depth+1]
+            mx.eval(bpred) if vcaps is None else mx.eval(bpred, vcaps[last])
+            bp = [int(bpred[i].item()) for i in range(depth + 1)]
+
+            # Longest matching prefix of ``path_drafts`` against ``bp[:depth]``.
+            j = 0
+            while j < depth and path_drafts[j] == bp[j]:
+                j += 1
+
+            if j > best_j:
+                best_j = j
+                best_bonus = bp[j]
+                best_path = path_drafts
+                best_hidden = vcaps[last][j][None, None]   # hidden at the last accepted draft / cur
+
+            # Roll back to round-start for the next path verify.
+            # KV cache: per-position slice via ``_rollback``. Mamba state: restore the round-start
+            # snapshot in-place (each path-verify mutates the live ``ssm``/``conv`` lists).
+            if ssm_round_start is not None:
+                for i in range(len(ssm)):
+                    ssm[i] = ssm_round_start[i]
+            if conv_round_start is not None:
+                for i in range(len(conv)):
+                    conv[i] = conv_round_start[i]
+            _rollback(model, caches, pre_offset)
+
+        # --- commit: replay [cur, *best_path[:best_j]] to advance state to the committed offset ---
+        # After all per-path rollbacks the cache + recurrent state are at the round-start (pre_offset).
+        # One bounded replay forward of length ``best_j + 1 <= depth + 1`` brings them forward to the
+        # committed offset. ``best_j == 0`` still replays ``[cur]`` (one token) — the single
+        # post-cur prefill that the chained spec also runs to position state at the bonus.
+        replay = [cur, *best_path[:best_j]]
+        rlog, rcaps = _forward(model, mx.array(replay), caches=caches, ssm=ssm, conv=conv,
+                               offset=pre_offset, capture_layers=(last,))
+        mx.eval(rlog) if rcaps is None else mx.eval(rlog, rcaps[last])
+        # The replay's final-position hidden is the bit-exact recompute of best_hidden (same input,
+        # same starting state); we keep best_hidden as the value carried forward (avoid a needless
+        # equality check, the result is the same MLX value graph).
+        prev_hidden = best_hidden
+
+        out.extend(best_path[:best_j])
+        out.append(best_bonus)
+        accept_lens.append(best_j + 1)
+
+        q = q + 1 + best_j
+        cur = best_bonus
+
+        # Bounded eos check on the tokens emitted this round (inclusive of the bonus).
+        if stop:
+            tail = best_path[:best_j] + [best_bonus]
+            for t in tail:
+                if t in stop:
+                    stopped = True
+                    break
+
+    out = out[:max_new]
+    if stop:                                              # terminate at the first eos (inclusive)
+        for i, t in enumerate(out):
+            if t in stop:
+                out = out[: i + 1]
+                break
+    return out, {
+        "rounds": len(accept_lens),
+        "tokens": len(out),
+        "mean_accept": (sum(accept_lens) / len(accept_lens)) if accept_lens else 0.0,
+        "max_accept": max(accept_lens) if accept_lens else 0,
+        "width": width,
+        "depth": depth,
+        "paths_per_round": paths_per_round,
+    }

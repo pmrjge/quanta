@@ -8,10 +8,14 @@ never allocates per-vocab-size, runs in <100ms on CPU. Tests:
   - :func:`build_tree` — BFS construction order, topology, ``W=1`` chain edge case.
   - :func:`tree_causal_mask` — each row is the ancestor set; siblings are masked from each other.
   - :func:`longest_accepted_path` — perfect-tree, no-match, partial-match, sibling tie-break.
+  - :func:`enumerate_paths` — all root-to-leaf draft paths (the W-parallel chain-verify input);
+    BFS-leftmost ordering, chain / root-only edge cases, malformed-input rule-6 raises.
 
-The shared module is the *structural* piece of #157; the per-model ``spec_generate_tree`` entry
-points (which require the per-model verify-side attention-mask plumbing) are NOT exercised here
-beyond their import path — see each model's ``spec.py`` for the follow-on.
+The shared module is the *structural* piece of #157. Per-model spec entries: the **W-parallel
+chain-verify** form is implemented for Qwen3.5 + Nemotron (hybrid models — see
+``parity/qwen35_tree_spec_test.py`` / ``parity/nemotron_tree_spec_test.py``); the **single-forward
+tree-causal-mask** form is still a stub for DSV4 (pure-attention; needs per-attention-regime mask
+plumbing — see :func:`quanta.dsv4.spec.spec_generate_tree`).
 
 Run:  ``uv run --with numpy python -m parity.tree_spec_test``
 """
@@ -23,6 +27,7 @@ import mlx.core as mx
 from quanta.spec.tree import (
     TreeDraft,
     build_tree,
+    enumerate_paths,
     longest_accepted_path,
     tree_causal_mask,
     tree_size,
@@ -305,32 +310,109 @@ def test_longest_accepted_length_mismatch() -> None:
     print("[OK] longest_accepted_path length mismatch fails loud")
 
 
-def test_per_model_dispatch_stubs_import() -> None:
-    """Per-model ``spec_generate_tree`` stubs are importable and raise the documented contract.
+def test_enumerate_paths_width2_depth2() -> None:
+    """``(W=2, D=2)`` tree → 4 paths of length 2 each, in BFS-leftmost order.
 
-    We do not call the model paths (they'd need a model) — we only assert the stubs exist with the
-    documented signature and raise ``NotImplementedError`` with the follow-on task named, so the
-    contract is visible to the spec_decode benches before the per-model attention-mask plumbing
-    lands.
+    Topology (same as :func:`test_tree_causal_mask_simple`)::
+
+                 0
+               /   \\
+              1     2
+             / \\   / \\
+            3   4 5   6
+    """
+    parents = [-1, 0, 0, 1, 1, 2, 2]
+    tokens = [99, 100, 101, 102, 103, 104, 105]
+    paths = enumerate_paths(parents, tokens)
+    # 4 leaves (idx 3,4,5,6) → 4 paths of length 2: [1->3, 1->4, 2->5, 2->6]
+    # BFS-leftmost ordering: walk left-subtree fully before right-subtree.
+    assert paths == [[100, 102], [100, 103], [101, 104], [101, 105]], paths
+    print("[OK] enumerate_paths W=2 D=2")
+
+
+def test_enumerate_paths_chain() -> None:
+    """``W=1`` chain has exactly one path of length ``D``."""
+    parents = [-1, 0, 1, 2]
+    tokens = [10, 11, 12, 13]
+    paths = enumerate_paths(parents, tokens)
+    assert paths == [[11, 12, 13]], paths
+    print("[OK] enumerate_paths chain (W=1)")
+
+
+def test_enumerate_paths_root_only() -> None:
+    """A root-only tree (``D=0``) has no draft paths."""
+    paths = enumerate_paths([-1], [99])
+    assert paths == [], paths
+    print("[OK] enumerate_paths root-only (D=0) → empty")
+
+
+def test_enumerate_paths_width4_depth2() -> None:
+    """``(W=4, D=2)`` — 16 paths of length 2 each, BFS-leftmost ordered (EAGLE-2 paper default).
+
+    Uses :func:`build_tree` to assemble the topology so the test also catches drift between
+    construction order and enumeration order — they must match (siblings BFS-left-first).
+    """
+    _stub_expand_topn.width = 4
+    draft = build_tree(_stub_expand_topn(start_token=1000), root_hidden=("h",), root_token=42,
+                       width=4, depth=2)
+    paths = enumerate_paths(draft.parents, draft.tokens)
+    assert len(paths) == 16, f"expected 16 paths, got {len(paths)}"
+    assert all(len(p) == 2 for p in paths), f"every path must be depth 2: {paths}"
+    # Leftmost path = leftmost child of root → leftmost grandchild = first MTP top-1 chain.
+    assert paths[0] == [int(draft.tokens[1]), int(draft.tokens[5])], (paths[0], draft.tokens)
+    print("[OK] enumerate_paths W=4 D=2 (16 paths, BFS-leftmost)")
+
+
+def test_enumerate_paths_malformed() -> None:
+    """Malformed inputs fail loud — empty, wrong root, length mismatch (rule 6)."""
+    try:
+        enumerate_paths([], [])
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("empty parents must raise")
+    try:
+        enumerate_paths([0, 0], [1, 2])  # root parent != -1
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("non-root parent must raise")
+    try:
+        enumerate_paths([-1, 0], [1, 2, 3])  # length mismatch
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("length mismatch must raise")
+    print("[OK] enumerate_paths malformed fails loud")
+
+
+def test_per_model_dispatch_stubs_import() -> None:
+    """The DSV4 ``spec_generate_tree`` stub is importable and raises the documented contract.
+
+    Qwen3.5 and Nemotron implementations of ``spec_generate_tree`` use the W-parallel chain-verify
+    form (hybrid-model-safe — their recurrent state can't be losslessly tree-masked); the DSV4
+    follow-on (single-forward tree-causal-mask through the dense / compressed / indexed attention
+    regimes) remains a stub here. Each implemented model has its own per-model parity test
+    (``parity/qwen35_tree_spec_test.py``, ``parity/nemotron_tree_spec_test.py``) — those exercise
+    the spec contract with a stub main model + stub MTP; this file only smoke-checks the remaining
+    DSV4 stub still names the follow-on (rule 6 — never silently produce wrong output).
     """
     from quanta.dsv4.spec import spec_generate_tree as dsv4_tree
-    from quanta.nemotron.spec import spec_generate_tree as nemo_tree
-    from quanta.qwen35.spec import spec_generate_tree as qwen_tree
 
-    for fn, name in (
-        (dsv4_tree, "dsv4"),
-        (nemo_tree, "nemotron"),
-        (qwen_tree, "qwen35"),
-    ):
-        try:
-            fn(None, None, None, None, [1, 2, 3], width=2, depth=2, max_new=4)
-        except NotImplementedError as e:
-            assert "attention-mask plumbing" in str(e) or "spec_generate_tree" in str(e), (
-                f"{name}: expected the contract message to name the follow-on, got: {e}"
-            )
-        else:
-            raise AssertionError(f"{name}: spec_generate_tree must raise NotImplementedError")
-    print("[OK] per-model spec_generate_tree stubs import + raise on contract")
+    try:
+        dsv4_tree(None, None, None, None, [1, 2, 3], width=2, depth=2, max_new=4)
+    except NotImplementedError as e:
+        assert "attention-mask plumbing" in str(e) or "spec_generate_tree" in str(e), (
+            f"dsv4: expected the contract message to name the follow-on, got: {e}"
+        )
+    else:
+        raise AssertionError("dsv4: spec_generate_tree must raise NotImplementedError")
+    # Sanity: the implemented Qwen3.5 / Nemotron entry points are importable (callable, not raising
+    # NotImplementedError on import). They are exercised in their own parity tests.
+    from quanta.nemotron.spec import spec_generate_tree as nemo_tree  # noqa: F401
+    from quanta.qwen35.spec import spec_generate_tree as qwen_tree  # noqa: F401
+    print("[OK] dsv4 spec_generate_tree stub raises with follow-on named; "
+          "qwen35 + nemotron entries importable")
 
 
 def main() -> int:
@@ -350,6 +432,11 @@ def main() -> int:
         test_longest_accepted_sibling_tiebreak,
         test_longest_accepted_chain_full_accept,
         test_longest_accepted_length_mismatch,
+        test_enumerate_paths_width2_depth2,
+        test_enumerate_paths_chain,
+        test_enumerate_paths_root_only,
+        test_enumerate_paths_width4_depth2,
+        test_enumerate_paths_malformed,
         test_per_model_dispatch_stubs_import,
     ]
     failures = 0

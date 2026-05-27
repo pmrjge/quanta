@@ -1,7 +1,7 @@
 """Tree-drafting infrastructure for native MTP speculative decoding (EAGLE-2 style).
 
-The per-model ``spec_generate_tree`` entry points consume the four primitives below to drive a
-single-forward verify of a (``width``, ``depth``)-tree of MTP-drafted continuations:
+The per-model ``spec_generate_tree`` entry points consume these primitives to drive tree-shaped MTP
+drafting in one of two verify regimes (which one depends on the model architecture; see below):
 
   1. :func:`build_tree` — BFS-expand the MTP head ``depth`` levels, taking the top-``width`` children
      of every node. Returns a :class:`TreeDraft` with the flat BFS-order token list and parent-index
@@ -9,10 +9,18 @@ single-forward verify of a (``width``, ``depth``)-tree of MTP-drafted continuati
   2. :func:`tree_causal_mask` — the ``[T, T]`` boolean mask each main-model attention layer needs so
      each draft token attends ONLY to its ancestor path (and itself), preserving the lossless verify
      semantics — siblings must NOT see each other or the verify would commit a token that depends on
-     unrelated draft context.
-  3. :func:`longest_accepted_path` — walk root-to-leaf picking the child whose token equals the main
-     model's greedy at the parent's position, accepting the longest such prefix.
-  4. :func:`tree_size` — total node count for a (``width``, ``depth``) tree: ``1 + sum(W^d for d in
+     unrelated draft context. **Single-forward verify** (the EAGLE-2 path) consumes this mask; it is
+     only lossless on PURE-ATTENTION main models (every layer admits an additive mask).
+  3. :func:`enumerate_paths` — all ``W ** D`` root-to-leaf draft paths in BFS order. **W-parallel
+     chain verify** (the HYBRID-MODEL path) consumes this: each path is chain-verified as
+     ``[cur, *path]``, the cache truncated back between paths, and the longest-accepting picked.
+     Lossless for ANY main-model layer mix (including GDN / Mamba) at the cost of ``W ** D + 1``
+     forwards per round vs the single-forward tree-mask form (which a hybrid model cannot do
+     losslessly — its recurrent state can't be tree-masked).
+  4. :func:`longest_accepted_path` — walk root-to-leaf picking the child whose token equals the main
+     model's greedy at the parent's position, accepting the longest such prefix. Consumed by the
+     single-forward (mask) regime to interpret greedy outputs at all tree positions in one pass.
+  5. :func:`tree_size` — total node count for a (``width``, ``depth``) tree: ``1 + sum(W^d for d in
      1..D)``. Useful for cache pre-sizing and parity assertions.
 
 Losslessness still rests on the main model arbitrating every emitted token: ``accept iff
@@ -178,6 +186,56 @@ def tree_causal_mask(parents: Sequence[int]) -> mx.array:
             j = parents[j]
         rows.append(row)
     return mx.array(rows, dtype=mx.bool_)
+
+
+def enumerate_paths(parents: Sequence[int], tokens: Sequence[int]) -> list[list[int]]:
+    """All root-to-leaf draft paths (root EXCLUDED from each path).
+
+    For a ``(W, D)`` tree there are ``W ** D`` paths, each a list of ``D`` token ids in root-to-leaf
+    order. Used by the **W-parallel chain-verify** form of tree drafting (the hybrid-model-safe
+    variant): each enumerated path is chain-verified through the main model as ``[cur, *path]``, then
+    the cache is rolled back so siblings can be verified from the same round-start state. Per-model
+    ``spec_generate_tree`` callers consume this when the model cannot accept the single-forward
+    tree-causal mask form (Qwen3.5 with GDN linear-attention layers, Nemotron-H with Mamba SSM layers
+    — their recurrent state can't be tree-masked, so the linearized-tree verify isn't lossless).
+
+    Tie-breaking / ordering: children are walked in BFS order (= construction order in
+    :func:`build_tree`), so the per-parent top-1 path is always the leftmost / first-enumerated. The
+    output is therefore stable: the first path is "always pick the MTP top-1 child" (the equivalent
+    of :func:`spec_generate_k` with ``k=depth``); subsequent paths exercise lower-ranked siblings.
+
+    Raises ``ValueError`` if the tree is empty or malformed (no root). A "chain" tree (``width=1``,
+    constructed in :func:`build_tree` as a degenerate case) returns exactly one path of length
+    ``depth``; a root-only tree (``depth=0``) returns an empty list (no paths to verify).
+    """
+    T = len(parents)
+    if T == 0:
+        raise ValueError("parents must be non-empty")
+    if parents[0] != -1:
+        raise ValueError("parents[0] must be -1 (root has no parent)")
+    if len(tokens) != T:
+        raise ValueError(f"parents / tokens length mismatch ({T} / {len(tokens)})")
+
+    # Children map (BFS order = construction order, since children were appended layer-by-layer).
+    children: dict[int, list[int]] = {}
+    for i, p in enumerate(parents):
+        if p >= 0:
+            children.setdefault(p, []).append(i)
+
+    paths: list[list[int]] = []
+    # Iterative DFS — bounded ``T`` (≤ a few hundred at realistic ``(W, D)``), trivially cheap.
+    stack: list[tuple[int, list[int]]] = [(0, [])]
+    while stack:
+        node, current = stack.pop()
+        kids = children.get(node, ())
+        if not kids:
+            if current:                                     # skip the empty root-only "path"
+                paths.append(current)
+            continue
+        # Push in reverse so the leftmost child is popped first → BFS-order traversal.
+        for c in reversed(kids):
+            stack.append((c, current + [int(tokens[c])]))
+    return paths
 
 
 def longest_accepted_path(
