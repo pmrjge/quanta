@@ -30,13 +30,15 @@ def _prefill(model: Qwen25ResidentModel, prompt_ids: mx.array, cache) -> mx.arra
     cfg = model.cfg
     T = prompt_ids.shape[-1]
     cs = cfg.dca_chunk_size if cfg.use_dca else 0
+    # ``last_only=True`` slices the residual to its last position before lm_head — at T=262144,
+    # the full ``[B, T, V]`` materialization is ~78 GB transient, vs ~300 KB for the last row.
     if cs <= 0 or T <= cs:
-        return model(prompt_ids, cache=cache)[:, -1, :]
+        return model(prompt_ids, cache=cache, last_only=True)[:, -1, :]
     last_row = None
     for start in range(0, T, cs):
         end = min(start + cs, T)
         chunk = prompt_ids[..., start:end]
-        last_row = model(chunk, cache=cache, offset=start)[:, -1, :]
+        last_row = model(chunk, cache=cache, offset=start, last_only=True)[:, -1, :]
         mx.eval(last_row)                                                       # bound peak memory
     return last_row
 

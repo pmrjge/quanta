@@ -30,12 +30,14 @@ class Qwen25Cache:
     * ``offset`` — current cached sequence length (consistent across layers).
     """
 
-    def __init__(self, cfg: Qwen25Config, *, quantized: bool = False, group_size: int = 64) -> None:
+    def __init__(self, cfg: Qwen25Config, *, quantized: bool = False, group_size: int = 64,
+                 bits: int = 8) -> None:
         self.cfg = cfg
         self.quantized = quantized
         self.group_size = group_size
+        self.bits = bits
         self.layers: list[KVCache] = [
-            KVCache(quantized=quantized, group_size=group_size)
+            KVCache(quantized=quantized, group_size=group_size, bits=bits)
             for _ in range(cfg.num_hidden_layers)
         ]
 
@@ -79,7 +81,8 @@ class Qwen25Cache:
         ``batch_size`` rows. MLX arrays are immutable so the replicated rows share storage with the
         source; a subsequent ``update`` on the replica creates new concatenated arrays per branch.
         """
-        new = Qwen25Cache(self.cfg, quantized=self.quantized, group_size=self.group_size)
+        new = Qwen25Cache(self.cfg, quantized=self.quantized, group_size=self.group_size,
+                          bits=self.bits)
         for i, c in enumerate(self.layers):
             r = new.layers[i]
             if not c.quantized:

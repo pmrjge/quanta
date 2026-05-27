@@ -39,21 +39,26 @@ class KVCache:
 
     Two storage modes (mirror :class:`quanta.qwen35.attention.KVCache`):
 
-    * ``quantized=False`` (default): bf16 verbatim — parity reference / short-context decode path.
-    * ``quantized=True``: per-token, per-group affine int8 over ``head_dim`` via
-      :mod:`quanta.cache_quant`. ``update`` dequantizes the full cache for the SDPA return so the
-      attention path is unchanged. Cuts steady-state cache memory ~half — at 1M context this is
-      the dominant memory cost (48 layers × 8 KV × 128 head_dim × 2 = 192 KB/token in bf16; ~96 KB
-      in int8).
+    * ``quantized=False``: bf16 verbatim — parity reference / short-context decode path.
+    * ``quantized=True`` (default for Qwen2.5-1M): per-token, per-group affine int-``bits`` over
+      ``head_dim`` via :mod:`quanta.cache_quant`. ``update`` dequantizes the full cache for the
+      SDPA return so the attention path is unchanged. ``bits`` is wired through to ``mx.quantize``
+      (MLX supports 2/3/4/6/8) — Qwen2.5 defaults to **int8 g64** (~8.5 bpp vs bf16's 16 bpp):
+      the smaller 7B variant (kv_heads=4, 28 layers) has less redundancy to absorb cache quant
+      noise — empirically int6 produces incoherent output on the 7B at short context, int8 works.
+      The 14B (kv_heads=8, 48 layers) tolerates int6 fine but we hold the 7B-safe default for the
+      whole family. 7B@1M int8: ~30 GB cache. 14B@1M int8: ~96 GB cache.
     """
 
-    def __init__(self, *, quantized: bool = False, group_size: int = 64) -> None:
+    def __init__(self, *, quantized: bool = False, group_size: int = 64,
+                 bits: int = 8) -> None:
         self.quantized = quantized
         self.group_size = group_size
+        self.bits = bits
         # bf16 mode
         self.k: mx.array | None = None
         self.v: mx.array | None = None
-        # int8 mode (codes + per-group scales/biases)
+        # int<bits> mode (codes + per-group scales/biases)
         self.k_q: mx.array | None = None
         self.k_s: mx.array | None = None
         self.k_b: mx.array | None = None
@@ -75,8 +80,8 @@ class KVCache:
                 self.k = mx.concatenate([self.k, k], axis=2)
                 self.v = mx.concatenate([self.v, v], axis=2)
             return self.k, self.v
-        k_qn, k_sn, k_bn = quantize_last_axis(k, self.group_size)
-        v_qn, v_sn, v_bn = quantize_last_axis(v, self.group_size)
+        k_qn, k_sn, k_bn = quantize_last_axis(k, self.group_size, bits=self.bits)
+        v_qn, v_sn, v_bn = quantize_last_axis(v, self.group_size, bits=self.bits)
         if self.k_q is None:
             self.k_q, self.k_s, self.k_b = k_qn, k_sn, k_bn
             self.v_q, self.v_s, self.v_b = v_qn, v_sn, v_bn
@@ -87,8 +92,10 @@ class KVCache:
             self.v_q = mx.concatenate([self.v_q, v_qn], axis=2)
             self.v_s = mx.concatenate([self.v_s, v_sn], axis=2)
             self.v_b = mx.concatenate([self.v_b, v_bn], axis=2)
-        k_full = dequantize_last_axis(self.k_q, self.k_s, self.k_b, self.group_size, dtype=k.dtype)
-        v_full = dequantize_last_axis(self.v_q, self.v_s, self.v_b, self.group_size, dtype=v.dtype)
+        k_full = dequantize_last_axis(self.k_q, self.k_s, self.k_b, self.group_size,
+                                       dtype=k.dtype, bits=self.bits)
+        v_full = dequantize_last_axis(self.v_q, self.v_s, self.v_b, self.group_size,
+                                       dtype=v.dtype, bits=self.bits)
         return k_full, v_full
 
 

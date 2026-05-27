@@ -1162,7 +1162,9 @@ class QuantaOmlxEngine(_OmlxBaseEngine):
                                        MiniMaxCache(self._runtime.num_layers, quantized=True))
         if mt.startswith("qwen3_5") or mt.startswith("qwen3.5"):  # hybrid cache needs cfg → use factory
             return _SingleTokenStepper(self._runtime, self._runtime.make_caches())
-        if mt == "qwen2" or mt.startswith("qwen2."):  # dense Qwen2.5-1M (DCA + intra-rotated K cache)
+        if mt == "qwen2" or mt.startswith("qwen2."):  # dense Qwen2.5-1M (DCA + int8 intra-K cache)
+            # ``make_caches()`` honors the runtime's ``quantized_kv`` default (True → int8 g64),
+            # the #122 inference policy — at 1M context cuts ~96 GB off the resident KV footprint.
             return _SingleTokenStepper(self._runtime, self._runtime.make_caches())
         if not mt and self._injected_runtime:
             # standalone / injected runtime with no artifact model_type (tests, embedding the engine

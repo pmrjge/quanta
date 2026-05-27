@@ -39,6 +39,7 @@ Runnable on a slice (``n_layers``) for bounded validation; the full call is the 
 
 from __future__ import annotations
 
+import shutil
 from pathlib import Path
 
 import mlx.core as mx
@@ -59,6 +60,30 @@ from quanta.qwen25.loader import (
 
 _ATTN_BITS = 8   # int8 affine for q/k/v/o (numerical headroom for 1M attention)
 _MLP_BITS = 4    # int4 affine for SwiGLU FFN (byte-budget dominator; bf16 source tolerates int4 g64)
+
+# Sidecar files copied verbatim from the source checkpoint so the artifact is self-contained
+# (rule: no external references). Tokenizer files are required for serve; generation_config /
+# sparse_attention_config / chat_template are optional but ship if present in the source.
+_SIDECAR_FILES = (
+    "tokenizer.json",                 # required: tokenizer state
+    "tokenizer_config.json",          # required: chat template + token policy
+    "vocab.json",                     # required: BPE vocab (Qwen2 convention)
+    "merges.txt",                     # required: BPE merges (Qwen2 convention)
+    "generation_config.json",         # recommended: sampling defaults + full eos set
+    "chat_template.jinja",            # optional: jinja override (Qwen3.x convention)
+    "sparse_attention_config.json",   # optional: Qwen2.5-1M MInference patterns (not yet consumed)
+)
+
+
+def _copy_sidecars(source: Path, dest: Path) -> list[str]:
+    """Copy every present sidecar from ``source`` to ``dest``; return the list copied."""
+    copied: list[str] = []
+    for name in _SIDECAR_FILES:
+        src = source / name
+        if src.is_file():
+            shutil.copy2(src, dest / name)
+            copied.append(name)
+    return copied
 
 
 def _write_quant(writer: ArtifactWriter, key: str, w: mx.array, bits: int, gs: int,
@@ -117,11 +142,15 @@ def bake_qwen25(
     Returns:
       Summary ``dict`` with per-kind tensor counts, layer count, and artifact byte size.
     """
-    cfg = Qwen25Config.from_pretrained(source)
-    ck = Qwen25SourceCheckpoint(source, cfg)
+    src_dir = Path(source)
+    cfg = Qwen25Config.from_pretrained(src_dir)
+    ck = Qwen25SourceCheckpoint(src_dir, cfg)
     n = cfg.num_hidden_layers if n_layers is None else n_layers
 
-    writer = ArtifactWriter(out_dir, Path(source) / "config.json")
+    writer = ArtifactWriter(out_dir, src_dir / "config.json")
+    # Self-contained artifact: tokenizer / generation_config / chat_template / sparse_attn config
+    # ride along so serve can load the bundle with no reference back to the source checkpoint.
+    sidecars = _copy_sidecars(src_dir, writer.dir)
 
     if include_head:
         writer.add_dense(EMBED_KEY, ck.embed())                 # token table → bf16 (logit-sensitive)
@@ -178,4 +207,5 @@ def bake_qwen25(
         "vocab_size": cfg.vocab_size,
         "hidden_size": cfg.hidden_size,
         "intermediate_size": cfg.intermediate_size,
+        "sidecars": sidecars,
     }

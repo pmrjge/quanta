@@ -16,7 +16,8 @@ share :class:`~quanta.qwen25.decode.Qwen25Cache`, the same RoPE/SDPA, and the sa
 
 API mirrors the other resident models in this repo so the oMLX shim wires it uniformly:
 
-* ``__init__(art_dir, *, packed=True, n_layers=None, quantized_kv=False)`` — load packed by default.
+* ``__init__(art_dir, *, packed=True, n_layers=None, quantized_kv=True, kv_bits=6)`` — packed
+  weights + int6 g64 KV (Qwen2.5-1M default; ~6.5 bpp, ~2.5× smaller than bf16 KV).
 * ``__call__(token_ids, *, cache=None, seq_hint=None)`` → ``[B, T, vocab]`` logits.
 * ``.cfg`` — :class:`~quanta.qwen25.config.Qwen25Config` (DCA fields, eos, vocab, …).
 * ``new_cache(quantized=…)`` — fresh :class:`~quanta.qwen25.decode.Qwen25Cache` per request.
@@ -248,14 +249,21 @@ class _PackedModel:
             mx.clear_cache()
 
     def __call__(self, token_ids: mx.array, *, caches=None, use_fast: bool = True,
-                 abs_pos_start: int | None = None) -> mx.array:
-        """Forward ``[B, T]`` token ids → ``[B, T, vocab]`` logits.
+                 abs_pos_start: int | None = None,
+                 last_only: bool = False) -> mx.array:
+        """Forward ``[B, T]`` token ids → ``[B, T, vocab]`` (or ``[B, 1, vocab]`` if ``last_only``).
 
         ``abs_pos_start`` is the absolute position of ``token_ids[..., 0]`` in the full sequence.
         Defaults to ``caches[0].offset`` (= where the new tokens land in the cache), but the caller
         can override for chunked DCA prefill — e.g. ``abs_pos_start = chunk_idx * chunk_size`` so the
         intra-chunk RoPE offset resets to 0 at each chunk boundary, even though ``cache.offset`` has
         grown to ``chunk_idx * chunk_size``.
+
+        ``last_only`` slices the residual stream to its **last position only** before the lm_head
+        matmul — essential for long-prompt chunked prefill: at T=262144 with vocab=152064, the full
+        ``[B, T, V]`` materialization is ~78 GB transient, vs ~300 KB for the last row alone. The
+        caller (generate-loop / chunked prefill) only ever needs the last position's logits during
+        prefill anyway, so this is purely a memory-safety win, not a semantic change.
 
         DCA is auto-engaged at decode (T=1) once ``abs_pos_start`` crosses into chunk 1+ — the cache
         already holds intra-rotated K from prior chunks (via this same code path), so the DCA
@@ -282,6 +290,8 @@ class _PackedModel:
             n = _rmsnorm(x, layer.post_norm, self.cfg.norm_eps)
             x = x + _packed_ffn(n, layer)
         x = _rmsnorm(x, self.final_norm, self.cfg.norm_eps)
+        if last_only:
+            x = x[:, -1:, :]                                                # [B, 1, H]
         head = self.embed if self.cfg.tie_word_embeddings else self.lm_head
         return x @ head.T
 
@@ -295,11 +305,12 @@ class Qwen25ResidentModel:
     """
 
     def __init__(self, art_dir: str | Path, *, packed: bool = True, n_layers: int | None = None,
-                 quantized_kv: bool = False, kv_group_size: int = 64) -> None:
+                 quantized_kv: bool = True, kv_group_size: int = 64, kv_bits: int = 8) -> None:
         self.art = Qwen25Artifact(art_dir)
         self.cfg: Qwen25Config = self.art.cfg
         self.quantized_kv = quantized_kv
         self.kv_group_size = kv_group_size
+        self.kv_bits = kv_bits
         self.packed = packed
 
         if packed:
@@ -321,12 +332,14 @@ class Qwen25ResidentModel:
         return self._model.n_layers
 
     def new_cache(self, *, quantized: bool | None = None,
-                  group_size: int | None = None) -> Qwen25Cache:
+                  group_size: int | None = None,
+                  bits: int | None = None) -> Qwen25Cache:
         """Allocate a fresh decode cache. Defaults follow the runtime's construction flags."""
         return Qwen25Cache(
             self.cfg,
             quantized=self.quantized_kv if quantized is None else quantized,
             group_size=self.kv_group_size if group_size is None else group_size,
+            bits=self.kv_bits if bits is None else bits,
         )
 
     # Alias for the oMLX shim's ``_SingleTokenStepper``, which calls ``runtime.make_caches()``
@@ -338,7 +351,8 @@ class Qwen25ResidentModel:
                  cache: Qwen25Cache | None = None,
                  caches: Qwen25Cache | list | None = None,
                  offset: int | None = None,
-                 use_fast: bool = True) -> mx.array:
+                 use_fast: bool = True,
+                 last_only: bool = False) -> mx.array:
         """Forward ``[B, T]`` token ids → ``[B, T, vocab]`` logits.
 
         Cache kwargs (accepts both forms — the oMLX ``_SingleTokenStepper`` passes ``caches=``):
@@ -379,4 +393,4 @@ class Qwen25ResidentModel:
             abs_pos_start = 0
 
         return self._model(token_ids, caches=cache_list, use_fast=use_fast,
-                            abs_pos_start=abs_pos_start)
+                            abs_pos_start=abs_pos_start, last_only=last_only)
