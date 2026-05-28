@@ -6,7 +6,11 @@ a ``(width, depth)`` MTP tree, enumerates ``W ** D`` root-to-leaf paths, chain-v
 cache + Mamba ``(ssm, conv)`` snapshot/restore between paths so every per-path forward sees a
 contiguous chain), and commits the longest-accepting path via a bounded replay. MODEL-FREE — a
 stub main model + stub MTP + stub cache; no checkpoint, no GPU, a few KB of tensors — safe along-
-side another large GPU-resident job.
+side another large GPU-resident job. The stub main model exposes BOTH the single-stream ``__call__``
+and the ``batch_step`` shared-offset verify surface, so the output-equivalence + stats subtests
+(1)–(4) run the DEFAULT ``batched=True`` verify (bit-identical to the sequential form, cross-checked
+in ``parity/nemotron_batched_tree_verify_test.py``); the per-path rollback subtest (5) pins
+``batched=False`` to assert the sequential cache-truncate pattern directly.
 
 Asserts:
   (1) Perfect-leftmost MTP (top-1 = main-greedy) at ``(W=2, D=2)`` and ``(W=4, D=2)``: spec output
@@ -16,10 +20,12 @@ Asserts:
       (verify-arbitrated losslessness), ``mean_accept == 1``.
   (3) ``width=1`` degenerates to chain and matches :func:`spec_generate_k` with ``k=depth``.
   (4) eos stops generation at the first emitted eos (inclusive), same as plain greedy.
-  (5) The decode cache's ``truncate`` is driven exactly as the per-path verify expects: every round
-      records ``W ** D`` per-path rollbacks (each dropping ``depth + 1`` tokens to round start) plus
-      one final at the replay (drops the replay's pre-offset). The total cache offset at the end
-      reflects only committed tokens.
+  (5) Under ``batched=False`` the decode cache's ``truncate`` is driven exactly as the per-path
+      verify expects: every round records ``W ** D`` per-path rollbacks (each dropping ``depth + 1``
+      tokens to round start); the commit-replay grows the cache rather than truncating, so there is
+      no final truncate, and the total cache offset at the end reflects only committed tokens. (The
+      default ``batched=True`` path replicates the prefix instead of rolling it back — zero truncates
+      on the original cache — gated separately in ``parity/nemotron_batched_tree_verify_test.py``.)
 
 The Mamba ``(ssm, conv)`` snapshot/restore pattern itself is not exercised by these model-free
 stubs — the stub model returns ``None`` for both — but the spec implementation USES the same
@@ -79,30 +85,51 @@ class _StubCache:
             self.truncations.append((self._len, length))
             self._len = length
 
+    def _copy(self) -> "_StubCache":
+        """Structural-sharing copy for :func:`quanta.nemotron.batched_runtime.replicate_state` — a
+        fresh cache at the same consumed length, independent of the original (a write on one does not
+        touch the other). Mirrors the ``_StubCache._copy`` in ``nemotron_batched_tree_verify_test``."""
+        new = _StubCache()
+        new._len = self._len
+        return new
+
 
 class _StubMainModel:
     """Deterministic stub of the resident Nemotron model: greedy(t) = t + STEP, with MTP-feature
-    capture. Honors the consumed contract ``(token_ids, *, caches, ssm, conv, offset, capture_layers)``
-    → ``(logits [1,T,vocab], {last: hidden [T,hidden]})``. ``ssm``/``conv`` are passed as None by
-    ``_capture_state`` (the stub has no Mamba state) — the snapshot/restore code paths in the spec
-    loop become no-ops for the stub, but the per-path KV rollback IS exercised."""
+    capture. Exposes BOTH spec contracts so :func:`spec_generate_tree` works on either flag:
+
+    * single-stream ``__call__(token_ids, *, caches, ssm, conv, offset, capture_layers)`` →
+      ``(logits [1,T,vocab], {last: hidden [T,hidden]})`` — drives the prefill, the commit-replay,
+      and the ``batched=False`` per-path verify;
+    * ``batch_step(tokens, *, replicas, offset, capture_layer)`` → ``(logits [B,1,vocab],
+      hidden [B,1,hidden] or None)`` — drives the default ``batched=True`` verify, mirroring
+      :meth:`quanta.nemotron.batched_runtime.NemotronBatchedResidentModel.batch_step` (shared offset
+      across replicas).
+
+    ``make_caches`` returns the Nemotron triple ``([cache], None, None)`` — the per-layer-list ``caches``
+    form :func:`quanta.nemotron.batched_runtime.replicate_state` requires — with ``ssm``/``conv`` left
+    ``None`` (the stub has no Mamba state), so the spec loop's snapshot/restore paths are no-ops while
+    the KV rollback (``batched=False``) and the batched replicate (``batched=True``) ARE exercised.
+    Folds the ``_StubMainModel`` + ``_NemotronStateAdapter`` pair from
+    ``parity/nemotron_batched_tree_verify_test.py`` into one class (no adapter needed here)."""
 
     def __init__(self) -> None:
         self.cfg = SimpleNamespace(num_hidden_layers=NL)
         self.num_layers = NL
-        self.calls: list[tuple[tuple[int, ...], int]] = []
+        self.calls: list[tuple[str, tuple[int, ...], int]] = []
         self.cache: _StubCache | None = None
 
-    def make_caches(self) -> _StubCache:
+    def make_caches(self) -> tuple[list, None, None]:
         self.cache = _StubCache()
-        return self.cache
+        return [self.cache], None, None
 
     def __call__(self, token_ids, *, caches=None, ssm=None, conv=None, offset=0, capture_layers=None):
         del ssm, conv                                     # stub has no Mamba state to thread
+        single = caches[0] if isinstance(caches, list) and caches else caches   # unwrap per-layer list
         ids = [int(x) for x in (token_ids.tolist() if isinstance(token_ids, mx.array) else token_ids)]
-        self.calls.append((tuple(ids), offset))
-        if caches is not None and hasattr(caches, "append"):
-            caches.append(len(ids))
+        self.calls.append(("call", tuple(ids), offset))
+        if single is not None and hasattr(single, "append"):
+            single.append(len(ids))
         t = len(ids)
         logits = mx.stack([_row(_greedy_next(tok)) for tok in ids])[None]    # [1,T,vocab]
         if not capture_layers:
@@ -110,6 +137,33 @@ class _StubMainModel:
         last = max(capture_layers)
         feat = mx.broadcast_to(mx.arange(t, dtype=mx.float32)[:, None], (t, HIDDEN))   # [T,hidden]
         return logits, {last: feat}
+
+    def batch_step(self, tokens, *, replicas, offset, capture_layer=None):
+        """Shared-offset batched verify step → ``(logits [B,1,vocab], hidden [B,1,hidden] or None)``.
+
+        Mirrors :meth:`NemotronBatchedResidentModel.batch_step`: every replica's per-layer KV must sit
+        at the shared ``offset`` (rule 6 / no silent drift), each advances one token, and the logits are
+        the same deterministic ``greedy(t) = t + STEP`` as ``__call__`` — so the batched verify is
+        bit-identical to the single-stream path. ``capture_layer`` is always set by ``batch_verify``,
+        so the captured hidden is never ``None`` on the spec hot path."""
+        b = len(tokens)
+        if len(replicas) != b:
+            raise ValueError(f"batch_step len mismatch: replicas={len(replicas)} tokens={b}")
+        for s, (caches_s, _ssm_s, _conv_s) in enumerate(replicas):
+            for c in (caches_s or []):                    # per-layer KV list (None on non-attn layers)
+                if c is not None and c.offset != offset:
+                    raise ValueError(f"batch_step replicas[{s}] offset={c.offset} != {offset}")
+        self.calls.append(("batch_step", tuple(int(t) for t in tokens), offset))
+        for caches_s, _ssm_s, _conv_s in replicas:
+            for c in (caches_s or []):
+                if c is not None and hasattr(c, "append"):
+                    c.append(1)
+        rows = mx.stack([_row(_greedy_next(int(t))) for t in tokens])           # [B, vocab]
+        logits = rows[:, None]                                                  # [B,1,vocab]
+        if capture_layer is None:
+            return logits, None
+        feat = mx.broadcast_to(mx.array(0.0, dtype=mx.float32), (b, 1, HIDDEN))  # [B,1,hidden]
+        return logits, feat
 
 
 def _dummy_hidden() -> mx.array:
@@ -178,7 +232,7 @@ def _greedy_reference(prompt: list[int], max_new: int, eos_id) -> list[int]:
             else ({int(eos_id)} if isinstance(eos_id, int)
                   else {int(s) for s in eos_id}))
     model = _StubMainModel()
-    caches = model.make_caches()
+    caches, _ssm, _conv = model.make_caches()       # ([cache], None, None) — pass the per-layer list
     logits = model(mx.array(prompt), caches=caches, offset=0)
     cur = int(mx.argmax(logits[0, -1]).item())
     out = [cur]
@@ -266,13 +320,16 @@ def test_eos_stops() -> None:
 
 
 def test_truncate_pattern() -> None:
-    """Per-path rollback pattern: every round records ``W ** D`` truncates (each dropping
-    ``depth + 1`` tokens to round start). No final commit-truncate (the replay grows the cache;
-    it does not truncate). The cache offset at the end reflects only committed tokens."""
+    """Per-path rollback pattern (``batched=False``): every round records ``W ** D`` truncates (each
+    dropping ``depth + 1`` tokens to round start). No final commit-truncate (the replay grows the
+    cache; it does not truncate). The cache offset at the end reflects only committed tokens. Pinned
+    to the sequential path on purpose — the default ``batched=True`` verify replicates the prefix
+    instead of rolling the original cache back (zero truncates on the original; that invariant is
+    gated in ``parity/nemotron_batched_tree_verify_test.py::test_cache_invariance_after_batched``)."""
     prompt = [2, 5, 7]
     model = _StubMainModel()
     spec, st = spec_generate_tree(model, _PerfectLeftmostMTP(2), EMBED, HEAD, prompt,
-                                  width=2, depth=2, max_new=MAXN, eos_id=None)
+                                  width=2, depth=2, max_new=MAXN, eos_id=None, batched=False)
     paths_per_round = st["paths_per_round"]
     rounds = st["rounds"]
     cache = model.cache
