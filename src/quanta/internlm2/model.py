@@ -31,6 +31,16 @@ from quanta.internlm2.attention import InternLM2Attention, KVCache
 from quanta.internlm2.config import InternLM2Config
 
 
+def _stack_decode_tokens(stream_tokens: list) -> mx.array:
+    """Stack ``B`` per-stream single decode tokens (``int`` / ``[1]`` / ``[1,1]`` mx.array) → ``[B, 1]``
+    int ids. Used by the batched-decode path (one new token per stream per step)."""
+    rows = []
+    for tok in stream_tokens:
+        a = tok if isinstance(tok, mx.array) else mx.array([int(tok)])
+        rows.append(int(a.reshape(-1)[0].item()))
+    return mx.array(rows, dtype=mx.int32)[:, None]
+
+
 class _SwiGLU(nn.Module):
     """InternLM2 SwiGLU FFN: ``w2(silu(w1(x)) * w3(x))`` — w1=gate, w3=up, w2=down. No bias."""
 
@@ -129,6 +139,49 @@ class InternLM2Model(nn.Module):
         if last_only:
             x = x[:, -1:, :]
         if self.cfg.tie_word_embeddings:
+            return x @ self.tok_embeddings.weight.T
+        return self.output(x)
+
+    def decode_batched(self, stream_tokens: list, caches: list, offsets: list[int]) -> mx.array:
+        """One batched decode step across ``B`` streams (Approach-1 vectorized attention).
+
+        Replaces the per-stream ``step_batch`` loop: ``stream_tokens[b]`` is stream ``b``'s single new
+        token (``int`` / ``[1]`` / ``[1,1]``), ``caches[b]`` its per-layer ``[KVCache]*n_layers`` list,
+        ``offsets[b]`` the new token's absolute position. Projections, FFN and the output head batch
+        over ``B`` trivially (per-token ops); the only per-stream work is the **bounded** KV-cache
+        update (bookkeeping, not compute) feeding one fused :func:`batched_decode_attention`. Returns
+        ``[B, 1, vocab]`` — equal to looping :meth:`__call__` per stream up to RoPE/SDPA tiling ULPs.
+        """
+        from quanta.modeling.batched_attention import batched_decode_attention
+
+        from quanta.internlm2.attention import batched_rope_fast
+
+        cfg = self.cfg
+        ids = _stack_decode_tokens(stream_tokens)                    # [B, 1] int
+        b = int(ids.shape[0])
+        clists = [c if isinstance(c, list) else c.as_list() for c in caches]
+        bases = [cfg.ntk_base(int(o) + 1) for o in offsets]
+        x = self.tok_embeddings(ids)                                 # [B, 1, H]
+        for i, layer in enumerate(self.layers):
+            att = layer.attention
+            n = layer.attention_norm(x)
+            q = mx.transpose(att.wq(n).reshape(b, 1, att.nh, att.hd), (0, 2, 1, 3))   # [B,H,1,D]
+            k = mx.transpose(att.wk(n).reshape(b, 1, att.nkv, att.hd), (0, 2, 1, 3))  # [B,nkv,1,D]
+            v = mx.transpose(att.wv(n).reshape(b, 1, att.nkv, att.hd), (0, 2, 1, 3))
+            q = batched_rope_fast(q, offsets, bases)
+            k = batched_rope_fast(k, offsets, bases)
+            qs, ks, vs = [], [], []
+            for s in range(b):                                       # bounded stream loop (cache I/O)
+                kf, vf = clists[s][i].update(k[s:s + 1], v[s:s + 1])  # [1, nkv, L_s, D]
+                qs.append(q[s])
+                ks.append(kf)
+                vs.append(vf)
+            out = batched_decode_attention(qs, ks, vs, scale=att.scale, n_rep=att.rep)  # [B,H,1,D]
+            out = mx.transpose(out, (0, 2, 1, 3)).reshape(b, 1, att.nh * att.hd)
+            x = x + att.wo(out)
+            x = x + layer.feed_forward(layer.ffn_norm(x))
+        x = self.norm(x)
+        if cfg.tie_word_embeddings:
             return x @ self.tok_embeddings.weight.T
         return self.output(x)
 

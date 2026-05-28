@@ -265,6 +265,51 @@ class _PackedModel:
         head = self.embed if self.cfg.tie_word_embeddings else self.lm_head
         return x @ head.T
 
+    def decode_batched(self, stream_tokens: list, caches: list, offsets: list[int]) -> mx.array:
+        """One batched decode step across ``B`` streams over packed weights (Approach-1 attention).
+
+        The packed analogue of :meth:`InternLM2Model.decode_batched`: ``stream_tokens[b]`` is stream
+        ``b``'s new token, ``caches[b]`` its per-layer cache list, ``offsets[b]`` the abs position. All
+        ``_qmm`` projections / FFN / output head batch over ``B``; the only per-stream work is the
+        bounded KV-cache update feeding one fused :func:`batched_decode_attention`. Returns
+        ``[B, 1, vocab]`` — the batched equivalent of looping :meth:`__call__` per stream.
+        """
+        from quanta.modeling.batched_attention import batched_decode_attention
+
+        from quanta.internlm2.attention import batched_rope_fast
+        from quanta.internlm2.model import _stack_decode_tokens
+
+        cfg = self.cfg
+        ids = _stack_decode_tokens(stream_tokens)                       # [B, 1] int
+        b = int(ids.shape[0])
+        clists = [c if isinstance(c, list) else c.as_list() for c in caches]
+        bases = [cfg.ntk_base(int(o) + 1) for o in offsets]
+        x = mx.take(self.embed, ids, axis=0)                            # [B, 1, H]
+        for i, layer in enumerate(self.layers):
+            n = _rmsnorm(x, layer.attn_norm, cfg.norm_eps)
+            q = _qmm(n, layer.q_packed, layer.q_scale, layer.q_wbias, layer.attn_bits, layer.attn_gs)
+            k = _qmm(n, layer.k_packed, layer.k_scale, layer.k_wbias, layer.attn_bits, layer.attn_gs)
+            v = _qmm(n, layer.v_packed, layer.v_scale, layer.v_wbias, layer.attn_bits, layer.attn_gs)
+            q = mx.transpose(q.reshape(b, 1, cfg.num_attention_heads, cfg.head_dim), (0, 2, 1, 3))
+            k = mx.transpose(k.reshape(b, 1, cfg.num_key_value_heads, cfg.head_dim), (0, 2, 1, 3))
+            v = mx.transpose(v.reshape(b, 1, cfg.num_key_value_heads, cfg.head_dim), (0, 2, 1, 3))
+            q = batched_rope_fast(q, offsets, bases)
+            k = batched_rope_fast(k, offsets, bases)
+            qs, ks, vs = [], [], []
+            for s in range(b):                                          # bounded stream loop (cache I/O)
+                kf, vf = clists[s][i].update(k[s:s + 1], v[s:s + 1])     # [1, nkv, L_s, D]
+                qs.append(q[s])
+                ks.append(kf)
+                vs.append(vf)
+            out = batched_decode_attention(qs, ks, vs, scale=cfg.attn_scale, n_rep=cfg.n_rep)
+            out = mx.transpose(out, (0, 2, 1, 3)).reshape(b, 1, cfg.q_dim)
+            x = x + _qmm(out, layer.o_packed, layer.o_scale, layer.o_wbias, layer.attn_bits, layer.attn_gs)
+            n = _rmsnorm(x, layer.ffn_norm, cfg.norm_eps)
+            x = x + _packed_ffn(n, layer)
+        x = _rmsnorm(x, self.final_norm, cfg.norm_eps)
+        head = self.embed if cfg.tie_word_embeddings else self.lm_head
+        return x @ head.T
+
 
 class InternLM2ResidentModel:
     """Bf16-resident or packed-resident InternLM2.5-7B-Chat-1M, loaded from a baked quanta artifact.
@@ -370,3 +415,14 @@ class InternLM2ResidentModel:
         # bf16 reference path
         return self._model(token_ids, caches=cache_list, use_fast=True,
                             abs_pos_start=abs_pos_start, last_only=last_only)
+
+    def decode_batched(self, stream_tokens: list, caches: list, offsets: list[int]) -> mx.array:
+        """Batched single-step decode across ``B`` streams → ``[B, 1, vocab]`` (Approach-1 attention).
+
+        Delegates to the active inner forward's ``decode_batched`` (``_PackedModel`` in prod, the bf16
+        :class:`~quanta.internlm2.model.InternLM2Model` under ``packed=False``). ``stream_tokens[b]`` is
+        stream ``b``'s new token, ``caches[b]`` its per-layer cache list (or an
+        :class:`~quanta.internlm2.decode.InternLM2Cache`), ``offsets[b]`` the abs position. The batched
+        equivalent of calling :meth:`__call__` once per stream — the win is one fused SDPA + one batched
+        matmul per layer instead of ``B`` looped ones."""
+        return self._model.decode_batched(stream_tokens, caches, offsets)

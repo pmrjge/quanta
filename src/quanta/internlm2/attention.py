@@ -134,6 +134,30 @@ def _rope_explicit(x: mx.array, base: float, offset: int) -> mx.array:
     return x * cos + rotated * sin
 
 
+def batched_rope_fast(x: mx.array, offsets: list[int], bases: list[float]) -> mx.array:
+    """Per-stream RoPE for ``B`` decode streams at **heterogeneous** absolute positions — bit-identical
+    to the looped single-stream :func:`_rope_fast`.
+
+    ``x`` ``[B, H, T, D]`` (decode ⇒ ``T == 1``); ``offsets[b]`` is the absolute position of
+    ``x[b, :, 0]`` for stream ``b`` and ``bases[b]`` its dynamic-NTK base (``cfg.ntk_base(seq_len_b)``,
+    per-stream because streams sit at different lengths). :func:`mx.fast.rope` takes a *scalar*
+    ``offset``/``base``, so the heterogeneous-offset batch is applied stream-by-stream over the
+    **bounded** stream axis (``B ≤ max_batch`` — a coarse IO-level loop, rule 3; never over
+    tokens/heads/hidden) and concatenated back to ``[B, H, T, D]``.
+
+    Critically this calls the SAME ``mx.fast.rope`` kernel the per-stream decode reference
+    (:func:`_rope_fast`) uses, so the batched decode path is **bit-exact** with the loop at every dtype.
+    A hand-rolled fp32-then-cast rotate-half form (the obvious "vectorized" shortcut) matches in fp32 but
+    its bf16 ULP drift on large-magnitude q **compounds across 32 layers and flips greedy tokens** on the
+    real model — caught by ``parity/internlm2_batched_bench`` (model-free gates with tiny random init and
+    ≤2 layers do not surface it).
+    """
+    rotated = [mx.fast.rope(x[s:s + 1], dims=x.shape[-1], traditional=False,
+                            base=float(bases[s]), scale=1.0, offset=int(offsets[s]))
+               for s in range(x.shape[0])]                                # B × [1, H, T, D]
+    return mx.concatenate(rotated, axis=0)                                # [B, H, T, D]
+
+
 def _causal_mask(q_len: int, kv_len: int, dtype: mx.Dtype) -> mx.array:
     """Lower-right causal additive mask (query j at abs pos kv_len-q_len+j)."""
     off = kv_len - q_len

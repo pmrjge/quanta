@@ -69,6 +69,7 @@ class InternLM2BatchedResidentModel:
             raise ValueError(f"max_batch must be positive, got {max_batch}")
         self.max_batch = int(max_batch)
         self._inner = InternLM2ResidentModel(art_dir, n_layers=n_layers)
+        self._fused = True  # default to the batched-attention decode path (Approach-1); see step_batch
 
     @classmethod
     def from_inner(cls, inner: Any, *, max_batch: int = 32) -> "InternLM2BatchedResidentModel":
@@ -80,6 +81,7 @@ class InternLM2BatchedResidentModel:
         self = cls.__new__(cls)
         self.max_batch = int(max_batch)
         self._inner = inner
+        self._fused = True
         return self
 
     # --- shared-weight surface -------------------------------------------------
@@ -101,16 +103,27 @@ class InternLM2BatchedResidentModel:
         logits (``last_only`` — the only row the sampler needs; memory-safe at long prompts)."""
         return self._inner(prompt_ids, cache=cache, last_only=True)
 
+    @staticmethod
+    def _cache_offset(cache: Any) -> int:
+        """A stream cache's absolute decode position — paged ``[view,…]`` list or a single InternLM2Cache."""
+        return cache[0].offset if isinstance(cache, list) else cache.offset
+
     def step_batch(self, stream_token_ids: list[mx.array], stream_caches: list[Any],
                    offsets: list[int] | None = None) -> list[mx.array]:
-        """One decode step across ``B = len(stream_token_ids)`` active streams (dense — bounded per-stream
-        loop over the shared resident weights; rule-3 coarse stream boundary, not a token/hidden loop).
+        """One decode step across ``B = len(stream_token_ids)`` active streams.
+
+        Default path (``self._fused``): a single **batched** forward via
+        :meth:`InternLM2ResidentModel.decode_batched` — one fused SDPA + one batched matmul per layer
+        across all ``B`` streams (Approach-1; the routed per-token work amortizes over ``B``), instead of
+        ``B`` separate single-stream forwards. Engages only for plain single-token decode (every
+        ``T_b == 1``); a multi-token tail replay (``T_b > 1``) falls back to the per-stream reference loop
+        :meth:`_step_batch_looped`, which is also the parity baseline ``decode_batched`` is gated against
+        (``parity/internlm2_batched_attention_test``).
 
         ``stream_token_ids[b]``: ``[T_b]`` mx.array (``T_b == 1`` for decode). ``stream_caches[b]``: the
         per-stream cache — an :class:`InternLM2Cache` (unpaged) OR the list of
-        :class:`~quanta.paged.PagedKVCacheView` from :meth:`make_paged_state` (paged); the inner
-        ``__call__`` accepts both via its ``caches=`` kwarg. ``offsets``: explicit abs position of each
-        new token (the paged step passes these); ``None`` ⇒ each cache's own ``offset`` is authoritative.
+        :class:`~quanta.paged.PagedKVCacheView` from :meth:`make_paged_state` (paged). ``offsets``: explicit
+        abs position of each new token (paged step passes these); ``None`` ⇒ each cache's own ``offset``.
         Returns ``[1, T_b, vocab]`` per stream."""
         b = len(stream_token_ids)
         if b == 0:
@@ -121,10 +134,23 @@ class InternLM2BatchedResidentModel:
             raise ValueError(f"stream_caches length {len(stream_caches)} != B={b}")
         if offsets is not None and len(offsets) != b:
             raise ValueError(f"offsets length {len(offsets)} != B={b}")
+        if offsets is None:
+            offsets = [self._cache_offset(c) for c in stream_caches]
+
+        single = all(int(t.reshape(-1).shape[0]) == 1 for t in stream_token_ids)
+        if self._fused and single and hasattr(self._inner, "decode_batched"):
+            logits = self._inner.decode_batched(stream_token_ids, stream_caches, offsets)  # [B,1,vocab]
+            return [logits[s:s + 1] for s in range(b)]
+        return self._step_batch_looped(stream_token_ids, stream_caches, offsets)
+
+    def _step_batch_looped(self, stream_token_ids: list[mx.array], stream_caches: list[Any],
+                           offsets: list[int]) -> list[mx.array]:
+        """Per-stream decode reference (pre-Approach-1 path): ``B`` independent single-stream forwards.
+        Retained as the parity baseline for the fused :meth:`step_batch` default and the multi-token
+        tail-replay fallback."""
         outs: list[mx.array] = []
-        for s in range(b):
-            off = offsets[s] if offsets is not None else None
-            outs.append(self._inner(stream_token_ids[s], caches=stream_caches[s], offset=off))
+        for s in range(len(stream_token_ids)):
+            outs.append(self._inner(stream_token_ids[s], caches=stream_caches[s], offset=offsets[s]))
         return outs
 
     # --- #152 paged contract ---------------------------------------------------
