@@ -41,11 +41,27 @@ from pathlib import Path
 
 import mlx.core as mx
 
+from quanta.cache_quant import BITS
 from quanta.dsv4.attention import _rms_w
 from quanta.dsv4.decode import DSV4Cache, decode_step_compressed, decode_step_dense
 from quanta.dsv4.hyper import hc_expand, hc_post, hc_pre
 from quanta.dsv4.moe import dsv4_moe
 from quanta.dsv4.runtime import DSV4ResidentModel
+
+
+def _latent_quant(head_dim: int, *, group_size: int = 128, quantized: bool = True) -> tuple[int, bool]:
+    """The ``(group_size, quantized)`` the DSV4 latent KV settles on for ``head_dim`` — mirrors
+    :meth:`quanta.dsv4.decode._LayerCache._resolve_quant` so the shared paged manager is bit-identical
+    to the discrete cache (rule 6: a width/grouping mismatch would silently mis-decode the prefix).
+    Real DSV4 head_dim=128 ⇒ ``(128, True)``; tiny test head_dims fall back exactly as the cache does."""
+    if not quantized:
+        return group_size, False
+    if group_size in (32, 64, 128) and head_dim % group_size == 0:
+        return group_size, True
+    for g in (128, 64, 32):
+        if g <= head_dim and head_dim % g == 0:
+            return g, True
+    return group_size, False               # head_dim too small / odd -> latent stays bf16
 
 
 class DSV4BatchedResidentModel:
@@ -65,6 +81,13 @@ class DSV4BatchedResidentModel:
     ``self.mtp_params`` so callers can drive a spec-decode loop alongside the batched main forward;
     the batched runtime itself does not consume the MTP head.
     """
+
+    # #152/#175 paged contract: DSV4 is pure attention (no global recurrence), but its compressed-KV /
+    # indexer-KV / raw-hidden ring ARE derived boundary state that the compressor pools from RAW hidden
+    # (not the latent KV), so they can't be recomputed from the shared latent — they're content-
+    # addressed at block boundaries via RecurrentPrefixCache. ``has_recurrent_state=True`` tells the
+    # session (quanta.shim.omlx._BaseBatchedSession) to lookup_at/store_at these boundary snapshots.
+    has_recurrent_state = True
 
     def __init__(
         self,
@@ -143,6 +166,69 @@ class DSV4BatchedResidentModel:
         if ids.shape[0] == 0:
             raise ValueError("prefill: empty prompt_ids (need >= 1 token to seed the cache)")
         return self._inner(ids, caches=cache, offset=0)
+
+    # --- #152/#175 paged contract (driven by quanta.shim.omlx._BaseBatchedSession paged mode) -------
+    @property
+    def paged_kv_spec(self) -> dict:
+        """Shape/codec the shared :class:`~quanta.paged.PagedKVCacheManager` must use to be bit-exact
+        with the discrete latent KV stream — threaded from the config, never hardcoded (rule 6). Every
+        DSV4 layer is attention (one latent KV head each), so ``n_layers == num_layers``;
+        ``single_stream=True`` selects the one-latent-per-token codec (DSV4's MQA latent, not a k/v
+        pair)."""
+        gs, q = _latent_quant(self.cfg.head_dim)
+        return {"n_layers": self.num_layers, "group_size": gs, "bits": BITS,
+                "quantized": q, "single_stream": True}
+
+    def make_paged_state(self, manager, seq):
+        """A per-stream paged :class:`~quanta.dsv4.decode.DSV4Cache`: every layer's latent KV is a
+        :class:`~quanta.paged.PagedLatentCacheView` into the shared ``manager`` (prefix blocks dedup),
+        while the derived ckv/ikv/ring stay per-stream (restored from a boundary snapshot in
+        :meth:`prefill_paged`)."""
+        from quanta.dsv4.decode import paged_cache
+        gs, q = _latent_quant(self.cfg.head_dim)
+        return paged_cache(manager, seq, self.num_layers, quantized=q, group_size=gs)
+
+    def prefill_paged(self, suffix_ids, state, *, offset: int, recurrent_in,
+                      block_size: int) -> tuple[mx.array, list[tuple[int, list]]]:
+        """Prefill ONLY the uncached suffix into ``state`` (a paged :class:`DSV4Cache` whose latent
+        slots are paged views over the resident prefix blocks), after restoring the derived
+        compressed-KV / indexer-KV / raw-hidden ring from ``recurrent_in`` (the boundary snapshot after
+        the shared prefix; ``None`` ⇒ fresh / ``offset == 0``).
+
+        Split in two at the deepest full-block boundary so the derived state THERE can be snapshotted
+        for future reuse: part 1 ``[offset, deepest)`` then the partial tail ``[deepest, end)`` — each
+        run is the parity-correct single-stream decode loop (:meth:`DSV4ResidentModel.__call__` with
+        ``caches=``), which appends latent to the paged views and pools the derived streams seeded by
+        the restored ring (the boundary-straddling window reads the prefix tail the ring carries).
+        Returns ``(last-position logits, [(deepest, derived_snapshot)])`` — the boundary list is empty
+        when the suffix adds no new full block. Bit-identical to a from-scratch full prefill + the KV
+        reuse is exact — gated model-free in ``parity/dsv4_paged_latent_test.py``."""
+        from quanta.dsv4.decode import restore_derived, snapshot_derived
+        if recurrent_in is not None:
+            restore_derived(state, recurrent_in)        # seed ckv/ikv/ring (rule 4: == continuous)
+        ids = suffix_ids if isinstance(suffix_ids, mx.array) else mx.array(suffix_ids)
+        ids = ids.reshape(-1)
+        total = int(ids.shape[0])
+        if total == 0:
+            raise ValueError("prefill_paged: empty suffix (admit must leave >=1 token to recompute)")
+        end = offset + total
+        deepest = (end // block_size) * block_size      # deepest full-block boundary <= end
+        new_boundaries: list[tuple[int, list]] = []
+        if deepest > offset:
+            n1 = deepest - offset
+            logits = self._inner(ids[:n1], caches=state, offset=offset)
+            new_boundaries.append((deepest, snapshot_derived(state)))   # derived AFTER prefix+full blocks
+            if end > deepest:
+                logits = self._inner(ids[n1:], caches=state, offset=deepest)
+        else:
+            logits = self._inner(ids, caches=state, offset=offset)
+        return logits, new_boundaries
+
+    def get_recurrent_state(self, state) -> list:
+        """Snapshot the live derived (compressed-KV / indexer-KV / ring) state for a decode-crossed
+        block boundary — the per-layer list :class:`~quanta.paged.RecurrentPrefixCache` stores."""
+        from quanta.dsv4.decode import snapshot_derived
+        return snapshot_derived(state)
 
     # --- per-layer batched decode block ---------------------------------------
     def _attn_per_stream(

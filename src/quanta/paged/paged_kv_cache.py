@@ -42,6 +42,10 @@ from quanta.paged.block_pool import BlockAllocator, CacheBlock, compute_block_ha
 
 _QUANT_COMPS = ("k_q", "k_s", "k_b", "v_q", "v_s", "v_b")
 _BF16_COMPS = ("k", "v")
+# single-stream (one latent KV per token, MQA — DSV4's compressed latent). Same block machinery,
+# one logical stream instead of a k/v pair (#175): half the components, half the bytes of a k/v pair.
+_SINGLE_QUANT_COMPS = ("kv_q", "kv_s", "kv_b")
+_SINGLE_BF16_COMPS = ("kv",)
 
 
 @dataclass
@@ -98,7 +102,7 @@ class PagedKVCacheManager:
 
     def __init__(self, *, num_layers: int, block_size: int = 32, max_blocks: int = 4096,
                  group_size: int = 128, bits: int = BITS, quantized: bool = True,
-                 model_name: str = "") -> None:
+                 model_name: str = "", single_stream: bool = False) -> None:
         if num_layers < 1:
             raise ValueError(f"num_layers {num_layers} < 1")
         if block_size < 1:
@@ -110,7 +114,13 @@ class PagedKVCacheManager:
         self.bits = bits
         self.quantized = quantized
         self.model_name = model_name
-        self._comps = _QUANT_COMPS if quantized else _BF16_COMPS
+        # ``single_stream`` selects DSV4's one-latent-per-token codec (``write_one``/``gather_one``/
+        # ``view_one``) over the k/v pair codec; the block pool / hashing / COW / LRU are identical.
+        self.single_stream = single_stream
+        if single_stream:
+            self._comps = _SINGLE_QUANT_COMPS if quantized else _SINGLE_BF16_COMPS
+        else:
+            self._comps = _QUANT_COMPS if quantized else _BF16_COMPS
         self._allocs = [BlockAllocator(max_blocks) for _ in range(num_layers)]
         # per layer: {component_name: pooled tensor [max_blocks, block_size, *per_token_shape]} —
         # lazily allocated on first write so dtypes/shapes match mx.quantize exactly.
@@ -224,6 +234,18 @@ class PagedKVCacheManager:
         # [1, n_kv, T, C] -> [T, n_kv, C]
         return {name: arr[0].transpose(1, 0, 2) for name, arr in raw.items()}
 
+    def _encode_one(self, kv: mx.array) -> dict[str, mx.array]:
+        """Quantize (or pass through) a single latent stream ``[1, T, head_dim]`` -> token-major
+        ``[T, head_dim]`` per component (the single-stream sibling of :meth:`_encode`)."""
+        if kv.shape[0] != 1:
+            raise ValueError(f"paged latent is per-sequence: expected batch 1, got {kv.shape[0]}")
+        if self.quantized:
+            q, s, b = quantize_last_axis(kv, self.group_size, self.bits)
+            raw = {"kv_q": q, "kv_s": s, "kv_b": b}
+        else:
+            raw = {"kv": kv}
+        return {name: arr[0] for name, arr in raw.items()}             # [1, T, C] -> [T, C]
+
     def _cow(self, layer: int, block_table: list[CacheBlock], bi: int) -> CacheBlock:
         alloc = self._allocs[layer]
         src = block_table[bi]
@@ -246,18 +268,37 @@ class PagedKVCacheManager:
         boundaries → multiple sub-range writes per advance); successive writes advance the cursor.
         Allocates fresh blocks as the stream crosses block boundaries and clones a shared partial tail
         block (COW) before mutating it."""
-        start = seq.n_written[layer]
         n_write = int(k.shape[2])
         if n_write == 0:
             return
         if v.shape[2] != n_write:
             raise ValueError(f"paged write layer {layer}: k has {n_write} tokens, v has {v.shape[2]}")
+        self._write_encoded(seq, layer, self._encode(k, v), n_write)
+
+    def write_one(self, seq: SeqHandle, layer: int, kv: mx.array) -> None:
+        """Single-stream append (DSV4 latent): ``kv`` is ``[1, T, head_dim]`` (one latent per token,
+        no k/v pair). Same write cursor / block-crossing / COW semantics as :meth:`write` — just the
+        single-stream codec. Allowed only on a ``single_stream=True`` manager (rule 6, loud)."""
+        if not self.single_stream:
+            raise RuntimeError("write_one requires a single_stream=True manager; use write() for k/v")
+        n_write = int(kv.shape[1])
+        if n_write == 0:
+            return
+        self._write_encoded(seq, layer, self._encode_one(kv), n_write)
+
+    def _write_encoded(self, seq: SeqHandle, layer: int, encoded: dict[str, mx.array],
+                       n_write: int) -> None:
+        """Scatter ``n_write`` pre-encoded token-major records (a component dict) into ``layer``'s
+        blocks from the write cursor — the shared body of :meth:`write` (k/v) and :meth:`write_one`
+        (single latent stream). Allocates / COW-clones blocks exactly as the public writers document."""
+        if n_write == 0:
+            return
+        start = seq.n_written[layer]
         end = start + n_write
         if end > seq.length:
             raise ValueError(
                 f"paged write layer {layer}: writing to {end} exceeds advanced length {seq.length} "
                 f"(call advance() to open the positions first)")
-        encoded = self._encode(k, v)
         pools = self._ensure_pools(layer, encoded, ())
         block_table = seq.block_tables[layer]
         alloc = self._allocs[layer]
@@ -327,6 +368,27 @@ class PagedKVCacheManager:
             return k, v
         return gathered["k"].astype(mx.bfloat16), gathered["v"].astype(mx.bfloat16)
 
+    def gather_one(self, seq: SeqHandle, layer: int) -> mx.array:
+        """Materialize the ``[1, n_written, head_dim]`` bf16 latent stream (single-stream sibling of
+        :meth:`gather`) — one vectorized ``mx.take`` over the sequence's block ids, sliced to this
+        layer's written extent. The reused prefix blocks + freshly-written suffix dequantize to a
+        stream **bit-identical** to the discrete :class:`quanta.dsv4.decode._LayerCache.kv`."""
+        pools = self._pools[layer]
+        n = seq.n_written[layer]
+        if pools is None or n == 0:
+            raise RuntimeError(f"paged gather_one layer {layer}: nothing written")
+        ids = mx.array([blk.block_id for blk in seq.block_tables[layer]], dtype=mx.uint32)
+        gathered: dict[str, mx.array] = {}
+        for name, pool in pools.items():
+            g = mx.take(pool, ids, axis=0)                      # [nb, block_size, C]
+            nb = g.shape[0]
+            g = g.reshape(nb * self.block_size, *g.shape[2:])   # [nb*block_size, C]
+            gathered[name] = g[:n][None]                        # [1, n_written, C]
+        if self.quantized:
+            return dequantize_last_axis(gathered["kv_q"], gathered["kv_s"], gathered["kv_b"],
+                                        self.group_size, dtype=mx.bfloat16, bits=self.bits)
+        return gathered["kv"].astype(mx.bfloat16)
+
     def truncate(self, seq: SeqHandle, length: int) -> None:
         """Roll the whole sequence back to ``length`` tokens (drop trailing blocks). Block-granular;
         a tail that lands mid-block keeps that block and just lowers its ``token_count`` (the stale
@@ -348,7 +410,14 @@ class PagedKVCacheManager:
 
     # --- stats ---------------------------------------------------------------
     def view(self, seq: SeqHandle, layer: int) -> "PagedKVCacheView":
+        if self.single_stream:
+            raise RuntimeError("view() is the k/v adapter; this manager is single_stream — use view_one()")
         return PagedKVCacheView(self, seq, layer)
+
+    def view_one(self, seq: SeqHandle, layer: int) -> "PagedLatentCacheView":
+        if not self.single_stream:
+            raise RuntimeError("view_one() needs a single_stream=True manager (DSV4 latent); use view()")
+        return PagedLatentCacheView(self, seq, layer)
 
     def get_stats(self) -> PagedCacheStats:
         live = cached = 0
@@ -388,3 +457,36 @@ class PagedKVCacheView:
             "paged per-layer replicate is a deferred follow-up; tree-spec verify (#158-160) uses "
             "discrete caches (the #152 scope guard). Use PagedKVCacheManager.fork for sequence-level "
             "branching.")
+
+
+class PagedLatentCacheView:
+    """Per-(sequence, layer) facade over a SINGLE latent KV stream (DSV4's MQA latent) — the
+    single-stream sibling of :class:`PagedKVCacheView`. Backs the latent surface of
+    :class:`quanta.dsv4.decode._PagedLayerCache`: ``offset`` (== written latent length),
+    ``append(kv)`` (write-only, the discarded-return hot path the DSV4 stepper uses), ``current()``
+    (gather the full bf16 latent stream for the windowed SDPA + compressed-KV scoring), and
+    ``truncate(length)``. Position advance + prefix hashing are driven by the manager
+    (``advance`` / ``commit``) — those need token ids, which the per-layer write never sees."""
+
+    def __init__(self, manager: PagedKVCacheManager, seq: SeqHandle, layer: int) -> None:
+        self._m = manager
+        self._seq = seq
+        self._layer = layer
+
+    @property
+    def offset(self) -> int:
+        return self._seq.n_written[self._layer]
+
+    def append(self, kv: mx.array) -> None:
+        """Write ``kv`` ``[1, T, head_dim]`` (T==1 at decode) at the write cursor. The DSV4 stepper
+        reads the grown stream back via :meth:`current` (the discrete ``_LayerCache.append_kv`` is
+        likewise void), so we don't gather here — one gather per step, not two."""
+        self._m.write_one(self._seq, self._layer, kv)
+
+    def current(self) -> mx.array:
+        """The full ``[1, n_written, head_dim]`` bf16 latent stream (prefix blocks + suffix)."""
+        return self._m.gather_one(self._seq, self._layer)
+
+    def truncate(self, length: int) -> None:
+        # per-layer truncate is driven at the sequence level by the manager (all layers move together)
+        self._m.truncate(self._seq, length)

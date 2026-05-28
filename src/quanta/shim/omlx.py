@@ -589,7 +589,8 @@ class _BaseBatchedSession:
             manager = PagedKVCacheManager(
                 num_layers=int(spec["n_layers"]), block_size=int(block_size), max_blocks=int(max_blocks),
                 group_size=int(spec["group_size"]), bits=int(spec["bits"]),
-                quantized=bool(spec["quantized"]), model_name=model_name)
+                quantized=bool(spec["quantized"]), model_name=model_name,
+                single_stream=bool(spec.get("single_stream", False)))
             if rec_cache is None and bool(getattr(runtime, "has_recurrent_state", False)):
                 rec_cache = RecurrentPrefixCache(block_size=int(block_size), model_name=model_name,
                                                  capacity=int(rec_capacity))

@@ -33,6 +33,9 @@ fed ``length`` tokens (speculative-decode rollback). Gated model-free in
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any
+
 import mlx.core as mx
 
 from quanta.cache_quant import dequantize_last_axis, quantize_last_axis
@@ -44,6 +47,9 @@ from quanta.dsv4.attention import (
     sdpa_window_sink,
 )
 from quanta.dsv4.config import DeepSeekV4Config
+
+if TYPE_CHECKING:  # type-only — the paged latent store is duck-typed at runtime (no import cycle)
+    from quanta.paged.paged_kv_cache import PagedKVCacheManager, PagedLatentCacheView, SeqHandle
 
 _NEG = -1e30
 
@@ -368,6 +374,131 @@ def _layer_overlap(lc: _LayerCache) -> bool:
     """Whether the layer's compressor uses overlapping windows (ratio==4 ⟺ overlap; ratio-128 layers
     are non-overlapping)."""
     return lc.ratio == 4
+
+
+# --- #152/#175 paged latent KV + content-addressed derived-state snapshots ----------------------
+#
+# DSV4's prefix-sharing splits the per-layer decode state two ways (the #174 hybrid pattern, adapted):
+#
+#   * the **latent KV** stream (``_LayerCache.kv``, the dominant byte cost, append-only, the same
+#     int8-along-head_dim layout :class:`quanta.nemotron.attention.KVCache` uses) is PAGED — shared
+#     across concurrent / multi-turn requests via :class:`~quanta.paged.PagedKVCacheManager`'s
+#     single-stream codec, so a common prompt prefix's latent KV is stored once;
+#   * the **derived** compressed-KV / indexer-KV / raw-hidden ring (a deterministic function of the
+#     prefix's RAW hidden states — the compressor pools raw hidden, NOT the latent KV, so they can't
+#     be recomputed from the shared latent) are kept per-stream and content-addressed at block
+#     boundaries via :class:`~quanta.paged.RecurrentPrefixCache`. On a prefix hit the boundary
+#     snapshot is restored and the suffix pools only its OWN windows, seeded by the restored ring —
+#     the ring already holds the ``coff*ratio`` raw-hidden tail every regime needs to pool the first
+#     post-boundary (possibly boundary-straddling) window, so correctness is independent of any
+#     block_size↔ratio alignment (gated in ``parity/dsv4_paged_latent_test.py``).
+
+
+class _PagedLayerCache(_LayerCache):
+    """A :class:`_LayerCache` whose LATENT KV lives in a shared
+    :class:`~quanta.paged.PagedLatentCacheView` (prefix blocks dedup'd across requests/turns), while
+    the derived compressed-KV / indexer-KV / raw-hidden ring stay per-stream (recomputed over the
+    suffix from a restored boundary snapshot). The decode steppers are UNCHANGED — they call
+    ``append_kv`` / read ``kv`` / read ``kv_length`` / pool the ring exactly as before; only the latent
+    storage swaps to the paged view here. ckv/ikv/ring + their append/truncate are inherited verbatim.
+    """
+
+    __slots__ = ("_view",)
+
+    def __init__(self, view: "PagedLatentCacheView", *, quantized: bool = True,
+                 group_size: int = 128, max_rollback: int = 1) -> None:
+        super().__init__(quantized=quantized, group_size=group_size, max_rollback=max_rollback)
+        self._view = view
+
+    @property
+    def kv(self) -> mx.array | None:
+        if self._view.offset == 0:
+            return None
+        return self._view.current()                 # gather prefix blocks + suffix -> bf16 latent
+
+    @kv.setter
+    def kv(self, value: mx.array | None) -> None:
+        raise RuntimeError("paged latent KV is written via append_kv() and paged blocks; direct set "
+                           "is unsupported (truncate via the manager).")
+
+    def kv_length(self) -> int:
+        return self._view.offset
+
+    def append_kv(self, kv_new: mx.array) -> None:
+        self._view.append(kv_new)                   # write-only; the kv property re-gathers on read
+
+    def truncate_kv(self, length: int) -> None:
+        self._view.truncate(length)
+
+
+def paged_cache(manager: "PagedKVCacheManager", seq: "SeqHandle", n_layers: int, *,
+                quantized: bool = True, group_size: int = 128, max_rollback: int = 1) -> DSV4Cache:
+    """A :class:`DSV4Cache` whose every layer's latent KV is a paged view into ``manager`` (ALL DSV4
+    layers are attention, so every latent stream is paged). Derived ckv/ikv/ring stay per-stream.
+    ``quantized``/``group_size`` MUST match the discrete cache's settled values (the runtime threads
+    the latent's :func:`quanta.dsv4.batched_runtime._latent_quant` result) so the paged round-trip is
+    bit-identical to the discrete stream."""
+    obj = DSV4Cache.__new__(DSV4Cache)
+    obj.layers = [
+        _PagedLayerCache(manager.view_one(seq, i), quantized=quantized,
+                         group_size=group_size, max_rollback=max_rollback)
+        for i in range(n_layers)
+    ]
+    return obj
+
+
+@dataclass(frozen=True)
+class _DerivedSnapshot:
+    """Opaque per-layer derived-state snapshot at a block boundary (the payload carried in
+    :class:`~quanta.paged.RecurrentPrefixCache` for DSV4). Holds everything the suffix pooling needs
+    that ISN'T the paged latent: the compressed-KV stream (int8 codes or bf16), the indexer KV, and
+    the raw-hidden ring. MLX arrays are immutable, so capturing references is a lossless snapshot —
+    a later append on the live cache creates new arrays and leaves these untouched. ``None`` for a
+    dense (ratio-0) layer, which has no derived state."""
+
+    ratio: int
+    quantized: bool
+    group_size: int
+    ckv_q: Any
+    ckv_s: Any
+    ckv_b: Any
+    ckv_bf16: Any
+    ikv: Any
+    ring: Any
+
+
+def snapshot_derived(cache: DSV4Cache) -> list[_DerivedSnapshot | None]:
+    """Capture each layer's derived (compressed-KV / indexer-KV / ring) state at the current boundary
+    — the per-layer list stored in the recurrent prefix cache. Dense layers contribute ``None``."""
+    out: list[_DerivedSnapshot | None] = []
+    for lc in cache.layers:
+        if lc.ratio == 0 and lc.ring is None:        # dense layer: latent only, no derived state
+            out.append(None)
+            continue
+        out.append(_DerivedSnapshot(
+            ratio=lc.ratio, quantized=lc.quantized, group_size=lc.group_size,
+            ckv_q=lc._ckv_q, ckv_s=lc._ckv_s, ckv_b=lc._ckv_b, ckv_bf16=lc._ckv_bf16,
+            ikv=lc.ikv, ring=lc.ring))
+    return out
+
+
+def restore_derived(cache: DSV4Cache, payload: list[_DerivedSnapshot | None] | None) -> None:
+    """Restore a :func:`snapshot_derived` payload into ``cache`` (in place) before a suffix prefill —
+    seeds each compressed layer's ckv/ikv/ring so the suffix resumes pooling exactly where the prefix
+    left off (bit-identical to a continuous decode). ``None`` payload / per-layer ``None`` is a no-op
+    (fresh / dense layer)."""
+    if payload is None:
+        return
+    for lc, snap in zip(cache.layers, payload, strict=True):
+        if snap is None:
+            continue
+        lc.ratio = snap.ratio
+        lc.quantized = snap.quantized
+        lc.group_size = snap.group_size
+        lc._ckv_q, lc._ckv_s, lc._ckv_b = snap.ckv_q, snap.ckv_s, snap.ckv_b
+        lc._ckv_bf16 = snap.ckv_bf16
+        lc.ikv = snap.ikv
+        lc.ring = snap.ring
 
 
 # --- compressor pooling (one window) — bit-identical to compressor_prefill ----

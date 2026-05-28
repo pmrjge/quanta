@@ -16,6 +16,7 @@ from quanta.paged.paged_kv_cache import (
     PagedCacheStats,
     PagedKVCacheManager,
     PagedKVCacheView,
+    PagedLatentCacheView,
     SeqHandle,
 )
 from quanta.paged.recurrent_cache import RecurrentCacheStats, RecurrentPrefixCache
@@ -30,6 +31,7 @@ __all__ = [
     "PagedCacheStats",
     "PagedKVCacheManager",
     "PagedKVCacheView",
+    "PagedLatentCacheView",
     "SeqHandle",
     "RecurrentCacheStats",
     "RecurrentPrefixCache",
