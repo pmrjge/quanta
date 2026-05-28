@@ -542,91 +542,257 @@ class _BatchedSession(Protocol):
     def step_batch(self, slot_to_token: dict[int, int]) -> dict[int, mx.array]: ...
     def release(self, slot: int) -> None: ...
 
+    # paged-KV stats surface (#152): default OFF; a session owning a live PagedKVCacheManager
+    # (#174/#175) overrides these so the engine can report real prefix-reuse stats to oMLX.
+    prefix_cache_enabled: bool
 
-class _DSV4BatchedSession:
-    """Batched decode session for DeepSeek-V4-Flash — wraps :class:`quanta.dsv4.batched_runtime.DSV4BatchedResidentModel`.
-
-    The wrapped runtime owns ``capacity`` decode caches (one per slot) and a single fused forward
-    that steps a vector of ``(slot, token)`` pairs through every layer. The session is a thin shim:
-    ``admit`` seeds a slot's cache by stepping the prompt one token at a time (bounded memory — never
-    materializes ``[1,T,vocab]`` for a long prompt, matching the single-stream :class:`_DSV4Stepper`);
-    ``step_batch`` calls the batched runtime once per decode tick with the alive slots' tokens;
-    ``release`` frees a slot so the next pending prompt can be admitted (continuous batching).
-
-    Lazy-imports ``quanta.dsv4.batched_runtime`` so the shim still loads when the sibling agent's
-    branch hasn't merged yet — calling ``_DSV4BatchedSession(...)`` is the failure point if the module
-    is missing (loud, per rule 6), not module import."""
-
-    def __init__(self, root: str | Path | None = None, *, capacity: int,
-                 runtime: Any | None = None) -> None:
-        if runtime is None:
-            from quanta.dsv4 import batched_runtime as _dbr  # lazy: sibling agent #145
-
-            if root is None:
-                raise OmlxShimError("DSV4BatchedSession: artifact root required when runtime is unset")
-            self._rt = _dbr.DSV4BatchedResidentModel(root, batch_size=capacity)
-        else:
-            self._rt = runtime
-        self.capacity = capacity
-        self.num_layers = getattr(self._rt, "num_layers", 0)
-
-    def admit(self, slot: int, prompt_ids: list[int]) -> mx.array:
-        if not prompt_ids:
-            raise OmlxShimError("DSV4 batched admit got an empty prompt")
-        if not 0 <= slot < self.capacity:
-            raise OmlxShimError(f"DSV4 batched admit slot {slot} out of range [0, {self.capacity})")
-        row = self._rt.prefill_slot(slot, prompt_ids)
-        mx.eval(row)
-        return row
-
-    def step_batch(self, slot_to_token: dict[int, int]) -> dict[int, mx.array]:
-        if not slot_to_token:
-            return {}
-        return self._rt.step_batch(slot_to_token)
-
-    def release(self, slot: int) -> None:
-        self._rt.free_slot(slot)
+    def get_cache_stats(self) -> dict[str, Any] | None: ...
 
 
-class _NemotronBatchedSession:
-    """Batched decode session for Nemotron-H — wraps :class:`quanta.nemotron.batched_runtime.NemotronBatchedResidentModel`.
+class _BaseBatchedSession:
+    """Continuous-batching session: owns one decode cache per slot and drives a model's batched
+    runtime through its real **caller-owned-state** API — ``make_cache`` / ``prefill(ids, cache)`` /
+    ``step_batch(token_ids, caches, offsets)``. The engine
+    (:meth:`QuantaOmlxEngine.batched_stream_generate`) only ever sees the slot contract
+    (``admit`` / ``step_batch(slot->token)`` / ``release``), so this class IS the
+    slot <-> per-stream-state adapter; the runtime stays a pure compute unit (its per-stream caches
+    live here, which is also where #152's paged cache will swap in).
 
-    Same contract as :class:`_DSV4BatchedSession`, but the underlying runtime threads the hybrid's
-    per-layer state (KV cache on attention layers, ``(ssm, conv)`` on mamba) per slot. The wrapper is
-    state-free: the batched runtime owns the per-slot state; the session only routes admit / step /
-    release into it. Lazy-imports ``quanta.nemotron.batched_runtime`` so the shim still loads when
-    the sibling agent's branch hasn't merged yet."""
+    ``admit`` builds a fresh per-slot cache and prefills the prompt into it (returning the final-
+    position logits row the engine samples). ``step_batch`` gathers the alive slots' caches + tokens
+    and runs one fused batched decode step. ``release`` drops the slot's cache. Subclasses supply five
+    model-specific hooks: runtime construction, the per-stream cache factory, prompt/token formatting,
+    and how a step reports each stream's absolute offset."""
 
     def __init__(self, root: str | Path | None = None, *, capacity: int,
-                 runtime: Any | None = None) -> None:
+                 runtime: Any | None = None, manager: Any | None = None,
+                 rec_cache: Any | None = None, paged_kv: bool = False,
+                 block_size: int = 32, max_blocks: int = 4096, rec_capacity: int = 4096,
+                 model_name: str = "") -> None:
         if runtime is None:
-            from quanta.nemotron import batched_runtime as _nbr  # lazy: sibling agent #146
-
             if root is None:
-                raise OmlxShimError("NemotronBatchedSession: artifact root required when runtime is unset")
-            self._rt = _nbr.NemotronBatchedResidentModel(root, batch_size=capacity)
-        else:
-            self._rt = runtime
-        self.capacity = capacity
-        self.num_layers = getattr(self._rt, "num_layers", 0)
+                raise OmlxShimError(f"{type(self).__name__}: artifact root required when runtime is unset")
+            runtime = self._make_runtime(root, capacity)
+        self._rt = runtime
+        self.capacity = int(capacity)
+        self.num_layers = getattr(runtime, "num_layers", 0)
+        self._caches: dict[int, Any] = {}                  # unpaged: slot -> per-stream cache
+        # --- paged mode (#152): a manager may be injected (tests) or built here from the runtime's
+        # paged spec when ``paged_kv`` is on. Engaged iff a PagedKVCacheManager ends up present. ------
+        if manager is None and paged_kv:
+            from quanta.paged import PagedKVCacheManager, RecurrentPrefixCache  # lazy (no oMLX dep)
+            spec = getattr(runtime, "paged_kv_spec", None)
+            if spec is None:
+                raise OmlxShimError(
+                    f"{type(self).__name__}: paged_kv=True but runtime {type(runtime).__name__} "
+                    "exposes no 'paged_kv_spec'")
+            manager = PagedKVCacheManager(
+                num_layers=int(spec["n_layers"]), block_size=int(block_size), max_blocks=int(max_blocks),
+                group_size=int(spec["group_size"]), bits=int(spec["bits"]),
+                quantized=bool(spec["quantized"]), model_name=model_name)
+            if rec_cache is None and bool(getattr(runtime, "has_recurrent_state", False)):
+                rec_cache = RecurrentPrefixCache(block_size=int(block_size), model_name=model_name,
+                                                 capacity=int(rec_capacity))
+        self._manager = manager                            # PagedKVCacheManager | None
+        self._rec = rec_cache                              # RecurrentPrefixCache | None
+        self._slots: dict[int, tuple[Any, Any]] = {}       # paged: slot -> (SeqHandle, paged_state)
+        self._block_size = int(manager.block_size) if manager is not None else 0
+        self._has_recurrent = False
+        if manager is not None:
+            # rule 6: a paged runtime MUST expose the paged contract — never silently half-page.
+            for attr in ("make_paged_state", "prefill_paged", "has_recurrent_state"):
+                if not hasattr(runtime, attr):
+                    raise OmlxShimError(
+                        f"{type(self).__name__}: paged runtime {type(runtime).__name__} missing {attr!r}")
+            self._has_recurrent = bool(runtime.has_recurrent_state)
+            if self._has_recurrent and not hasattr(runtime, "get_recurrent_state"):
+                raise OmlxShimError(
+                    f"{type(self).__name__}: recurrent paged runtime missing 'get_recurrent_state'")
 
+    # --- model-specific hooks (subclasses override) --------------------------
+    def _make_runtime(self, root: str | Path, capacity: int) -> Any:
+        raise NotImplementedError
+
+    def _new_cache(self) -> Any:
+        raise NotImplementedError
+
+    def _to_prefill_ids(self, prompt_ids: list[int]) -> Any:
+        return mx.array(prompt_ids)
+
+    def _to_step_tokens(self, tokens: list[int]) -> list[Any]:
+        return [mx.array([t]) for t in tokens]
+
+    def _step_offsets(self, caches: list[Any]) -> list[int] | None:
+        return [c.offset for c in caches]
+
+    # --- engine-facing slot contract -----------------------------------------
     def admit(self, slot: int, prompt_ids: list[int]) -> mx.array:
         if not prompt_ids:
-            raise OmlxShimError("Nemotron batched admit got an empty prompt")
+            raise OmlxShimError(f"{type(self).__name__}: admit got an empty prompt")
         if not 0 <= slot < self.capacity:
             raise OmlxShimError(
-                f"Nemotron batched admit slot {slot} out of range [0, {self.capacity})")
-        row = self._rt.prefill_slot(slot, prompt_ids)
+                f"{type(self).__name__}: admit slot {slot} out of range [0, {self.capacity})")
+        if slot in self._caches or slot in self._slots:
+            raise OmlxShimError(f"{type(self).__name__}: admit slot {slot} already in use")
+        if self._manager is not None:
+            return self._admit_paged(slot, prompt_ids)
+        cache = self._new_cache()
+        logits = self._rt.prefill(self._to_prefill_ids(prompt_ids), cache)
+        self._caches[slot] = cache
+        row = logits[0, -1]  # [vocab] at the final prompt position
         mx.eval(row)
         return row
 
     def step_batch(self, slot_to_token: dict[int, int]) -> dict[int, mx.array]:
         if not slot_to_token:
             return {}
-        return self._rt.step_batch(slot_to_token)
+        if self._manager is not None:
+            return self._step_paged(slot_to_token)
+        slots = sorted(slot_to_token)
+        missing = [s for s in slots if s not in self._caches]
+        if missing:
+            raise OmlxShimError(f"{type(self).__name__}: step_batch on unadmitted slots {missing}")
+        caches = [self._caches[s] for s in slots]
+        tokens = self._to_step_tokens([slot_to_token[s] for s in slots])
+        outs = self._rt.step_batch(tokens, caches, self._step_offsets(caches))
+        if len(outs) != len(slots):
+            raise OmlxShimError(
+                f"{type(self).__name__}: step_batch returned {len(outs)} rows for {len(slots)} slots")
+        result = {s: outs[i][0, -1] for i, s in enumerate(slots)}  # [vocab] per slot
+        mx.eval(list(result.values()))
+        return result
 
     def release(self, slot: int) -> None:
-        self._rt.free_slot(slot)
+        if self._manager is not None:
+            entry = self._slots.pop(slot, None)
+            if entry is not None:
+                self._manager.free(entry[0])     # ref-- (prefix blocks stay resident for LRU reuse)
+            return
+        self._caches.pop(slot, None)
+
+    # --- paged slot contract (#152) ------------------------------------------
+    def _admit_paged(self, slot: int, prompt_ids: list[int]) -> mx.array:
+        """Paged admit: re-reference the resident attention-KV prefix blocks + restore the recurrent
+        boundary state, then prefill ONLY the uncached suffix. A whole prompt that matches is trimmed
+        by one block so the last token is recomputed — KV reuse alone can't yield the last-position
+        logits the sampler needs (logits are not cached)."""
+        mgr, rec = self._manager, self._rec
+        seq = mgr.new_sequence()
+        # match against prompt_ids[:-1] so at least the final token is always recomputed.
+        n_attn = mgr.match_prefix(seq, prompt_ids[:-1]) if len(prompt_ids) > 1 else 0
+        rec_state = None
+        if n_attn and self._has_recurrent:
+            rec_state = rec.lookup_at(prompt_ids, n_attn) if rec is not None else None
+            if rec_state is None:
+                # no recurrent boundary snapshot here -> can't suffix-skip a hybrid; recompute in full.
+                mgr.truncate(seq, 0)
+                n_attn = 0
+        suffix = prompt_ids[n_attn:]
+        mgr.advance(seq, suffix)                                   # opens [n_attn, len) for KV writes
+        state = self._rt.make_paged_state(mgr, seq)
+        logits, new_boundaries = self._rt.prefill_paged(
+            self._to_prefill_ids(suffix), state,
+            offset=n_attn, recurrent_in=rec_state, block_size=self._block_size)
+        mgr.commit(seq)                                            # content-hash any block that filled
+        if rec is not None:
+            for pos, payload in new_boundaries:                   # store recurrent boundary snapshots
+                rec.store_at(prompt_ids, pos, payload)
+        self._slots[slot] = (seq, state)
+        row = logits[0, -1]
+        mx.eval(row)
+        return row
+
+    def _step_paged(self, slot_to_token: dict[int, int]) -> dict[int, mx.array]:
+        """Paged decode step: open one position per alive slot (``advance``), run the unchanged batched
+        forward (attention writes through the paged views; recurrent state mutates per-stream), then
+        ``commit`` and snapshot the recurrent state at any block boundary that just filled."""
+        slots = sorted(slot_to_token)
+        missing = [s for s in slots if s not in self._slots]
+        if missing:
+            raise OmlxShimError(f"{type(self).__name__}: step_batch on unadmitted slots {missing}")
+        mgr, rec = self._manager, self._rec
+        for s in slots:
+            mgr.advance(self._slots[s][0], [int(slot_to_token[s])])
+        states = [self._slots[s][1] for s in slots]
+        offsets = [self._slots[s][0].length - 1 for s in slots]    # abs position of each new token
+        tokens = self._to_step_tokens([slot_to_token[s] for s in slots])
+        outs = self._rt.step_batch(tokens, states, offsets)
+        if len(outs) != len(slots):
+            raise OmlxShimError(
+                f"{type(self).__name__}: step_batch returned {len(outs)} rows for {len(slots)} slots")
+        for i, s in enumerate(slots):
+            seq = self._slots[s][0]
+            mgr.commit(seq)
+            if self._has_recurrent and rec is not None and seq.length % self._block_size == 0:
+                rec.store_at(seq.token_ids, seq.length, self._rt.get_recurrent_state(states[i]))
+        result = {s: outs[i][0, -1] for i, s in enumerate(slots)}
+        mx.eval(list(result.values()))
+        return result
+
+    # --- paged-KV stats (real once a PagedKVCacheManager is wired in — #174/#175) -------------
+    @property
+    def prefix_cache_enabled(self) -> bool:
+        return self._manager is not None
+
+    def get_cache_stats(self) -> dict[str, Any] | None:
+        if self._manager is None:
+            return None
+        stats = self._manager.get_stats().to_dict()
+        if self._rec is not None:
+            stats["recurrent"] = self._rec.get_stats().__dict__
+        return stats
+
+
+class _DSV4BatchedSession(_BaseBatchedSession):
+    """DeepSeek-V4-Flash batched session — one :class:`quanta.dsv4.decode.DSV4Cache` per slot, fused
+    batched MoE across the alive slots. DSV4's ``step_batch`` validates each stream's declared offset
+    against its cache, so the offsets come straight from ``DSV4Cache.offset``. Lazy-imports the
+    batched runtime so the shim still loads when that module is absent (loud on use, rule 6)."""
+
+    def _make_runtime(self, root: str | Path, capacity: int) -> Any:
+        from quanta.dsv4 import batched_runtime as _dbr  # lazy
+
+        return _dbr.DSV4BatchedResidentModel(root, max_batch=capacity)
+
+    def _new_cache(self) -> Any:
+        return self._rt.make_cache()
+
+
+class _NemotronBatchedSession(_BaseBatchedSession):
+    """Nemotron-H batched session — one ``(caches, ssm, conv)`` triple per slot (KV on the 8 attention
+    layers, recurrent state on the 40 Mamba layers). Nemotron's ``step_batch`` reads each attention
+    layer's ``KVCache.offset`` internally, so the session passes ``offsets=None``."""
+
+    def _make_runtime(self, root: str | Path, capacity: int) -> Any:
+        from quanta.nemotron import batched_runtime as _nbr  # lazy
+
+        return _nbr.NemotronBatchedResidentModel(root, max_batch=capacity)
+
+    def _new_cache(self) -> Any:
+        return self._rt.make_stream_state()
+
+    def _step_offsets(self, caches: list[Any]) -> list[int] | None:
+        return None  # Nemotron derives per-stream offset from each KVCache internally
+
+
+class _Qwen35BatchedSession(_BaseBatchedSession):
+    """Qwen3.5 batched session — one :class:`quanta.qwen35.decode.Qwen35Cache` per slot (int8 KV on the
+    15 full-attn layers, recurrent GatedDeltaNet state on the 45 linear-attn layers). Qwen3.5's
+    ``step_batch`` takes plain int token ids + per-stream offsets (``Qwen35Cache.offset``)."""
+
+    def _make_runtime(self, root: str | Path, capacity: int) -> Any:
+        from quanta.qwen35 import batched_runtime as _qbr  # lazy
+
+        return _qbr.Qwen35BatchedResidentModel(root, max_batch=capacity)
+
+    def _new_cache(self) -> Any:
+        return self._rt.make_caches()
+
+    def _to_prefill_ids(self, prompt_ids: list[int]) -> Any:
+        return list(prompt_ids)
+
+    def _to_step_tokens(self, tokens: list[int]) -> list[Any]:
+        return [int(t) for t in tokens]
 
 
 @dataclass(slots=True)
@@ -664,7 +830,7 @@ class QuantaOmlxEngine(_OmlxBaseEngine):
     def __init__(self, model_name: str, *, runtime: RuntimeLike | None = None,
                  tokenizer: TokenizerLike | None = None, runtime_loader=None,
                  output_cls: type[Any] = OmlxGenerationOutput, eos_token_ids: set[int] | None = None,
-                 batched_session: Any | None = None) -> None:
+                 batched_session: Any | None = None, paged_kv: bool | None = None) -> None:
         self._model_name = model_name
         self._root = Path(model_name).expanduser().resolve(strict=False)
         self._runtime = runtime
@@ -677,6 +843,9 @@ class QuantaOmlxEngine(_OmlxBaseEngine):
         self._active = 0
         # injected batched session (tests / advanced callers); None ⇒ built lazily on first use.
         self._batched_session = batched_session
+        # #152 prefix-sharing paged KV — OFF until parity-green (rule 4); None ⇒ the package default.
+        from quanta.paged import PAGED_KV_DEFAULT
+        self._paged_kv = PAGED_KV_DEFAULT if paged_kv is None else bool(paged_kv)
 
     # --- BaseEngine properties -------------------------------------------------
     @property
@@ -698,7 +867,12 @@ class QuantaOmlxEngine(_OmlxBaseEngine):
 
     @property
     def prefix_cache_enabled(self) -> bool:
-        return False
+        """True only while a batched session with a live paged-KV manager is active (the #152 prefix
+        win); False for single-stream decode and the unpaged batched path. Delegates to the active
+        batched session — the paged path is OFF by default until parity-green (rule 4), so this stays
+        False until #174/#175 wire a PagedKVCacheManager into the session."""
+        sess = self._batched_session
+        return bool(sess is not None and sess.prefix_cache_enabled)
 
     def has_active_requests(self) -> bool:
         return self._active > 0
@@ -708,7 +882,11 @@ class QuantaOmlxEngine(_OmlxBaseEngine):
                 "active_requests": self._active}
 
     def get_cache_stats(self) -> dict[str, Any] | None:
-        return None
+        """oMLX cache-stats hook: forward the active batched session's paged-KV stats (block reuse /
+        hit rate, shaped like oMLX's ``BaseCacheStats``); ``None`` when no batched session is live or
+        its paged cache is off (the default until #174/#175 wire the manager in)."""
+        sess = self._batched_session
+        return sess.get_cache_stats() if sess is not None else None
 
     # --- token accounting ------------------------------------------------------
     def count_chat_tokens(
@@ -1184,22 +1362,30 @@ class QuantaOmlxEngine(_OmlxBaseEngine):
     def _make_batched_session(self, *, capacity: int) -> _BatchedSession:
         """Build the engine's batched decode session for this artifact's model class (``model_type``).
 
-        Only DSV4 and Nemotron expose a batched runtime today (#145/#146); other model classes fail
-        loud here (rule 6) until their batched runtime is implemented — never silently fall back to
-        a serial loop pretending to be batched (the caller would think it has ``B`` concurrent slots
-        when it actually has one). When a session was injected at engine construction (tests /
-        advanced callers), it is returned as-is."""
+        DSV4, Nemotron and Qwen3.5 expose a batched runtime (#145/#146/#147); each is driven through
+        the same :class:`_BaseBatchedSession` slot adapter (the #152 unification — previously Qwen3.5
+        was a separate :class:`Qwen35BatchedEngine` subclass). Other model classes fail loud here
+        (rule 6) until their batched runtime is implemented — never silently fall back to a serial loop
+        pretending to be batched (the caller would think it has ``B`` concurrent slots when it actually
+        has one). When a session was injected at engine construction (tests / advanced callers), it is
+        returned as-is. ``self._paged_kv`` (off by default, rule 4) is threaded to the session, which
+        builds the shared :class:`~quanta.paged.PagedKVCacheManager` from the runtime's paged spec; a
+        model whose batched runtime lacks the paged contract raises loudly when paged_kv is on."""
         if self._batched_session is not None:
             return self._batched_session
         mt = self.model_type or ""
+        kw = {"capacity": capacity, "paged_kv": self._paged_kv, "model_name": self._model_name}
         if mt.startswith("deepseek_v4"):
-            self._batched_session = _DSV4BatchedSession(self._root, capacity=capacity)
-            return self._batched_session
-        if mt.startswith("nemotron"):
-            self._batched_session = _NemotronBatchedSession(self._root, capacity=capacity)
-            return self._batched_session
-        raise OmlxShimError(
-            f"no batched runtime for quanta artifact model_type={mt!r} (DSV4 / Nemotron only)")
+            self._batched_session = _DSV4BatchedSession(self._root, **kw)
+        elif mt.startswith("nemotron"):
+            self._batched_session = _NemotronBatchedSession(self._root, **kw)
+        elif mt.startswith("qwen3_5") or mt.startswith("qwen3.5"):
+            self._batched_session = _Qwen35BatchedSession(self._root, **kw)
+        else:
+            raise OmlxShimError(
+                f"no batched runtime for quanta artifact model_type={mt!r} "
+                "(DSV4 / Nemotron / InternLM2.5 only)")
+        return self._batched_session
 
     def _dispatch_spec_k(self, *, prompt_ids: list[int], spec_k: int, max_new: int,
                          eos_id: Any) -> list[int]:

@@ -105,49 +105,50 @@ BATCH_PRED = {2: 100, 3: 101, 4: 102, 5: 103, 6: 104, 7: EOS}
 BATCH_EXPECT_TOKENS = [100, 101, 102, 103, 104, EOS]
 
 
+class _FakeCache:
+    """A per-stream state stand-in for Nemotron's ``(caches, ssm, conv)`` triple — only an ``offset``
+    (the runtime owns the real hybrid state; this stub routes purely by absolute position)."""
+
+    def __init__(self) -> None:
+        self.offset = 0
+
+
 class _FakeBatchedRuntime:
-    """Stub ``NemotronBatchedResidentModel`` for the batched-engine gate.
+    """Stub ``NemotronBatchedResidentModel`` exposing the REAL caller-owned-state API the session
+    drives: ``make_stream_state`` / ``prefill(ids, state)`` / ``step_batch(token_ids, caches, offsets)``
+    (Nemotron passes ``offsets=None`` — each KVCache owns its offset; here the stub state carries it).
 
-    Owns ``capacity`` decode slots with independent per-slot absolute offsets; records admit / step /
-    release. Returns deterministic per-slot logits by absolute offset (mirroring the single-stream
-    stub) so a batched run with B identical prompts equals B single-stream runs.
+    The session (not the runtime) owns slot<->state bookkeeping, so this stub is slot-agnostic: it
+    advances each passed-in state's offset and returns logits by absolute position (argmax
+    ``BATCH_PRED[position_of_fed_token]``), identical to the single-stream chain, so batched output is
+    output-equivalent to single-stream (rule 4). ``prefills`` counts admits for the lifecycle check."""
 
-    The Nemotron batched runtime's contract differs from the single-stream Nemotron model (it does
-    NOT return ``(logits, ssm, conv)`` directly — that state is owned per-slot inside the runtime).
-    The session's only requirements are ``prefill_slot`` / ``step_batch`` / ``free_slot``, so this
-    stub doesn't model the hybrid state explicitly."""
-
-    def __init__(self, capacity: int, vocab_size: int = 200, n_layers: int = 4) -> None:
-        self.capacity = capacity
+    def __init__(self, vocab_size: int = 200, n_layers: int = 4) -> None:
         self.num_layers = n_layers
         self._v = vocab_size
-        self._slot_offset: dict[int, int] = {}
-        self.admits: list[tuple[int, tuple[int, ...]]] = []
-        self.steps: list[tuple[tuple[int, ...], tuple[int, ...]]] = []
-        self.releases: list[int] = []
+        self.prefills = 0
+        self.steps: list[tuple[int, ...]] = []
 
     def _row(self, nxt: int) -> mx.array:
         return (mx.arange(self._v) == nxt).astype(mx.float32) * 60.0 - 30.0
 
-    def prefill_slot(self, slot: int, prompt_ids):
-        ids = tuple(int(t) for t in prompt_ids)
-        self.admits.append((slot, ids))
-        self._slot_offset[slot] = len(ids)
-        return self._row(BATCH_PRED.get(len(ids) - 1, EOS))
+    def make_stream_state(self) -> _FakeCache:
+        return _FakeCache()
 
-    def step_batch(self, slot_to_token):
-        slots = tuple(sorted(slot_to_token))
-        tokens = tuple(int(slot_to_token[s]) for s in slots)
-        self.steps.append((slots, tokens))
-        out: dict[int, mx.array] = {}
-        for s in slots:
-            self._slot_offset[s] += 1
-            out[s] = self._row(BATCH_PRED.get(self._slot_offset[s] - 1, EOS))
+    def prefill(self, prompt_ids, state: _FakeCache) -> mx.array:
+        n = int(mx.array(prompt_ids).reshape(-1).shape[0])
+        state.offset = n
+        self.prefills += 1
+        return mx.broadcast_to(self._row(BATCH_PRED.get(n - 1, EOS)), (1, n, self._v))
+
+    def step_batch(self, stream_token_ids, stream_caches, offsets=None) -> list[mx.array]:
+        self.steps.append(tuple(int(mx.array(t).reshape(-1)[0].item()) for t in stream_token_ids))
+        out: list[mx.array] = []
+        for state in stream_caches:
+            pos = state.offset
+            state.offset = pos + 1
+            out.append(mx.broadcast_to(self._row(BATCH_PRED.get(pos, EOS)), (1, 1, self._v)))
         return out
-
-    def free_slot(self, slot: int) -> None:
-        self.releases.append(slot)
-        self._slot_offset.pop(slot, None)
 
 
 class _SingleStreamBatchTok:
@@ -261,7 +262,7 @@ def run() -> None:
 
     # (3) batched engine equivalence: B=4 identical streams equal single-stream on the same prompt
     b = 4
-    batched_rt = _FakeBatchedRuntime(capacity=b)
+    batched_rt = _FakeBatchedRuntime()
     sess = _NemotronBatchedSession(root=None, capacity=b, runtime=batched_rt)
     eng_batched = QuantaOmlxEngine(NEM_ART, runtime=batched_rt, tokenizer=_SingleStreamBatchTok(),
                                     eos_token_ids={EOS}, batched_session=sess)
@@ -282,18 +283,18 @@ def run() -> None:
         and batched_chunks[i][-1].text == single_last.text
         and batched_chunks[i][-1].finish_reason == single_last.finish_reason
         for i in range(b))
-    admits_ok = len(batched_rt.admits) == b and {s for s, _ in batched_rt.admits} == set(range(b))
-    releases_ok = sorted(batched_rt.releases) == list(range(b))
-    good = per_stream_eq and admits_ok and releases_ok and single_last.tokens == BATCH_EXPECT_TOKENS
+    prefills_ok = batched_rt.prefills == b               # session admitted all b streams
+    released_ok = not sess._caches                       # every slot released after finishing
+    good = per_stream_eq and prefills_ok and released_ok and single_last.tokens == BATCH_EXPECT_TOKENS
     ok = ok and good
     print(f"  [{'OK' if good else 'FAIL'}] batched_stream_generate: per_stream_eq={per_stream_eq} "
-          f"admits={len(batched_rt.admits)} releases={sorted(batched_rt.releases)} "
+          f"prefills={batched_rt.prefills} caches_left={len(sess._caches)} "
           f"single_tokens={single_last.tokens}")
 
     # (3b) continuous batching: prompts > capacity ⇒ freed slots admit the next pending prompt
     n_streams = 5
     cap = 2
-    cb_rt = _FakeBatchedRuntime(capacity=cap)
+    cb_rt = _FakeBatchedRuntime()
     cb_sess = _NemotronBatchedSession(root=None, capacity=cap, runtime=cb_rt)
     eng_cb = QuantaOmlxEngine(NEM_ART, runtime=cb_rt, tokenizer=_SingleStreamBatchTok(),
                                 eos_token_ids={EOS}, batched_session=cb_sess)
@@ -308,7 +309,8 @@ def run() -> None:
         return seen_streams, finals
     seen, finals = asyncio.run(_collect_cb())
     cb_ok = (seen == set(range(n_streams)) and len(finals) == n_streams
-             and all(finals[i].tokens == single_last.tokens for i in range(n_streams)))
+             and all(finals[i].tokens == single_last.tokens for i in range(n_streams))
+             and cb_rt.prefills == n_streams and not cb_sess._caches)
     ok = ok and cb_ok
     print(f"  [{'OK' if cb_ok else 'FAIL'}] continuous batching: streams_seen={sorted(seen)} "
           f"finished={sorted(finals)} cap={cap}")

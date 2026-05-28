@@ -134,47 +134,50 @@ async def _collect(engine, prompt, **kw):
     return [o async for o in engine.stream_generate(prompt, **kw)]
 
 
+class _FakeCache:
+    """A per-stream decode cache stand-in — only an ``offset`` (the absolute decode position), which
+    is all :class:`_BaseBatchedSession` reads from a DSV4 cache to drive ``step_batch``."""
+
+    def __init__(self) -> None:
+        self.offset = 0
+
+
 class _FakeBatchedRuntime:
-    """Stub ``DSV4BatchedResidentModel`` for the batched-engine gate.
+    """Stub ``DSV4BatchedResidentModel`` exposing the REAL caller-owned-state API the session drives:
+    ``make_cache`` / ``prefill(ids, cache)`` / ``step_batch(token_ids, caches, offsets)``.
 
-    Owns ``capacity`` decode slots, each with an independent (prompt_len + tokens-emitted) offset.
-    Records every admit / step / release so the test can prove the engine's slot lifecycle is right.
-    Returns deterministic per-slot logits whose argmax is the deterministic-chain predictor: at any
-    slot, ``next = PRED[absolute_offset]`` (default eos). Because the stub ignores cache contents and
-    routes solely by absolute offset, a single-stream stub running the same prompt would produce the
-    same token sequence — exactly what the equivalence assertion needs."""
+    The session (not the runtime) owns slot<->cache bookkeeping now, so this stub is slot-agnostic: it
+    just advances each passed-in cache's offset and returns the deterministic-chain predictor logits
+    (argmax ``PRED[position_of_fed_token]``, default eos). Feeding a token at position ``p`` predicts
+    ``PRED[p]`` — identical to the single-stream :class:`_FakeDSV4Runtime` — so batched output is
+    output-equivalent to single-stream (rule 4). ``prefills`` counts admits for the lifecycle check."""
 
-    def __init__(self, capacity: int, vocab_size: int = 200, n_layers: int = 2) -> None:
-        self.capacity = capacity
+    def __init__(self, vocab_size: int = 200, n_layers: int = 2) -> None:
         self.num_layers = n_layers
         self._v = vocab_size
-        self._slot_offset: dict[int, int] = {}
-        self.admits: list[tuple[int, tuple[int, ...]]] = []
-        self.steps: list[tuple[tuple[int, ...], tuple[int, ...]]] = []
-        self.releases: list[int] = []
+        self.prefills = 0
+        self.steps: list[tuple[int, ...]] = []
 
     def _row(self, nxt: int) -> mx.array:
         return (mx.arange(self._v) == nxt).astype(mx.float32) * 60.0 - 30.0
 
-    def prefill_slot(self, slot: int, prompt_ids):
-        ids = tuple(int(t) for t in prompt_ids)
-        self.admits.append((slot, ids))
-        self._slot_offset[slot] = len(ids)
-        return self._row(PRED.get(len(ids) - 1, EOS))
+    def make_cache(self) -> _FakeCache:
+        return _FakeCache()
 
-    def step_batch(self, slot_to_token):
-        slots = tuple(sorted(slot_to_token))
-        tokens = tuple(int(slot_to_token[s]) for s in slots)
-        self.steps.append((slots, tokens))
-        out: dict[int, mx.array] = {}
-        for s in slots:
-            self._slot_offset[s] += 1
-            out[s] = self._row(PRED.get(self._slot_offset[s] - 1, EOS))
+    def prefill(self, prompt_ids, cache: _FakeCache) -> mx.array:
+        n = int(mx.array(prompt_ids).reshape(-1).shape[0])
+        cache.offset = n
+        self.prefills += 1
+        return mx.broadcast_to(self._row(PRED.get(n - 1, EOS)), (1, n, self._v))
+
+    def step_batch(self, stream_token_ids, caches, offsets=None) -> list[mx.array]:
+        self.steps.append(tuple(int(mx.array(t).reshape(-1)[0].item()) for t in stream_token_ids))
+        out: list[mx.array] = []
+        for cache in caches:
+            pos = cache.offset
+            cache.offset = pos + 1
+            out.append(mx.broadcast_to(self._row(PRED.get(pos, EOS)), (1, 1, self._v)))
         return out
-
-    def free_slot(self, slot: int) -> None:
-        self.releases.append(slot)
-        self._slot_offset.pop(slot, None)
 
 
 class _SpecStub:
@@ -260,7 +263,7 @@ def run() -> None:
         # (4) batched engine equivalence: B=4 parallel streams equal single-stream on each prompt
         b = 4
         prompts = ["hi"] * b
-        batched_rt = _FakeBatchedRuntime(capacity=b)
+        batched_rt = _FakeBatchedRuntime()
         sess = _DSV4BatchedSession(root=None, capacity=b, runtime=batched_rt)
         eng_batched = QuantaOmlxEngine(v4, runtime=batched_rt, tokenizer=_FakeTok(),
                                         eos_token_ids={EOS}, batched_session=sess)
@@ -280,17 +283,17 @@ def run() -> None:
             and batched_chunks[i][-1].text == single_last.text
             and batched_chunks[i][-1].finish_reason == single_last.finish_reason
             for i in range(b))
-        admits_ok = len(batched_rt.admits) == b and {s for s, _ in batched_rt.admits} == set(range(b))
-        releases_ok = sorted(batched_rt.releases) == list(range(b))
-        good = per_stream_eq and admits_ok and releases_ok
+        prefills_ok = batched_rt.prefills == b               # session admitted all b streams
+        released_ok = not sess._caches                       # every slot released after finishing
+        good = per_stream_eq and prefills_ok and released_ok
         ok = ok and good
         print(f"  [{'OK' if good else 'FAIL'}] batched_stream_generate: per_stream_eq={per_stream_eq} "
-              f"admits={len(batched_rt.admits)} releases={sorted(batched_rt.releases)}")
+              f"prefills={batched_rt.prefills} caches_left={len(sess._caches)}")
 
         # (4b) continuous batching: prompts > capacity ⇒ freed slots admit the next pending prompt
         n_streams = 5
         cap = 2
-        cb_rt = _FakeBatchedRuntime(capacity=cap)
+        cb_rt = _FakeBatchedRuntime()
         cb_sess = _DSV4BatchedSession(root=None, capacity=cap, runtime=cb_rt)
         eng_cb = QuantaOmlxEngine(v4, runtime=cb_rt, tokenizer=_FakeTok(),
                                    eos_token_ids={EOS}, batched_session=cb_sess)
@@ -305,7 +308,8 @@ def run() -> None:
             return seen_streams, finals
         seen, finals = asyncio.run(_collect_cb())
         cb_ok = (seen == set(range(n_streams)) and len(finals) == n_streams
-                 and all(finals[i].tokens == single_last.tokens for i in range(n_streams)))
+                 and all(finals[i].tokens == single_last.tokens for i in range(n_streams))
+                 and cb_rt.prefills == n_streams and not cb_sess._caches)
         ok = ok and cb_ok
         print(f"  [{'OK' if cb_ok else 'FAIL'}] continuous batching: streams_seen={sorted(seen)} "
               f"finished={sorted(finals)} cap={cap}")
