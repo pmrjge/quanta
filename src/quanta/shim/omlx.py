@@ -257,9 +257,15 @@ def _default_runtime_loader(root: Path) -> tuple[RuntimeLike, TokenizerLike]:
         from quanta.qwen25.tokenizer import Qwen25Tokenizer
 
         return Qwen25ResidentModel(root), _RenderChatAdapter(Qwen25Tokenizer.from_pretrained(str(root)))
+    if mt == "internlm2" or mt.startswith("internlm2"):  # InternLM2.5-7B-1M (dense GQA + dynamic-NTK)
+        from quanta.internlm2.runtime import InternLM2ResidentModel
+        from quanta.internlm2.tokenizer import InternLM2Tokenizer
+
+        return (InternLM2ResidentModel(root),
+                _RenderChatAdapter(InternLM2Tokenizer.from_pretrained(str(root))))
     raise OmlxShimError(
         f"no resident runtime for quanta artifact model_type={mt!r} "
-        "(supported: kimi, deepseek_v3, deepseek_v4, nemotron, glm, minimax, qwen2, qwen3_5)"
+        "(supported: kimi, deepseek_v3, deepseek_v4, nemotron, glm, minimax, qwen2, qwen3_5, internlm2)"
     )
 
 
@@ -1165,6 +1171,8 @@ class QuantaOmlxEngine(_OmlxBaseEngine):
         if mt == "qwen2" or mt.startswith("qwen2."):  # dense Qwen2.5-1M (DCA + int8 intra-K cache)
             # ``make_caches()`` honors the runtime's ``quantized_kv`` default (True → int8 g64),
             # the #122 inference policy — at 1M context cuts ~96 GB off the resident KV footprint.
+            return _SingleTokenStepper(self._runtime, self._runtime.make_caches())
+        if mt == "internlm2" or mt.startswith("internlm2"):  # dense InternLM2.5-1M (dynamic-NTK + int8 KV)
             return _SingleTokenStepper(self._runtime, self._runtime.make_caches())
         if not mt and self._injected_runtime:
             # standalone / injected runtime with no artifact model_type (tests, embedding the engine
