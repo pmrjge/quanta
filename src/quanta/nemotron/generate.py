@@ -24,7 +24,8 @@ from quanta.nemotron.model import NemotronModel
 def attn_caches(model: NemotronModel, *, max_rollback: int = 1) -> list:
     """One KV cache per attention layer (``None`` on mamba/moe layers). ``max_rollback`` is the
     deepest rollback each KV cache will accept (k=1 native MTP → 1; multi-step k>=2 needs k)."""
-    return [KVCache(max_rollback=max_rollback) if k == "attention" else None
+    gs = min(128, model.cfg.head_dim)  # cap KV group_size at head_dim; real head_dim=128 -> 128 (unchanged)
+    return [KVCache(max_rollback=max_rollback, group_size=gs) if k == "attention" else None
             for k in model.cfg.layers_block_type]
 
 

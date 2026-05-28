@@ -56,7 +56,8 @@ def make_stream_state(cfg: NemotronHConfig) -> tuple[list, list, list]:
     window), which is the intended contract — the caller is expected to run :meth:`prefill`
     before :meth:`step_batch` (rule-6: no silent defaults)."""
     kinds = cfg.layers_block_type
-    caches = [KVCache() if k == "attention" else None for k in kinds]
+    gs = min(128, cfg.head_dim)  # cap KV group_size at head_dim; real head_dim=128 -> 128 (unchanged)
+    caches = [KVCache(group_size=gs) if k == "attention" else None for k in kinds]
     ssm = [None] * len(kinds)
     conv = [None] * len(kinds)
     return caches, ssm, conv
@@ -102,7 +103,8 @@ def make_step_state(cfg: NemotronHConfig) -> tuple[list, list, list]:
     proper uses :func:`make_stream_state` (None conv) + a prefill call instead."""
     kinds = cfg.layers_block_type
     conv0 = mx.zeros((1, cfg.conv_kernel - 1, cfg.mamba_conv_dim))
-    caches = [KVCache() if k == "attention" else None for k in kinds]
+    gs = min(128, cfg.head_dim)  # cap KV group_size at head_dim; real head_dim=128 -> 128 (unchanged)
+    caches = [KVCache(group_size=gs) if k == "attention" else None for k in kinds]
     ssm = [None] * len(kinds)
     conv = [conv0 if k == "mamba" else None for k in kinds]
     return caches, ssm, conv

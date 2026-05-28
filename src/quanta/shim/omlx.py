@@ -776,6 +776,26 @@ class _NemotronBatchedSession(_BaseBatchedSession):
         return None  # Nemotron derives per-stream offset from each KVCache internally
 
 
+class _InternLM2BatchedSession(_BaseBatchedSession):
+    """InternLM2.5-7B-Chat-1M batched session — one :class:`quanta.internlm2.decode.InternLM2Cache` per
+    slot (dense GQA, int8 KV on all 32 layers, NO recurrent state). The clean #152 paged case: every
+    layer's k/v pair is paged and nothing is content-addressed at a block boundary
+    (``has_recurrent_state=False`` ⇒ the base ``_admit_paged`` skips the recurrent branch). ``step_batch``
+    reads each ``InternLM2Cache.offset`` internally, so the unpaged path passes ``offsets=None`` (the
+    paged path supplies explicit per-token offsets). Lazy-imports the batched runtime (loud on use, rule 6)."""
+
+    def _make_runtime(self, root: str | Path, capacity: int) -> Any:
+        from quanta.internlm2 import batched_runtime as _ibr  # lazy
+
+        return _ibr.InternLM2BatchedResidentModel(root, max_batch=capacity)
+
+    def _new_cache(self) -> Any:
+        return self._rt.new_cache()
+
+    def _step_offsets(self, caches: list[Any]) -> list[int] | None:
+        return None  # InternLM2Cache.offset is authoritative (paged step passes explicit offsets)
+
+
 class _Qwen35BatchedSession(_BaseBatchedSession):
     """Qwen3.5 batched session — one :class:`quanta.qwen35.decode.Qwen35Cache` per slot (int8 KV on the
     15 full-attn layers, recurrent GatedDeltaNet state on the 45 linear-attn layers). Qwen3.5's
@@ -1382,6 +1402,8 @@ class QuantaOmlxEngine(_OmlxBaseEngine):
             self._batched_session = _NemotronBatchedSession(self._root, **kw)
         elif mt.startswith("qwen3_5") or mt.startswith("qwen3.5"):
             self._batched_session = _Qwen35BatchedSession(self._root, **kw)
+        elif mt == "internlm2" or mt.startswith("internlm2"):
+            self._batched_session = _InternLM2BatchedSession(self._root, **kw)
         else:
             raise OmlxShimError(
                 f"no batched runtime for quanta artifact model_type={mt!r} "

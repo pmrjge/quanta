@@ -67,7 +67,10 @@ def _tiny_cfg() -> NemotronHConfig:
         hybrid_override_pattern="M*EM",
         num_attention_heads=4,
         num_key_value_heads=2,
-        head_dim=8,
+        head_dim=32,  # smallest int8-KV-valid head_dim: mx.quantize's min group_size is 32 and head_dim
+        # must be a multiple of the KV group_size. The state factories cap the cache group_size at
+        # head_dim (min(128, head_dim)), so this is the smallest valid int8 KV — head_dim=8 crashed
+        # mx.quantize once int8 KV became default; head_dim=128 would needlessly 16x the test KV cache.
         attention_bias=False,
         rope_theta=10000.0,
         partial_rotary_factor=1.0,
