@@ -1401,7 +1401,10 @@ class QuantaOmlxEngine(_OmlxBaseEngine):
         elif mt.startswith("nemotron"):
             self._batched_session = _NemotronBatchedSession(self._root, **kw)
         elif mt.startswith("qwen3_5") or mt.startswith("qwen3.5"):
-            self._batched_session = _Qwen35BatchedSession(self._root, **kw)
+            # Qwen3.5 is OUT of the #152 paged scope (user directive; its batched runtime has no
+            # paged contract). Force unpaged even when PAGED_KV_DEFAULT is True — rule 6: never hand
+            # paged_kv=True to a runtime with no paged_kv_spec. The 3 keepers honor self._paged_kv.
+            self._batched_session = _Qwen35BatchedSession(self._root, **{**kw, "paged_kv": False})
         elif mt == "internlm2" or mt.startswith("internlm2"):
             self._batched_session = _InternLM2BatchedSession(self._root, **kw)
         else:
