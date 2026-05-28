@@ -66,7 +66,8 @@ def _paged_decode(rt: InternLM2BatchedResidentModel, prefix: list[int], full: li
         mx.eval(row)
         toks.append(_argmax(row))
         rows.append(row)
-    return toks, rows, mgr.get_stats()
+    # engine-level stats surface (omlx.py:738) — the smoke deferred by paged_prefix_reuse_test.py:22.
+    return toks, rows, mgr.get_stats(), sess.get_cache_stats()
 
 
 def _max_abs(rows_a, rows_b) -> float:
@@ -87,14 +88,18 @@ def run() -> None:
     full = ids[:plen + SUFFIX_LEN]
 
     discrete, d_rows = _discrete_decode(rt, full, K)
-    paged, p_rows, st = _paged_decode(rt, prefix, full, K)
+    paged, p_rows, st, estats = _paged_decode(rt, prefix, full, K)
 
     agree = sum(a == b for a, b in zip(discrete, paged, strict=True))
     logit_max_abs = _max_abs(d_rows, p_rows)
     tokens_eq = discrete == paged
     reused = st.prefix_hit_tokens == len(prefix)
     varied = len(set(discrete)) > 1                  # a real, non-degenerate continuation
-    ok = tokens_eq and reused and varied
+    # engine.get_cache_stats() must report the same reuse the manager saw (the deferred smoke).
+    estats_ok = (isinstance(estats, dict)
+                 and estats.get("prefix_hit_tokens") == st.prefix_hit_tokens == len(prefix)
+                 and estats.get("prefix_hit_blocks") == st.prefix_hit_blocks)
+    ok = tokens_eq and reused and varied and estats_ok
 
     print(f"  prompt_tokens={len(ids)} prefix={len(prefix)} suffix={SUFFIX_LEN}")
     print(f"  discrete={discrete}")
@@ -104,6 +109,10 @@ def run() -> None:
     print(f"  [info]  per-step logits max_abs(paged-discrete) = {logit_max_abs:.3e}")
     print(f"  [{'OK' if reused else 'FAIL'}] prefix reused: hit_tokens={st.prefix_hit_tokens} "
           f"(exp {len(prefix)}) hit_blocks={st.prefix_hit_blocks}")
+    e_tok = estats.get("prefix_hit_tokens") if isinstance(estats, dict) else estats
+    e_blk = estats.get("prefix_hit_blocks") if isinstance(estats, dict) else None
+    print(f"  [{'OK' if estats_ok else 'FAIL'}] engine.get_cache_stats(): "
+          f"hit_tokens={e_tok} hit_blocks={e_blk}")
     print("PASS" if ok else "FAIL")
     if not ok:
         raise SystemExit(1)

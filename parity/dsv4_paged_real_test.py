@@ -10,7 +10,8 @@ single-stream codec bit-exactly across the dense / ratio-4 / ratio-128 regimes; 
 faithful: top-1 next-token agreement over a greedy decode of a COHERENT prompt (the project's e2e
 arbiter), the per-step logits max-abs diff, the prefix-reuse stats, and the recurrent-snapshot restore.
 
-DSV4 is the biggest + riskiest keeper — loads ~389 GB. Run ALONE, never beside another large-resident
+DSV4 is the biggest + riskiest keeper — loads ~180 GiB (int4-packed via gather_qmm; ~389 GiB only on
+the bf16 ``packed_experts=False`` debug path). Run ALONE, never beside another large-resident
 job (the OOM-reboot hazard, [[feedback-memory-safety]]).
 
     uv run --with regex python -m parity.dsv4_paged_real_test
@@ -70,7 +71,8 @@ def _paged_decode(rt: DSV4BatchedResidentModel, prefix: list[int], full: list[in
         mx.eval(row)
         toks.append(_argmax(row))
         rows.append(row)
-    return toks, rows, mgr.get_stats(), rec.get_stats()
+    # engine-level stats surface (omlx.py:738) — the smoke deferred by paged_prefix_reuse_test.py:22.
+    return toks, rows, mgr.get_stats(), rec.get_stats(), sess.get_cache_stats()
 
 
 def _max_abs(rows_a, rows_b) -> float:
@@ -91,7 +93,7 @@ def run() -> None:
     full = ids[:plen + SUFFIX_LEN]
 
     discrete, d_rows = _discrete_decode(rt, full, K)
-    paged, p_rows, st, rst = _paged_decode(rt, prefix, full, K)
+    paged, p_rows, st, rst, estats = _paged_decode(rt, prefix, full, K)
 
     agree = sum(a == b for a, b in zip(discrete, paged, strict=True))
     logit_max_abs = _max_abs(d_rows, p_rows)
@@ -99,7 +101,15 @@ def run() -> None:
     reused = st.prefix_hit_tokens == len(prefix)
     restored = rst.snapshot_hits >= 1
     varied = len(set(discrete)) > 1                  # a real, non-degenerate continuation
-    ok = tokens_eq and reused and restored and varied
+    # engine.get_cache_stats() must report the same paged reuse + derived restore the caches saw.
+    rec_stats = estats.get("recurrent") if isinstance(estats, dict) else None
+    estats_ok = (isinstance(estats, dict)
+                 and estats.get("prefix_hit_tokens") == st.prefix_hit_tokens == len(prefix)
+                 and estats.get("prefix_hit_blocks") == st.prefix_hit_blocks
+                 and isinstance(rec_stats, dict)
+                 and rec_stats.get("snapshot_hits") == rst.snapshot_hits
+                 and rec_stats.get("snapshot_stores") == rst.snapshot_stores)
+    ok = tokens_eq and reused and restored and varied and estats_ok
 
     print(f"  prompt_tokens={len(ids)} prefix={len(prefix)} suffix={SUFFIX_LEN}")
     print(f"  discrete={discrete}")
@@ -111,6 +121,11 @@ def run() -> None:
           f"(exp {len(prefix)}) hit_blocks={st.prefix_hit_blocks}")
     print(f"  [{'OK' if restored else 'FAIL'}] derived boundary restored: snapshot_hits="
           f"{rst.snapshot_hits} stores={rst.snapshot_stores}")
+    e_tok = estats.get("prefix_hit_tokens") if isinstance(estats, dict) else estats
+    e_blk = estats.get("prefix_hit_blocks") if isinstance(estats, dict) else None
+    e_hit = rec_stats.get("snapshot_hits") if isinstance(rec_stats, dict) else None
+    print(f"  [{'OK' if estats_ok else 'FAIL'}] engine.get_cache_stats(): hit_tokens={e_tok} "
+          f"hit_blocks={e_blk} rec_snapshot_hits={e_hit}")
     print("PASS" if ok else "FAIL")
     if not ok:
         raise SystemExit(1)

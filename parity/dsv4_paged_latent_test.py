@@ -1,6 +1,6 @@
 """Parity: DSV4 prefix-sharing paged latent KV + content-addressed derived-state recompute (#175).
 
-Model-free gate for the DSV4 half of #152. With **tiny random params** (never load the 389 GB
+Model-free gate for the DSV4 half of #152. With **tiny random params** (never load the ~180 GiB
 artifact — a job may be resident), it proves the two halves of DSV4 prefix sharing are exact:
 
   A. **Core (the remaining-risk gate).** For each attention regime — ratio-0 dense sliding-window,

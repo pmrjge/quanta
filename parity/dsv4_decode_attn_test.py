@@ -16,7 +16,7 @@ The three regimes are ``cfg.compress_ratio(layer_id)``: ratio 0 (dense sliding-w
 (compressed + Lightning-Indexer / DSA), and the "ratio-128" regime (compressed, no indexer). The
 ratio-128 code path is keyed purely on ``has_indexer``/``overlap`` (both ``== 4``), so any non-{0,4}
 ratio exercises it identically; we use a small ratio (3) so a short sequence still produces several
-compressed tokens. **Tiny tensors only — never load the real model** (a 389 GB job may be resident).
+compressed tokens. **Tiny tensors only — never load the real model** (a ~180 GiB job may be resident).
 
     uv run --with numpy python -m parity.dsv4_decode_attn_test
 """
