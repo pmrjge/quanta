@@ -38,6 +38,7 @@ from pathlib import Path
 
 import mlx.core as mx
 
+from quanta.cache_quant import BITS
 from quanta.nemotron.attention import KVCache
 from quanta.nemotron.config import NemotronHConfig
 from quanta.nemotron.model import NemotronBlock
@@ -189,11 +190,22 @@ class NemotronBatchedResidentModel:
     * :meth:`make_stream_state` — factory for a fresh per-stream ``(caches, ssm, conv)`` triple.
     """
 
+    # #152 paged contract: Nemotron is HYBRID — the attention KV is paged (shared prefix dedup) while
+    # the 40 Mamba layers' recurrent state is content-addressed at block boundaries so a shared prefix
+    # can be suffix-computed instead of reprocessed (the recurrent state at a boundary is a pure
+    # function of the prefix tokens). See quanta.shim.omlx._BaseBatchedSession paged mode.
+    has_recurrent_state = True
+
     def __init__(self, art_dir: str | Path, *, max_batch: int = 32, n_layers: int | None = None) -> None:
         if max_batch <= 0:
             raise ValueError(f"max_batch must be positive, got {max_batch}")
         self.max_batch = int(max_batch)
         self._inner = NemotronResidentModel(art_dir, n_layers=n_layers)
+        # global layer index -> paged-attention-layer index (only the "attention" layers are paged;
+        # the Mamba + MoE layers carry no KV cache). The paged manager has one layer per attention layer.
+        kinds = self._inner.cfg.layers_block_type
+        self._attn_globals = [i for i, k in enumerate(kinds) if k == "attention"]
+        self._attn_map = {g: idx for idx, g in enumerate(self._attn_globals)}
 
     # --- shared-weight surface (mirrors NemotronResidentModel) -----------------
     @property
@@ -286,6 +298,73 @@ class NemotronBatchedResidentModel:
     # --- per-stream state factory ----------------------------------------------
     def make_stream_state(self) -> tuple[list, list, list]:
         return make_stream_state(self.cfg)
+
+    # --- #152 paged contract (driven by quanta.shim.omlx._BaseBatchedSession paged mode) -------
+    @property
+    def paged_kv_spec(self) -> dict:
+        """Shape/codec the shared :class:`~quanta.paged.PagedKVCacheManager` must use to be bit-exact
+        with this model's discrete ``KVCache`` — threaded from a probe, never hardcoded (rule 6).
+        ``n_layers`` is the count of paged (attention) layers; the Mamba/MoE layers carry no KV."""
+        probe = KVCache()
+        return {"n_layers": len(self._attn_globals), "group_size": probe.group_size,
+                "bits": BITS, "quantized": probe.quantized}
+
+    def make_paged_state(self, manager, seq) -> tuple[list, list, list]:
+        """A per-stream ``(caches, ssm, conv)`` triple where each attention layer's KV slot is a
+        :class:`~quanta.paged.PagedKVCacheView` into the shared manager (so the prefix blocks dedup),
+        and the Mamba layers keep ``None`` recurrent state (filled by :meth:`prefill_paged`)."""
+        n = self.num_layers
+        caches: list = [None] * n
+        for global_i, attn_idx in self._attn_map.items():
+            caches[global_i] = manager.view(seq, attn_idx)
+        return caches, [None] * n, [None] * n
+
+    def prefill_paged(self, suffix_ids, state: tuple[list, list, list], *, offset: int,
+                      recurrent_in, block_size: int) -> tuple[mx.array, list[tuple[int, tuple]]]:
+        """Prefill ONLY the uncached suffix into ``state`` (whose attention slots are paged views over
+        the resident prefix blocks), resuming the Mamba recurrence from ``recurrent_in`` (the boundary
+        snapshot of ``(ssm, conv)`` after the shared prefix; ``None`` ⇒ fresh / ``offset == 0``).
+
+        Split in two at the deepest full-block boundary so the recurrent state THERE can be snapshotted
+        for future reuse: part 1 ``[offset, deepest)`` (a T>1 chunk prefilled against the reused KV —
+        Nemotron's attention applies offset-aware lower-right causal masking + RoPE at ``cache.offset``,
+        so this is bit-exact with a one-shot prefill), then the partial tail ``[deepest, end)``. Returns
+        ``(last-position logits, [(deepest, (ssm_snapshot, conv_snapshot))])`` — the boundary list is
+        empty when the suffix adds no new full block. Bit-identical to a from-scratch full prefill +
+        decode (the SSD recurrence is split-invariant + the KV reuse is exact) — gated model-free in
+        ``parity/paged_engine_equiv_test.py`` and (deferred, one model at a time) on the real artifact."""
+        caches, ssm, conv = state
+        if recurrent_in is not None:
+            ssm_in, conv_in = recurrent_in
+            ssm[:] = ssm_in      # restore the post-prefix recurrent state in place (rule 4: == full)
+            conv[:] = conv_in
+        ids = suffix_ids if isinstance(suffix_ids, mx.array) else mx.array(suffix_ids)
+        ids = ids.reshape(-1)
+        total = int(ids.shape[0])
+        if total == 0:
+            raise ValueError("prefill_paged: empty suffix (admit must leave >=1 token to recompute)")
+        end = offset + total
+        deepest = (end // block_size) * block_size          # deepest full-block boundary <= end
+        new_boundaries: list[tuple[int, tuple]] = []
+        if deepest > offset:
+            n1 = deepest - offset
+            logits, _, _ = self._inner(ids[:n1], caches=caches, ssm=ssm, conv=conv,
+                                       use_fast=True, compiled=False, mamba_chunked_cont=True)
+            new_boundaries.append((deepest, (list(ssm), list(conv))))   # state AFTER the prefix+full blocks
+            if end > deepest:
+                logits, _, _ = self._inner(ids[n1:], caches=caches, ssm=ssm, conv=conv,
+                                           use_fast=True, compiled=False, mamba_chunked_cont=True)
+        else:
+            logits, _, _ = self._inner(ids, caches=caches, ssm=ssm, conv=conv,
+                                       use_fast=True, compiled=False, mamba_chunked_cont=True)
+        return logits, new_boundaries
+
+    def get_recurrent_state(self, state: tuple[list, list, list]) -> tuple[list, list]:
+        """Snapshot the live ``(ssm, conv)`` recurrent state (for a decode-crossed block boundary).
+        Copies the list spines only — the per-layer arrays are immutable, so a later step that
+        reassigns ``ssm[i]`` leaves this snapshot intact."""
+        _caches, ssm, conv = state
+        return list(ssm), list(conv)
 
     # --- batched decode step ---------------------------------------------------
     def step_batch(

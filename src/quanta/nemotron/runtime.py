@@ -128,7 +128,7 @@ class NemotronResidentModel:
         return self._cmix
 
     def __call__(self, token_ids, *, caches=None, ssm=None, conv=None,
-                 capture_layers=None, use_fast=True, compiled=True):
+                 capture_layers=None, use_fast=True, compiled=True, mamba_chunked_cont=False):
         """Logits ``[1, t, vocab]`` + updated mamba state lists. All-``None`` state ⇒ fresh prefill.
         At decode (``t == 1``) the mamba/moe mixers run through compiled fused graphs by default.
 
@@ -155,7 +155,8 @@ class NemotronResidentModel:
             elif cmix is not None and blk.kind == "moe":
                 h = h + cmix[i](blk.norm(h))
             else:
-                h, ssm[i], conv[i] = blk(h, cache=caches[i], ssm_state=ssm[i], conv_state=conv[i], use_fast=use_fast)
+                h, ssm[i], conv[i] = blk(h, cache=caches[i], ssm_state=ssm[i], conv_state=conv[i],
+                                         use_fast=use_fast, chunked_cont=mamba_chunked_cont)
             if capture_set is not None and i in capture_set:
                 # Strip the leading batch-1 dim — match the ``[T, hidden]`` capture shape
                 # convention used by :class:`quanta.dsv4.runtime.DSV4ResidentModel` and

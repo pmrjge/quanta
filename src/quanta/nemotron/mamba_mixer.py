@@ -67,7 +67,7 @@ class MambaMixer(nn.Module):
         cm = xbc[..., self.d_inner + gn :].reshape(b, t, self.g, self.n)
         return x, bm, cm
 
-    def __call__(self, x, *, state=None, conv_state=None):
+    def __call__(self, x, *, state=None, conv_state=None, chunked_cont=False):
         b, t, _ = x.shape
         a = -mx.exp(self.A_log)
         z, xbc, dt = self._split(self.in_proj(x))
@@ -78,6 +78,25 @@ class MambaMixer(nn.Module):
             dt = _softplus(dt + self.dt_bias)
             y, state = self._prefill(xs, dt, a, bm, cm, state)
             conv_state = xbc_pre[:, -(self.k - 1) :]   # for decode continuation
+        elif chunked_cont:
+            # Prefill CONTINUATION via the **chunked SSD** (resumed from ``(state, conv_state)``) — the
+            # #152 paged-suffix path. Unlike the per-token branch below (which matches ``batch_step``),
+            # this matches the FRESH chunked-prefill numerics so a suffix prefilled on top of a reused
+            # prefix is output-equivalent to a one-shot prefill of prefix+suffix (rule 4). The restored
+            # ``conv_state`` (the raw last ``k-1`` xBC of the prefix) is prepended so the depthwise
+            # conv1d sees the correct left context for the first suffix positions; the prepended window
+            # is sliced off after the conv and is NOT fed to the SSD (it is already folded into
+            # ``state``). The SSD resumes via ``ssd_chunked(state_in=state)`` (same kernel as fresh
+            # prefill). Gated on the real artifact in ``parity/nemotron_paged_real_test.py``.
+            if state is None:
+                state = mx.zeros((b, self.h, self.n, self.p), dtype=x.dtype)
+            cw = conv_state.shape[1]                          # == k-1 (raw prefix-tail window)
+            xbc_ext = mx.concatenate([conv_state, xbc], axis=1)        # [b, (k-1)+t, conv_dim]
+            xbc_conv = _silu(causal_conv1d(xbc_ext, self.conv_weight, self.conv_bias))[:, cw:]
+            xs, bm, cm = self._split_xbc(xbc_conv, b, t)
+            dt = _softplus(dt + self.dt_bias)
+            y, state = self._prefill(xs, dt, a, bm, cm, state)
+            conv_state = xbc_ext[:, -(self.k - 1) :]          # raw window for the next continuation
         else:
             # Mid-stream continuation: use the **same per-token step ops** as the t==1
             # decode path for every t in [0..T-1]. Chunked SSD with ``state_in`` is
