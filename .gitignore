@@ -55,3 +55,6 @@ scratch/
 .idea/
 .vscode/
 *.swp
+
+# ---- Claude Code (local agent state / settings) ----
+.claude/
