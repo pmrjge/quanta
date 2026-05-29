@@ -102,6 +102,7 @@ class DSV4BatchedResidentModel:
         max_batch: int = 32,
         packed_experts: bool = True,
         load_mtp: bool = False,
+        kv_arena: bool = False,
         n_layers: int | None = None,
     ) -> None:
         if max_batch < 1:
@@ -119,11 +120,12 @@ class DSV4BatchedResidentModel:
             inner.art.release()
             mx.clear_cache()
         self._init_from_inner(inner, max_batch=max_batch, packed_experts=packed_experts,
-                              mtp_params=mtp_params)
+                              mtp_params=mtp_params, kv_arena=kv_arena)
 
     @classmethod
     def from_inner(cls, inner, *, max_batch: int = 32, packed_experts: bool = True,
-                   mtp_params: dict | None = None) -> "DSV4BatchedResidentModel":
+                   mtp_params: dict | None = None,
+                   kv_arena: bool = False) -> "DSV4BatchedResidentModel":
         """Build a batched runtime around an EXISTING single-stream-shaped inner (parity tests).
 
         The inner must expose the :class:`DSV4ResidentModel` surface this runtime consumes:
@@ -133,11 +135,11 @@ class DSV4BatchedResidentModel:
         a real artifact (rule-6: never silently couple test correctness to checkpoint I/O)."""
         obj = cls.__new__(cls)
         obj._init_from_inner(inner, max_batch=max_batch, packed_experts=packed_experts,
-                             mtp_params=mtp_params)
+                             mtp_params=mtp_params, kv_arena=kv_arena)
         return obj
 
     def _init_from_inner(self, inner, *, max_batch: int, packed_experts: bool,
-                         mtp_params: dict | None) -> None:
+                         mtp_params: dict | None, kv_arena: bool = False) -> None:
         """Common init: bind the inner + mirror its surface so callers can drop a batched model in
         wherever a single-stream one is expected (same ``.cfg``/``.num_layers``/``.embed_w``/...)."""
         if max_batch < 1:
@@ -156,6 +158,11 @@ class DSV4BatchedResidentModel:
         # decode_step_*_batched siblings). Gated model-free in parity/dsv4_batched_attention_test.py;
         # the per-stream Design-A loop stays the reference + the multi-token-tail fallback.
         self._fused = True
+        # #18 batched KV arena: replace the B ragged per-stream caches' per-stream KV-update loop with
+        # a persistent max_batch-sized padded arena (one scatter write + one gather read). INERT here
+        # (no stepper consumes it yet) — wired dense in M1, compressed in M3; the default flips ON in
+        # M4 once the whole path is parity-green (rule 4: default = proven per-stream path until then).
+        self._kv_arena = bool(kv_arena)
 
     # --- convenience pass-throughs --------------------------------------------
     def make_cache(self) -> DSV4Cache:

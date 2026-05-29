@@ -38,7 +38,7 @@ from typing import TYPE_CHECKING, Any
 
 import mlx.core as mx
 
-from quanta.cache_quant import dequantize_last_axis, quantize_last_axis
+from quanta.cache_quant import BITS, dequantize_last_axis, quantize_last_axis
 from quanta.dsv4.attention import (
     _rms_w,
     gather_rope_rows,
@@ -701,6 +701,242 @@ def _pad_stack(arrs: list[mx.array | None], lmax: int | None = None) -> mx.array
         else:
             out.append(a if ln == lmax else mx.pad(a, [(0, 0), (0, lmax - ln), (0, 0)]))
     return mx.concatenate(out, axis=0)
+
+
+# --- batched KV arena (#18): persistent max_batch-sized latent store ----------------------------
+# Kills the per-stream KV-update loop in the batched decode steppers. Instead of B ragged per-stream
+# _LayerCache streams (each quantizing + ``mx.concatenate``-growing per step) plus a ``_pad_stack``
+# readback every step, one per-layer arena holds R = ``max_batch`` padded rows; the hot path writes
+# all B active rows with ONE scatter (``arena[rows, cols, :] = codes``) and reads them with ONE gather
+# (``mx.take``) + one batched dequant. Contents are bit-identical to ``_LayerCache``: the same
+# :mod:`quanta.cache_quant` codec on the same input, and affine int-bits over the last axis is
+# row-independent, so a batched ``[B,1,D]`` quantize equals B separate ``[1,1,D]`` quantizes row-for-row.
+# Gated model-free in ``parity/dsv4_kv_arena_test.py``; flag-guarded (``kv_arena``) on
+# :class:`~quanta.dsv4.batched_runtime.DSV4BatchedResidentModel`, default OFF until parity is green (rule 4).
+def _grow_seq(arr: mx.array, cap: int) -> mx.array:
+    """Return a ``[R, cap, X]`` copy of ``arr`` (``[R, old, X]``) with the live prefix slice-assigned
+    in (the rest zero). Doubling growth for the arena's seq axis — amortized, not a hot op."""
+    r, old, x = arr.shape
+    out = mx.zeros((r, cap, x), dtype=arr.dtype)
+    out[:, :old, :] = arr
+    return out
+
+
+class _KVArena:
+    """One decoder layer's persistent batched latent-KV store: ``rows`` (== ``max_batch``) padded
+    streams of affine int-bits codes (or bf16 when ``quantized=False``), each grown independently to
+    ``lengths[row]`` tokens. Storage mirrors :class:`_LayerCache`'s latent trio (``_kv_q/_kv_s/_kv_b``
+    via :mod:`quanta.cache_quant`) promoted to a leading ``rows`` axis: codes ``[R, L_cap, D/pack]``,
+    scales/biases ``[R, L_cap, D/group]``. ``L_cap`` grows by doubling (slice-assign, amortized); the
+    lazy first-write alloc learns ``D`` and the trio dtypes from the codec output."""
+
+    __slots__ = ("rows", "group_size", "quantized", "bits", "l_cap", "lengths",
+                 "_q", "_s", "_b", "_bf16")
+
+    def __init__(self, rows: int, *, group_size: int, quantized: bool, bits: int = BITS) -> None:
+        if rows < 1:
+            raise ValueError(f"_KVArena rows must be >= 1 (got {rows})")
+        self.rows = int(rows)
+        self.group_size = int(group_size)
+        self.quantized = bool(quantized)
+        self.bits = int(bits)
+        self.l_cap = 0
+        self.lengths = [0] * self.rows        # per-row token count (bounded accounting, not a hot loop)
+        self._q: mx.array | None = None
+        self._s: mx.array | None = None
+        self._b: mx.array | None = None
+        self._bf16: mx.array | None = None
+
+    # --- length probes -------------------------------------------------------
+    def length(self, row: int) -> int:
+        return self.lengths[row]
+
+    def max_length(self, rows: list[int]) -> int:
+        return max((self.lengths[r] for r in rows), default=0)
+
+    # --- capacity (doubling) -------------------------------------------------
+    def _ensure_q(self, need: int, q: mx.array, s: mx.array, b: mx.array) -> None:
+        if self._q is None:
+            cap = 1
+            while cap < need:
+                cap *= 2
+            self._q = mx.zeros((self.rows, cap, q.shape[-1]), dtype=q.dtype)
+            self._s = mx.zeros((self.rows, cap, s.shape[-1]), dtype=s.dtype)
+            self._b = mx.zeros((self.rows, cap, b.shape[-1]), dtype=b.dtype)
+            self.l_cap = cap
+        elif need > self.l_cap:
+            cap = self.l_cap
+            while cap < need:
+                cap *= 2
+            self._q, self._s, self._b = (_grow_seq(self._q, cap), _grow_seq(self._s, cap),
+                                         _grow_seq(self._b, cap))
+            self.l_cap = cap
+
+    def _ensure_bf16(self, need: int, kv_new: mx.array) -> None:
+        if self._bf16 is None:
+            cap = 1
+            while cap < need:
+                cap *= 2
+            self._bf16 = mx.zeros((self.rows, cap, kv_new.shape[-1]), dtype=kv_new.dtype)
+            self.l_cap = cap
+        elif need > self.l_cap:
+            cap = self.l_cap
+            while cap < need:
+                cap *= 2
+            self._bf16 = _grow_seq(self._bf16, cap)
+            self.l_cap = cap
+
+    # --- writes --------------------------------------------------------------
+    def append_row(self, row: int, kv_new: mx.array) -> None:
+        """Per-row append (one stream, ``T`` tokens) — prefill / the multi-token tail via the view.
+        ``kv_new``: ``[1, T, D]``. Slice-assigns row ``row`` at ``[length:length+T]`` (a bounded
+        one-row write, not a hot per-stream loop)."""
+        t = int(kv_new.shape[1])
+        off = self.lengths[row]
+        if self.quantized:
+            q, s, b = quantize_last_axis(kv_new, self.group_size, self.bits)
+            self._ensure_q(off + t, q, s, b)
+            self._q[row, off:off + t, :] = q[0]
+            self._s[row, off:off + t, :] = s[0]
+            self._b[row, off:off + t, :] = b[0]
+        else:
+            self._ensure_bf16(off + t, kv_new)
+            self._bf16[row, off:off + t, :] = kv_new[0]
+        self.lengths[row] = off + t
+
+    def append_batched(self, rows: list[int], kv_new: mx.array) -> None:
+        """Hot-path batched append: ``kv_new`` ``[k, 1, D]`` for the ``k`` active rows. ONE quantize +
+        ONE scatter at each row's current length, then advance lengths — no per-stream Python loop.
+        Equivalent to :meth:`append_row` on each row (same codec; affine quant is row-independent)."""
+        if int(kv_new.shape[1]) != 1:
+            raise ValueError(f"append_batched expects T==1 (got {kv_new.shape[1]})")
+        rows_arr = mx.array(rows, dtype=mx.int32)
+        cols = mx.array([self.lengths[r] for r in rows], dtype=mx.int32)     # bounded accounting
+        need = max(self.lengths[r] for r in rows) + 1
+        if self.quantized:
+            q, s, b = quantize_last_axis(kv_new, self.group_size, self.bits)
+            self._ensure_q(need, q, s, b)
+            self._q[rows_arr, cols, :] = q[:, 0, :]
+            self._s[rows_arr, cols, :] = s[:, 0, :]
+            self._b[rows_arr, cols, :] = b[:, 0, :]
+        else:
+            self._ensure_bf16(need, kv_new)
+            self._bf16[rows_arr, cols, :] = kv_new[:, 0, :]
+        for r in rows:                          # bounded accounting (<= max_batch), no tensor compute
+            self.lengths[r] += 1
+
+    # --- reads ---------------------------------------------------------------
+    def read_row(self, row: int) -> mx.array | None:
+        """Dequantized ``[1, length, D]`` bf16 for one row (the view's ``kv`` property); ``None`` if
+        empty. Bit-identical to :attr:`_LayerCache.kv` for the same stream."""
+        n = self.lengths[row]
+        if n == 0:
+            return None
+        if self.quantized:
+            return dequantize_last_axis(self._q[row:row + 1, :n], self._s[row:row + 1, :n],
+                                        self._b[row:row + 1, :n], self.group_size, bits=self.bits)
+        return self._bf16[row:row + 1, :n]
+
+    def read_batched(self, rows: list[int]) -> mx.array:
+        """Gather the ``k`` active rows, slice to ``L_max = max(lengths[rows])`` and dequant →
+        ``[k, L_max, D]`` bf16 — replaces ``_pad_stack([lc.kv ...])`` on the arena path. Rows shorter
+        than ``L_max`` keep stale/zero tail codes that the SDPA window/pad mask sends to ``-inf``
+        (numerically inert); every valid position is bit-identical to the per-stream stream."""
+        l_max = self.max_length(rows)
+        if l_max == 0:
+            raise ValueError("read_batched: every active row is empty (no KV to read)")   # rule 6
+        rows_arr = mx.array(rows, dtype=mx.int32)
+        if self.quantized:
+            q = mx.take(self._q, rows_arr, axis=0)[:, :l_max]
+            s = mx.take(self._s, rows_arr, axis=0)[:, :l_max]
+            b = mx.take(self._b, rows_arr, axis=0)[:, :l_max]
+            return dequantize_last_axis(q, s, b, self.group_size, bits=self.bits)
+        return mx.take(self._bf16, rows_arr, axis=0)[:, :l_max]
+
+    # --- rollback / free-list reset ------------------------------------------
+    def truncate_row(self, row: int, length: int) -> None:
+        """Roll row ``row`` back to ``length`` tokens (spec-decode rollback). Cursor move only — the
+        stale tail is never read (``read_row`` slices to ``length``) and is overwritten on next write."""
+        if length < self.lengths[row]:
+            self.lengths[row] = length
+
+    def reset_row(self, row: int) -> None:
+        """Free-list reset: drop row ``row`` to empty so a new stream can lease it (:meth:`free`)."""
+        self.lengths[row] = 0
+
+
+class _KVArenaSet:
+    """The ``R``-row free-list + one :class:`_KVArena` per layer (latent KV). Owned by
+    :class:`~quanta.dsv4.batched_runtime.DSV4BatchedResidentModel` when ``kv_arena=True``; a stream
+    leases a row via :meth:`alloc` (the SAME row index across every layer) and returns it via
+    :meth:`free` on release. Model-free constructible for the parity gate. (Compressed-layer
+    ckv/ikv/ring arenas join the set in #18 M3.)"""
+
+    def __init__(self, n_layers: int, rows: int, *, group_size: int, quantized: bool,
+                 bits: int = BITS) -> None:
+        if rows < 1:
+            raise ValueError(f"_KVArenaSet rows must be >= 1 (got {rows})")
+        if n_layers < 1:
+            raise ValueError(f"_KVArenaSet n_layers must be >= 1 (got {n_layers})")
+        self.rows = int(rows)
+        self.latent: list[_KVArena] = [
+            _KVArena(rows, group_size=group_size, quantized=quantized, bits=bits)
+            for _ in range(n_layers)
+        ]
+        self._free: list[int] = list(reversed(range(rows)))     # pop() hands out 0,1,2,...
+
+    def alloc(self) -> int:
+        if not self._free:
+            raise RuntimeError(f"_KVArenaSet: no free rows (all {self.rows} leased)")   # rule 6
+        return self._free.pop()
+
+    def free(self, row: int) -> None:
+        if not 0 <= row < self.rows:
+            raise ValueError(f"_KVArenaSet.free: row {row} out of range [0,{self.rows})")
+        if row in self._free:
+            raise RuntimeError(f"_KVArenaSet: double-free of row {row}")                 # rule 6
+        for a in self.latent:
+            a.reset_row(row)
+        self._free.append(row)
+
+    def __len__(self) -> int:
+        return len(self.latent)
+
+    def __getitem__(self, i: int) -> _KVArena:
+        return self.latent[i]
+
+
+class _ArenaLayerView(_LayerCache):
+    """A :class:`_LayerCache` whose LATENT KV lives in a shared :class:`_KVArena` row (the batched
+    arena, #18), while the derived ckv/ikv/ring stay per-object (inherited — batched into the arena set
+    in M3). Mirrors the :class:`_PagedLayerCache` pattern: prefill / the single-stream decode path call
+    ``append_kv`` / read ``kv`` / ``kv_length`` / ``truncate_kv`` exactly as before; only the latent
+    storage swaps to the arena row here, so prefill seeds an arena row directly (no migration)."""
+
+    __slots__ = ("_arena", "_row")
+
+    def __init__(self, arena: _KVArena, row: int, *, quantized: bool = True,
+                 group_size: int = 128, max_rollback: int = 1) -> None:
+        super().__init__(quantized=quantized, group_size=group_size, max_rollback=max_rollback)
+        self._arena = arena
+        self._row = row
+
+    @property
+    def kv(self) -> mx.array | None:
+        return self._arena.read_row(self._row)
+
+    @kv.setter
+    def kv(self, value: mx.array | None) -> None:
+        raise RuntimeError("arena latent KV is written via append_kv(); direct set unsupported (#18)")
+
+    def kv_length(self) -> int:
+        return self._arena.length(self._row)
+
+    def append_kv(self, kv_new: mx.array) -> None:
+        self._arena.append_row(self._row, kv_new)
+
+    def truncate_kv(self, length: int) -> None:
+        self._arena.truncate_row(self._row, length)
 
 
 def decode_step_dense_batched(x_t: mx.array, p: dict, cfg: DeepSeekV4Config, layer_id: int,
