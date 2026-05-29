@@ -160,3 +160,88 @@ def attention_dense(x: mx.array, p: dict, cfg: DeepSeekV4Config, layer_id: int,
                          p["attn_sink"].astype(mx.float32), cfg.attn_scale,
                          cfg.sliding_window, offset)
     return output_proj(o, p, cfg, cos, sin)
+
+
+# --- batched single-token decode (per-stream offsets) ------------------------
+# These mirror the single-stream helpers above but carry a PER-STREAM RoPE row (each decode stream
+# sits at its OWN absolute position) so B ragged-offset streams run through ONE projection / ONE
+# windowed-sink SDPA instead of a Python loop over streams. The single-stream helpers are untouched
+# (their parity stands); B=1 collapses these to the same math (one row, no padding) → bit-exact.
+def _apply_rope_b(x: mx.array, cos: mx.array, sin: mx.array, inverse: bool) -> mx.array:
+    """Interleaved-complex RoPE on the last dim of ``x`` with a **per-stream** ``(cos, sin)``.
+    ``x``: ``[B,1,rd]`` or ``[B,1,H,rd]``; ``cos``/``sin``: ``[B,1,rd/2]`` (stream ``b``'s row at its
+    own absolute position). Same rotation as :func:`_apply_rope`, only the batch axis carries a
+    distinct angle per stream instead of a shared ``[T,rd/2]`` table broadcast over the batch."""
+    *lead, rd = x.shape
+    xr = x.reshape(*lead, rd // 2, 2)
+    x0, x1 = xr[..., 0], xr[..., 1]
+    if x.ndim == 4:                                # [B,1,H,rd] -> insert head axis
+        c, s = cos[:, :, None, :], sin[:, :, None, :]
+    else:                                          # [B,1,rd]
+        c, s = cos, sin
+    if inverse:
+        s = -s
+    o0 = x0 * c - x1 * s
+    o1 = x0 * s + x1 * c
+    return mx.stack([o0, o1], axis=-1).reshape(*lead, rd)
+
+
+def rope_partial_b(x: mx.array, cos: mx.array, sin: mx.array, rd: int,
+                   inverse: bool = False) -> mx.array:
+    """Per-stream RoPE on only the last ``rd`` dims of ``x`` (batched sibling of :func:`rope_partial`)."""
+    return mx.concatenate([x[..., :-rd], _apply_rope_b(x[..., -rd:], cos, sin, inverse)], axis=-1)
+
+
+def gather_rope_rows(cos: mx.array, sin: mx.array, offsets: list[int]
+                     ) -> tuple[mx.array, mx.array]:
+    """Pick each stream's RoPE row from the full per-layer tables → ``[B,1,rd/2]`` each.
+    ``cos``/``sin``: ``[L, rd/2]`` for ``[0, L)``; ``offsets[b]``: stream ``b``'s absolute position."""
+    idx = mx.array(offsets, dtype=mx.int32)
+    return cos[idx][:, None, :], sin[idx][:, None, :]
+
+
+def project_qkv_b(x: mx.array, p: dict, cfg: DeepSeekV4Config, cos_b: mx.array, sin_b: mx.array
+                  ) -> tuple[mx.array, mx.array, mx.array]:
+    """Batched-offset :func:`project_qkv`: ``x`` ``[B,1,dim]``, ``cos_b``/``sin_b`` ``[B,1,rd/2]``
+    (per-stream rows). Identical projection math; only the RoPE carries a per-stream angle."""
+    b, t, _ = x.shape
+    nh, hd, rd, eps = cfg.num_attention_heads, cfg.head_dim, cfg.rope_head_dim, cfg.norm_eps
+    qr = _rms_w(x @ p["wq_a"].T, p["q_norm"], eps)              # [B,1,q_lora_rank]
+    q = (qr @ p["wq_b"].T).reshape(b, t, nh, hd)               # [B,1,H,head_dim]
+    q = _rms(q.astype(mx.float32), eps).astype(x.dtype)        # unweighted per-head RMS
+    q = rope_partial_b(q, cos_b, sin_b, rd)
+    kv = _rms_w(x @ p["wkv"].T, p["kv_norm"], eps)             # [B,1,head_dim]
+    kv = rope_partial_b(kv, cos_b, sin_b, rd)
+    return qr, q, kv
+
+
+def output_proj_b(o: mx.array, p: dict, cfg: DeepSeekV4Config, cos_b: mx.array, sin_b: mx.array
+                  ) -> mx.array:
+    """Batched-offset :func:`output_proj`: inverse per-stream RoPE then grouped low-rank O."""
+    o = rope_partial_b(o, cos_b, sin_b, cfg.rope_head_dim, inverse=True)
+    return grouped_o(o, p["wo_a"], p["wo_b"], cfg.o_groups, cfg.o_lora_rank)
+
+
+def sdpa_window_sink_batched(q: mx.array, kv: mx.array, sink: mx.array, scale: float,
+                             window: int, offsets: list[int]) -> mx.array:
+    """Causal sliding-window SDPA + per-head sink across ``B`` decode streams of ragged length.
+
+    ``q``: ``[B,1,H,D]`` (one query per stream, RoPE applied); ``kv``: ``[B,L_max,D]`` — each stream's
+    latent KV right-padded with a zero tail to the longest stream's length; ``offsets[b]``: stream
+    ``b``'s absolute query position (and ``L_b == offsets[b]+1`` valid keys). Row ``b`` equals the
+    single-stream :func:`sdpa_window_sink` over exactly ``L_b`` keys: the window/sink mask sends both
+    out-of-window AND padded (``j > offset_b``) columns to ``-1e9`` (≈ zero softmax weight), so the
+    padding is inert. B=1 has ``L_max == L_1`` (no padding) → bit-exact; B≥2 differs only by the SDPA
+    reduction tiling (``L_max`` vs ``L_b``) → argmax-stable fp ULPs."""
+    b, t, h, d = q.shape                                         # t == 1
+    s = kv.shape[1]
+    scores = mx.einsum("bthd,bsd->bths", q, kv) * scale          # [B,1,H,L_max]
+    ki = mx.arange(s)[None, :]                                   # [1,L_max] key pos
+    off = mx.array(offsets, dtype=mx.int32)[:, None]             # [B,1] each stream's abs query pos
+    allow = (ki <= off) & (ki > off - window)                    # [B,L_max] window + pad(ki>off) mask
+    scores = scores + mx.where(allow, 0.0, -1e9)[:, None, None, :]
+    m = mx.max(scores, axis=-1, keepdims=True)                   # [B,1,H,1]
+    ex = mx.exp(scores - m)
+    denom = mx.sum(ex, axis=-1) + mx.exp(sink[None, None, :] - m[..., 0])   # [B,1,H]
+    num = mx.einsum("bths,bsd->bthd", ex, kv)                    # [B,1,H,D]
+    return num / denom[..., None]

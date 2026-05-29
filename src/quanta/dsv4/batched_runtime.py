@@ -43,7 +43,13 @@ import mlx.core as mx
 
 from quanta.cache_quant import BITS
 from quanta.dsv4.attention import _rms_w
-from quanta.dsv4.decode import DSV4Cache, decode_step_compressed, decode_step_dense
+from quanta.dsv4.decode import (
+    DSV4Cache,
+    decode_step_compressed,
+    decode_step_compressed_batched,
+    decode_step_dense,
+    decode_step_dense_batched,
+)
 from quanta.dsv4.hyper import hc_expand, hc_post, hc_pre
 from quanta.dsv4.moe import dsv4_moe
 from quanta.dsv4.runtime import DSV4ResidentModel
@@ -145,6 +151,11 @@ class DSV4BatchedResidentModel:
         self.lm_head_w = inner.lm_head_w
         self.layers = inner.layers
         self.mtp_params = mtp_params
+        # Batched-attention decode default: for the common all-T==1 step, fuse the per-stream attention
+        # loop into ONE projection + ONE windowed-sink SDPA per layer across all B streams (the
+        # decode_step_*_batched siblings). Gated model-free in parity/dsv4_batched_attention_test.py;
+        # the per-stream Design-A loop stays the reference + the multi-token-tail fallback.
+        self._fused = True
 
     # --- convenience pass-throughs --------------------------------------------
     def make_cache(self) -> DSV4Cache:
@@ -348,6 +359,13 @@ class DSV4BatchedResidentModel:
             stream_ids.append(arr)
             seq_lens.append(int(arr.shape[1]))
 
+        # Fast path — every stream is a plain single-token decode (T_b == 1): fuse the per-stream
+        # attention loop into ONE batched pass (decode_step_*_batched). Multi-token tails (T_b > 1,
+        # spec replay) keep the position-by-position Design-A loop below — it is also the reference
+        # the batched steppers are gated against (parity/dsv4_batched_attention_test.py).
+        if self._fused and all(t == 1 for t in seq_lens):
+            return self._decode_batched_single(mx.concatenate(stream_ids, axis=0), caches, offsets)
+
         # Per-stream HC residual stream (initial embed expansion) — [1, T_b, hc, dim] per stream.
         stream_h: list[mx.array] = [
             hc_expand(self.embed_w[arr].astype(mx.bfloat16), self.cfg.hc_mult)
@@ -397,6 +415,36 @@ class DSV4BatchedResidentModel:
             h_s = mx.stack(stream_outs[s], axis=0)[None]                          # [1, T_b, hc, dim]
             out_logits.append(self._inner._head(h_s))
         return out_logits
+
+    def _decode_batched_single(self, ids_b: mx.array, caches: list[DSV4Cache],
+                               offsets: list[int]) -> list[mx.array]:
+        """One batched decode step across ``B`` streams with the attention **fused across streams**
+        (the ``self._fused`` all-T==1 path). ``ids_b``: ``[B,1]`` token ids; ``caches[b]``/``offsets[b]``:
+        stream ``b``'s :class:`DSV4Cache` / absolute position. Per layer: ONE batched attention sub-block
+        (``decode_step_*_batched`` — batched projection + per-stream cache/pool IO + one windowed-sink
+        SDPA) wrapped in the batched HC mix, then the already-batched :meth:`_ffn_batched`. Returns the
+        per-stream ``[1,1,vocab]`` logits list — output-equivalent to :meth:`step_batch`'s Design-A loop
+        (gated in ``parity/dsv4_batched_attention_test.py``)."""
+        cfg = self.cfg
+        eps, hc, iters, heps = cfg.norm_eps, cfg.hc_mult, cfg.hc_sinkhorn_iters, cfg.hc_eps
+        b = int(ids_b.shape[0])
+        h = hc_expand(self.embed_w[ids_b].astype(mx.bfloat16), hc)               # [B,1,hc,dim]
+        max_len = max(offsets) + 1
+        for i, p in enumerate(self.layers):
+            cos, sin = self._inner._rope(i, max_len)                             # full RoPE tables
+            lcs = [caches[s][i] for s in range(b)]                               # this layer per stream
+            step_b = (decode_step_dense_batched if cfg.compress_ratio(i) == 0
+                      else decode_step_compressed_batched)
+            res = h                                                              # attention sub-block
+            x, post, comb = hc_pre(h, p["hc_attn_fn"], p["hc_attn_scale"], p["hc_attn_base"],
+                                   hc, iters, eps, heps)
+            x = _rms_w(x, p["attn_norm"], eps)
+            x = step_b(x, p["attn"], cfg, i, lcs, cos, sin, offsets)
+            h = hc_post(x, res, post, comb)
+            h = self._ffn_batched(h, ids_b, p, i)                               # batched MoE sub-block
+        mx.eval(h)
+        logits = self._inner._head(h)                                            # [B,1,vocab]
+        return [logits[s:s + 1] for s in range(b)]
 
     # --- single-stream __call__ delegating to inner ---------------------------
     def __call__(self, token_ids, *, caches=None, offset=0, capture_layers=None):

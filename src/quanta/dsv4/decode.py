@@ -41,10 +41,15 @@ import mlx.core as mx
 from quanta.cache_quant import dequantize_last_axis, quantize_last_axis
 from quanta.dsv4.attention import (
     _rms_w,
+    gather_rope_rows,
     output_proj,
+    output_proj_b,
     project_qkv,
+    project_qkv_b,
     rope_partial,
+    rope_partial_b,
     sdpa_window_sink,
+    sdpa_window_sink_batched,
 )
 from quanta.dsv4.config import DeepSeekV4Config
 
@@ -668,3 +673,134 @@ def _decode_indexer_select(x_t: mx.array, qr: mx.array, lc: _LayerCache, idx_p: 
         return mx.ones((b, 1, ncomp), dtype=mx.bool_)
     thr = mx.sort(score, axis=-1)[..., ncomp - k][..., None]   # k-th largest
     return score >= thr
+
+
+# --- batched single-token decode steppers (per-stream offsets) ----------------
+# The per-stream-offset siblings of the steppers above: B ragged-offset decode streams run through
+# ONE projection / ONE windowed-sink SDPA per layer instead of a Python loop over streams. The only
+# remaining per-stream work is the bounded cache append/ckv-append/ring-push (IO, rule-3) and the
+# window-closing pool, which is data-dependent per stream. Output-equivalent to looping the
+# single-stream steppers: B=1 is bit-exact (no padding), B≥2 is greedy-exact (the pad+mask SDPA
+# reorders the softmax reduction → argmax-stable bf16 ULPs). Gated in parity/dsv4_batched_attention_test.
+def _pad_stack(arrs: list[mx.array | None], lmax: int | None = None) -> mx.array:
+    """Stack ``B`` per-stream ``[1, L_b, D]`` streams → ``[B, lmax, D]`` (zero tail along seq). A
+    ``None`` entry (a compressed/indexer stream that is still empty — no window has closed yet)
+    becomes a zero ``[1, lmax, D]`` row. The window / visibility masks send every padded column to a
+    large negative, so the padding is numerically inert. ``lmax`` defaults to the longest stream."""
+    lengths = [0 if a is None else int(a.shape[1]) for a in arrs]
+    if lmax is None:
+        lmax = max(lengths)
+    ref = next((a for a in arrs if a is not None), None)
+    if ref is None:
+        raise ValueError("_pad_stack: every stream is empty (no shape to infer)")
+    hd, dtype = int(ref.shape[-1]), ref.dtype
+    out = []
+    for a, ln in zip(arrs, lengths, strict=True):
+        if a is None:
+            out.append(mx.zeros((1, lmax, hd), dtype=dtype))
+        else:
+            out.append(a if ln == lmax else mx.pad(a, [(0, 0), (0, lmax - ln), (0, 0)]))
+    return mx.concatenate(out, axis=0)
+
+
+def decode_step_dense_batched(x_t: mx.array, p: dict, cfg: DeepSeekV4Config, layer_id: int,
+                              lcs: list[_LayerCache], cos: mx.array, sin: mx.array,
+                              offsets: list[int]) -> mx.array:
+    """Batched ratio-0 decode across ``B`` streams — per-stream-offset sibling of
+    :func:`decode_step_dense`. ``x_t``: ``[B,1,dim]``; ``lcs[b]``: stream ``b``'s :class:`_LayerCache`
+    for this layer; ``cos``/``sin``: full RoPE tables for ``[0, max(offsets)+1)``; ``offsets[b]``:
+    stream ``b``'s absolute position. Returns ``[B,1,dim]``."""
+    b = x_t.shape[0]
+    cos_b, sin_b = gather_rope_rows(cos, sin, offsets)          # [B,1,rd/2] per-stream rows
+    _, q, kv = project_qkv_b(x_t, p, cfg, cos_b, sin_b)         # q [B,1,H,hd], kv [B,1,hd]
+    for s in range(b):                                          # bounded per-stream KV append (IO, rule-3)
+        lcs[s].append_kv(kv[s:s + 1])
+    kv_pad = _pad_stack([lc.kv for lc in lcs])                  # [B, L_max, hd]
+    o = sdpa_window_sink_batched(q.astype(mx.float32), kv_pad.astype(mx.float32),
+                                 p["attn_sink"].astype(mx.float32), cfg.attn_scale,
+                                 cfg.sliding_window, offsets)
+    return output_proj_b(o, p, cfg, cos_b, sin_b)
+
+
+def _decode_indexer_select_batched(x_t: mx.array, qr: mx.array, lcs: list[_LayerCache], idx_p: dict,
+                                   cfg: DeepSeekV4Config, cos_b: mx.array, sin_b: mx.array,
+                                   ncomp_max: int, ncomps: list[int]) -> mx.array:
+    """Batched Lightning-indexer top-k selection: ``[B,1,ncomp_max]`` bool mask of the compressed
+    tokens each stream keeps. Per-stream-offset sibling of :func:`_decode_indexer_select` over the
+    padded indexer-KV; padded columns (``t >= n_comp_b``) are scored ``-inf`` so they never win the
+    per-stream top-``index_topk`` (k clamped to ``n_comp_b``). B=1 reproduces the single-stream mask."""
+    inh, ihd, rd = cfg.index_n_heads, cfg.index_head_dim, cfg.rope_head_dim
+    b = x_t.shape[0]
+    qb = (qr @ idx_p["wq_b"].T).reshape(b, 1, inh, ihd)
+    qb = rope_partial_b(qb, cos_b, sin_b, rd).astype(mx.float32)
+    ikv = _pad_stack([lc.ikv for lc in lcs], ncomp_max).astype(mx.float32)   # [B,ncomp_max,index_head_dim]
+    weights = (x_t @ idx_p["weights_proj"].T).astype(mx.float32) * (ihd ** -0.5 * inh ** -0.5)
+    score = mx.einsum("bqhd,btd->bqht", qb, ikv)               # [B,1,inh,ncomp_max]
+    score = (mx.maximum(score, 0.0) * weights[..., None]).sum(axis=2)   # [B,1,ncomp_max]
+    ki = mx.arange(ncomp_max)[None, :]
+    ncs = mx.array(ncomps, dtype=mx.int32)[:, None]
+    valid = (ki < ncs)[:, None, :]                             # [B,1,ncomp_max]
+    score = mx.where(valid, score, mx.array(float("-inf"), score.dtype))   # padding never selected
+    # per-stream threshold = the k-th largest valid score (k = min(index_topk, n_comp_b)); ascending
+    # sort puts the -inf padding first, so index ``ncomp_max - k`` is the k-th largest of the valids.
+    ks = [min(cfg.index_topk, n) for n in ncomps]
+    thr_idx = mx.array([min(max(ncomp_max - k, 0), ncomp_max - 1) for k in ks], dtype=mx.int32)
+    sorted_sc = mx.sort(score, axis=-1)                        # [B,1,ncomp_max] ascending
+    thr = mx.take_along_axis(sorted_sc, thr_idx[:, None, None], axis=-1)    # [B,1,1]
+    return (score >= thr) & valid                              # exclude padding (redundant w/ -inf)
+
+
+def decode_step_compressed_batched(x_t: mx.array, p: dict, cfg: DeepSeekV4Config, layer_id: int,
+                                   lcs: list[_LayerCache], cos: mx.array, sin: mx.array,
+                                   offsets: list[int]) -> mx.array:
+    """Batched compressed decode across ``B`` streams (ratio-4 + indexer / ratio-128) —
+    per-stream-offset sibling of :func:`decode_step_compressed`. Per-stream (rule-3): the latent-KV
+    append, the raw-hidden ring push, and the window-closing compressor pool (``_maybe_pool``, which
+    appends one compressed/indexer token when ``(offset_b+1) % ratio == 0``). Batched: ONE projection,
+    and ONE softmax over the per-stream-padded window-latent ++ compressed keys with per-stream window
+    / visibility / indexer-top-k masks (so each stream attends exactly the keys its single-stream step
+    would). Returns ``[B,1,dim]``."""
+    b = x_t.shape[0]
+    ratio = cfg.compress_ratio(layer_id)
+    overlap = cfg.overlap(layer_id)
+    cos_b, sin_b = gather_rope_rows(cos, sin, offsets)         # [B,1,rd/2]
+    qr, q, kv = project_qkv_b(x_t, p, cfg, cos_b, sin_b)       # qr [B,1,qlora], q [B,1,H,hd], kv [B,1,hd]
+    for s in range(b):                                         # per-stream cache update + pool (IO, rule-3)
+        lc = lcs[s]
+        lc.ratio = ratio
+        lc.append_kv(kv[s:s + 1])
+        _push_ring(lc, x_t[s:s + 1], ratio, overlap)
+        _maybe_pool(lc, p, cfg, layer_id, ratio, offsets[s], cos, sin)
+
+    qf = q.astype(mx.float32)
+    scale = cfg.attn_scale
+    kv_pad = _pad_stack([lc.kv for lc in lcs]).astype(mx.float32)           # [B,L_max,hd]
+    l_max = kv_pad.shape[1]
+    sc = mx.einsum("bqhd,bsd->bqhs", qf, kv_pad) * scale                   # [B,1,H,L_max]
+    ki = mx.arange(l_max)[None, :]
+    off = mx.array(offsets, dtype=mx.int32)[:, None]
+    win = (ki <= off) & (ki > off - cfg.sliding_window)                    # [B,L_max] window + pad mask
+    sc = sc + mx.where(win, 0.0, _NEG)[:, None, None, :]
+    kv_all = kv_pad
+
+    ncomps = [lc.n_comp() for lc in lcs]
+    ncomp_max = max(ncomps)
+    if ncomp_max > 0:
+        ckv = _pad_stack([lc.ckv for lc in lcs], ncomp_max).astype(mx.float32)   # [B,ncomp_max,hd]
+        sc_c = mx.einsum("bqhd,btd->bqht", qf, ckv) * scale                # [B,1,H,ncomp_max]
+        if cfg.has_indexer(layer_id):
+            sel = _decode_indexer_select_batched(x_t, qr, lcs, p["indexer"], cfg, cos_b, sin_b,
+                                                 ncomp_max, ncomps)        # [B,1,ncomp_max]
+        else:                                                              # ratio-128: all cached visible
+            ncs = mx.array(ncomps, dtype=mx.int32)[:, None]
+            sel = (mx.arange(ncomp_max)[None, :] < ncs)[:, None, :]        # mask padded columns only
+        sc_c = sc_c + mx.where(sel, 0.0, _NEG)[:, :, None, :]
+        sc = mx.concatenate([sc, sc_c], axis=-1)
+        kv_all = mx.concatenate([kv_pad, ckv], axis=1)
+
+    m = mx.max(sc, axis=-1, keepdims=True)
+    ex = mx.exp(sc - m)
+    sink = p["attn_sink"].astype(mx.float32)
+    denom = mx.sum(ex, axis=-1) + mx.exp(sink[None, None, :] - m[..., 0])
+    o = mx.einsum("bqht,btd->bqhd", ex, kv_all) / denom[..., None]
+    return output_proj_b(o, p, cfg, cos_b, sin_b)
