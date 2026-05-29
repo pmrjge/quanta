@@ -578,15 +578,41 @@ def _maybe_pool(lc: _LayerCache, p: dict, cfg: DeepSeekV4Config, layer_id: int, 
         lc.ikv = ik if lc.ikv is None else mx.concatenate([lc.ikv, ik], axis=1)
 
 
+def _ring_cap(ratio: int, overlap: bool, max_rollback: int) -> int:
+    """Raw-hidden ring depth: the last ``(2 if overlap else 1)*ratio`` positions needed to pool the
+    next (possibly overlapping) window, plus ``max_rollback-1`` extra so a k≥2 spec-decode rollback
+    can drop a full chained draft suffix. Single source of truth shared by :func:`_push_ring`
+    (per-stream) and :func:`_push_ring_batched` (the #18 batched arena ring)."""
+    return (2 if overlap else 1) * ratio + (max_rollback - 1)
+
+
 def _push_ring(lc: _LayerCache, x_t: mx.array, ratio: int, overlap: bool) -> None:
     """Append the new hidden vector to the raw-hidden ring, trimmed to the last
     ``coff*ratio + (max_rollback-1)`` positions — the minimum needed to pool the next window AND
     roll back up to ``max_rollback`` tokens within it (k≥2 spec-decode drops a full chained suffix
     when every draft is rejected). ``max_rollback`` defaults to 1 ⇒ classic k=1 sizing."""
-    cap = (2 if overlap else 1) * ratio + (lc.max_rollback - 1)
+    cap = _ring_cap(ratio, overlap, lc.max_rollback)
     lc.ring = x_t if lc.ring is None else mx.concatenate([lc.ring, x_t], axis=1)
     if lc.ring.shape[1] > cap:
         lc.ring = lc.ring[:, -cap:]
+
+
+def _push_ring_batched(ring: mx.array | None, x_t: mx.array, *, cap: int) -> mx.array:
+    """Batched sibling of :func:`_push_ring` for the #18 arena: roll a **fixed-width** ``[R, cap, dim]``
+    raw-hidden ring and append the ``R`` new hidden vectors ``x_t`` (``[R, T, dim]``; ``T==1`` on the
+    decode hot path) at the newest slots — ONE batched roll for all rows, no per-stream Python loop.
+
+    Unlike the per-stream ring (which *grows* from width 1 up to ``cap`` because a single stream owns
+    its own array), the batched ring holds ``R`` ragged-length rows in ONE array, so it is always
+    ``cap`` wide with the newest vector at ``[:, -1]`` and unfilled positions zero-padded at the FRONT.
+    A row pushed ``n`` times thus holds its valid tail in the last ``min(n, cap)`` columns —
+    bit-identical to that row's per-stream :func:`_push_ring` ring (same concat-then-trim-to-``cap``;
+    raw hidden, no quant ⇒ exact). ``ring=None`` lazily allocates a zero ``[R, cap, dim]`` (learning
+    ``R``/``dim``/dtype from ``x_t``), mirroring the arena's lazy first-write alloc. ``cap`` is the
+    layer-uniform :func:`_ring_cap`. Pure data movement — isolated, not yet wired into a stepper (M3)."""
+    if ring is None:
+        ring = mx.zeros((x_t.shape[0], cap, x_t.shape[-1]), dtype=x_t.dtype)
+    return mx.concatenate([ring, x_t], axis=1)[:, -cap:]
 
 
 # --- decode steppers ---------------------------------------------------------
