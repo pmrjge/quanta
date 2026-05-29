@@ -188,9 +188,10 @@ class Qwen35Artifact:
     def mtp(self, j: int = 0) -> dict[str, mx.array]:
         """The native MTP block: ``fc`` fusion + pre-norms (bf16), one full-attn (int8) + MoE block.
 
-        Mirrors :meth:`quanta.qwen35.loader.Qwen35SourceCheckpoint.mtp`: the routed experts come back
-        as **separate** pre-stacked stacks (``experts_gate_proj`` / ``experts_up_proj`` /
-        ``experts_down_proj``), dequantized from the int4 g64 stacks.
+        Mirrors :meth:`quanta.qwen35.loader.Qwen35SourceCheckpoint.mtp`: the MoE has the SAME fused
+        pre-stacked layout as a main-decoder block, so the routed experts come back as ``experts_gate_up``
+        ``[E, 2*moe_inter, hidden]`` / ``experts_down`` ``[E, hidden, moe_inter]`` (the int4 g64 stacks
+        dequantized in one shot) — identical to :meth:`moe`.
         """
         if j != 0:
             raise IndexError(f"Qwen3.5 has {self.cfg.num_mtp_modules} MTP head(s); got j={j}")
@@ -209,10 +210,11 @@ class Qwen35Artifact:
         moe: dict[str, mx.array] = {
             "gate": self.read(mp + "gate.weight"),
             "shared_expert_gate": self.read(mp + "shared_expert_gate.weight"),
+            "experts_gate_up": self.read(mp + "experts.gate_up_proj"),  # [E, 2*moe_inter, hidden]
+            "experts_down": self.read(mp + "experts.down_proj"),        # [E, hidden, moe_inter]
         }
         for proj in SHARED_EXPERT_PROJS:
             moe[f"shared_{proj}"] = self.read(mp + f"shared_expert.{proj}.weight")
-            moe[f"experts_{proj}"] = self.read(mp + f"experts.{proj}")  # [E, out, in] int4 stack
         out["moe"] = moe
-        mx.eval([out["fc"], out["attention"]["q_proj.weight"], moe["experts_gate_proj"]])
+        mx.eval([out["fc"], out["attention"]["q_proj.weight"], moe["experts_gate_up"]])
         return out

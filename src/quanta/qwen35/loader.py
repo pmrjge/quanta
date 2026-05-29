@@ -19,11 +19,12 @@ DeltaNet) **or** ``full_attn`` (gated GQA) chosen by :meth:`Qwen35Config.is_line
 :meth:`~Qwen35Config.is_full_attention`, ``moe`` (router + pre-stacked routed experts + shared expert),
 and the native ``mtp`` block.
 
-Layout note — routed experts are stored **pre-stacked 3D** in the main decoder
-(``mlp.experts.gate_up_proj`` ``[E, 2*moe_inter, hidden]`` and ``mlp.experts.down_proj``
-``[E, hidden, moe_inter]`` — already ``gather_qmm``-ready), but the native MTP block stores them
-**per-expert** (``mlp.experts.{e}.{gate_proj,up_proj,down_proj}.weight``), so :meth:`mtp` stacks them to
-the same ``[E, out, in]`` shape on demand.
+Layout note — routed experts are stored **pre-stacked + gate/up-fused 3-D** on **every** MoE block,
+the main decoder and the native MTP block alike (``mlp.experts.gate_up_proj`` ``[E, 2*moe_inter,
+hidden]`` and ``mlp.experts.down_proj`` ``[E, hidden, moe_inter]`` — already ``gather_qmm``-ready), so
+this loader never stacks experts itself. (Verified empirically on Qwen3.6-35B-A3B: the only
+``experts.*`` children across the whole checkpoint are ``gate_up_proj`` / ``down_proj``, on all 40
+decoder layers + the 1 MTP layer; no per-expert ``experts.{e}.*`` keys exist.)
 
 Tensors are returned in their **native source dtype** verbatim: most weights are BF16, but the Gated
 DeltaNet ``A_log`` and per-head ``norm.weight`` are F32 in the checkpoint (SSM state precision) — they
@@ -108,6 +109,14 @@ class Qwen35SourceCheckpoint:
     def has(self, key: str) -> bool:
         return key in self._wm
 
+    def release(self) -> None:
+        """Drop the cached shard mmap so a layer's source tensors can be freed (rule-8: one text layer
+        resident at a time). The next ``_tensor`` access re-mmaps its shard lazily. Mirrors
+        :meth:`quanta.qwen35.artifact.Qwen35Artifact.release` so the bake/reference treat the source
+        checkpoint and the baked artifact identically."""
+        self._cache = {}
+        self._cache_file = None
+
     # ---- top-level ----------------------------------------------------------
     def embed(self) -> mx.array:
         return self._tensor(EMBED_KEY)
@@ -183,9 +192,10 @@ class Qwen35SourceCheckpoint:
         """The native MTP module: the ``fc`` embed/hidden combine + one full-attn + MoE decoder block.
 
         ``j`` selects the MTP head; Qwen3.5 has exactly one (``mtp_num_hidden_layers=1``). The MTP
-        decoder block is **always full-attention**, and — unlike the main decoder — its routed experts
-        are stored **per-expert** (``mlp.experts.{e}.{gate_proj,up_proj,down_proj}.weight``), so they
-        are stacked here to the same ``[E, out, in]`` shape the main decoder ships pre-stacked.
+        decoder block is **always full-attention**, and its MoE — exactly like the main decoder — ships
+        routed experts **pre-stacked + gate/up-fused** (``mlp.experts.gate_up_proj`` / ``down_proj``),
+        so the ``moe`` sub-dict matches :meth:`moe` verbatim (``experts_gate_up`` / ``experts_down``;
+        no per-expert python stacking).
         """
         if j != 0:
             raise IndexError(f"Qwen3.5 has {self.cfg.num_mtp_modules} MTP head(s); got j={j}")
@@ -206,15 +216,11 @@ class Qwen35SourceCheckpoint:
         moe: dict[str, mx.array] = {
             "gate": self._tensor(mp + "gate.weight"),
             "shared_expert_gate": self._tensor(mp + "shared_expert_gate.weight"),
+            "experts_gate_up": self._tensor(mp + "experts.gate_up_proj"),  # [E, 2*moe_inter, hidden]
+            "experts_down": self._tensor(mp + "experts.down_proj"),        # [E, hidden, moe_inter]
         }
         sp = mp + "shared_expert."
         for proj in SHARED_EXPERT_PROJS:
             moe[f"shared_{proj}"] = self._tensor(sp + f"{proj}.weight")
-        # per-expert -> [E, out, in] stacks (the only place this loader stacks experts itself)
-        e = self.cfg.num_experts
-        ep = mp + "experts."
-        for proj in SHARED_EXPERT_PROJS:
-            moe[f"experts_{proj}"] = mx.stack(
-                [self._tensor(f"{ep}{j_}.{proj}.weight") for j_ in range(e)])
         out["moe"] = moe
         return out

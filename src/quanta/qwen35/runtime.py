@@ -52,12 +52,21 @@ _LINEAR_PROJS = ("in_proj_qkv", "in_proj_a", "in_proj_b", "in_proj_z", "out_proj
 _FULL_PROJS = ("q_proj", "k_proj", "v_proj", "o_proj")
 
 
+def _one_plus(w: mx.array) -> mx.array:
+    """Qwen3.5 ``Qwen3_5MoeRMSNorm`` applies ``(1 + weight)`` (Gemma-style; see the HF reference), so
+    the resident norm weight is ``source + 1`` and the plain ``weight·normed`` forward (nn.RMSNorm /
+    mx.fast.rms_norm / the attention ``_rms``) matches the reference. Applies to input/post-attention
+    layernorms, the per-head q/k norms, and the final norm — but NOT the GatedDeltaNet gated norm
+    (``Qwen3_5MoeRMSNormGated`` uses plain ``weight``). Kept in the source dtype (bf16)."""
+    return w + 1.0
+
+
 def _load_block(art: Qwen35Artifact, cfg: Qwen35Config, i: int) -> Qwen35Block:
     """Build one runnable :class:`Qwen35Block` for layer ``i`` from the dequantized artifact tensors."""
     blk = Qwen35Block(cfg, i)
     norms = art.block_norms(i)
-    blk.input_layernorm.weight = norms["input_layernorm"]
-    blk.post_attention_layernorm.weight = norms["post_attention_layernorm"]
+    blk.input_layernorm.weight = _one_plus(norms["input_layernorm"])          # (1+w) convention
+    blk.post_attention_layernorm.weight = _one_plus(norms["post_attention_layernorm"])
 
     m = blk.mixer
     if cfg.is_linear_attention(i):
@@ -78,8 +87,8 @@ def _load_block(art: Qwen35Artifact, cfg: Qwen35Config, i: int) -> Qwen35Block:
         fa = art.full_attn(i)
         for proj in _FULL_PROJS:
             getattr(m, proj).weight = fa[f"{proj}.weight"]
-        m.q_norm = fa["q_norm.weight"]
-        m.k_norm = fa["k_norm.weight"]
+        m.q_norm = _one_plus(fa["q_norm.weight"])                             # (1+w) convention
+        m.k_norm = _one_plus(fa["k_norm.weight"])
 
     moe = art.moe(i)
     blk.mlp.gate = moe["gate"]
@@ -123,7 +132,7 @@ class Qwen35ResidentModel:
 
         # embed / final norm / lm_head (bf16; head may be tied to the embedding)
         self.embed_w = self.art.embed()
-        self.norm_w = self.art.final_norm()
+        self.norm_w = _one_plus(self.art.final_norm())          # (1+w) Qwen3_5MoeRMSNorm convention
         self.lm_head_w = self.art.lm_head()
         mx.eval([self.embed_w, self.norm_w, self.lm_head_w])
         self.art.release()
@@ -182,7 +191,7 @@ class Qwen35ResidentModel:
         for t in range(h.shape[1]):
             ht = h[:, t:t + 1]                                 # [1,1,hidden] token t
             off_t = offset + t                                 # its absolute position
-            hint = seq_hint if seq_hint is not None else off_t + 1
+            hint = seq_hint if seq_hint is not None else caches.yarn_seq(off_t + 1, self.cfg)
             for i, blk in enumerate(self.layers):
                 ht = self._decode_block(ht, blk, i, caches, off_t, use_fast, hint)
                 if i in cap_set:

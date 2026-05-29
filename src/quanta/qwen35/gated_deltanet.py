@@ -90,13 +90,13 @@ def gdn_recurrence(q, k, v, g, beta, state_in=None):
     for t in range(length):  # reference only: explicit time loop (never the hot path)
         kt = k[:, t]                                            # (B,Hv,Dk)
         vt = v[:, t]                                            # (B,Hv,Dv)
+        s = g[:, t][:, :, None, None] * s                       # decay the state FIRST (gated delta rule)
         if DELTA_RULE:
-            pred = mx.sum(s * kt[:, :, :, None], axis=2)        # Sᵀk: (B,Hv,Dv)
+            pred = mx.sum(s * kt[:, :, :, None], axis=2)        # (decayed S)ᵀk: (B,Hv,Dv)
             u = vt - pred
         else:
             u = vt
-        s = (g[:, t][:, :, None, None] * s
-             + beta[:, t][:, :, None, None] * (kt[:, :, :, None] * u[:, :, None, :]))
+        s = s + beta[:, t][:, :, None, None] * (kt[:, :, :, None] * u[:, :, None, :])  # add write
         o = mx.sum(s * q[:, t][:, :, :, None], axis=2)          # Sᵀq: (B,Hv,Dv)
         os.append(o)
     return mx.stack(os, axis=1), s
@@ -118,13 +118,13 @@ def gdn_step(q_t, k_t, v_t, g_t, beta_t, state):
     rep = hv // hk
     k_t = _repeat_kheads(k_t, rep, axis=1)                      # (B,Hv,Dk)
     q_t = _repeat_kheads(q_t, rep, axis=1)
+    state = g_t[:, :, None, None] * state                      # decay the state FIRST (gated delta rule)
     if DELTA_RULE:
-        pred = mx.sum(state * k_t[:, :, :, None], axis=2)       # (B,Hv,Dv)
+        pred = mx.sum(state * k_t[:, :, :, None], axis=2)       # (decayed S)ᵀk: (B,Hv,Dv)
         u = v_t - pred
     else:
         u = v_t
-    state = (g_t[:, :, None, None] * state
-             + beta_t[:, :, None, None] * (k_t[:, :, :, None] * u[:, :, None, :]))
+    state = state + beta_t[:, :, None, None] * (k_t[:, :, :, None] * u[:, :, None, :])  # add write
     o = mx.sum(state * q_t[:, :, :, None], axis=2)              # (B,Hv,Dv)
     return o, state
 
@@ -164,12 +164,12 @@ def _gdn_chunk(q, k, v, g, beta, s):
     os = []
     for t in range(q_len):  # bounded: <= chunk_size, the permitted inner block scan
         kt, vt = k[:, t], v[:, t]
+        s = g[:, t][:, :, None, None] * s                       # decay the state FIRST (gated delta rule)
         if DELTA_RULE:
-            u = vt - mx.sum(s * kt[:, :, :, None], axis=2)
+            u = vt - mx.sum(s * kt[:, :, :, None], axis=2)      # (decayed S)ᵀk
         else:
             u = vt
-        s = (g[:, t][:, :, None, None] * s
-             + beta[:, t][:, :, None, None] * (kt[:, :, :, None] * u[:, :, None, :]))
+        s = s + beta[:, t][:, :, None, None] * (kt[:, :, :, None] * u[:, :, None, :])  # add write
         os.append(mx.sum(s * q[:, t][:, :, :, None], axis=2))
     return mx.stack(os, axis=1), s
 
@@ -196,13 +196,17 @@ def causal_conv1d_step(u_t, weight, conv_state, bias=None):
 
 
 def _gated_rmsnorm(x, weight, gate, eps):
-    """Per-head gated RMSNorm (FusedRMSNormGated): RMSNorm(x)·weight, gated by silu(gate).
+    """Per-head gated RMSNorm — Qwen3.5 ``Qwen3_5MoeRMSNormGated``: ``silu(gate)·weight·RMSNorm(x)``.
 
-    x,gate: (B,L,Hv,Dv); weight: (Dv,). Normalization in fp32; the gate multiplies the *normalized*
-    value (gate-before-weight order, matching the Nemotron mamba gated norm)."""
-    xf = x.astype(mx.float32) * silu(gate.astype(mx.float32))
-    xf = xf * mx.rsqrt(mx.mean(xf * xf, axis=-1, keepdims=True) + eps)
-    return weight.astype(mx.float32) * xf
+    x,gate: (B,L,Hv,Dv); weight: (Dv,). The RMSNorm normalizes ``x`` **alone** (fp32), then the
+    weight multiplies, then the silu-gate multiplies — gate AFTER the norm, NOT before. The gate must
+    not enter the RMS reduction (it is per-element, and RMS is nonlinear), so the gate-before-norm
+    order (Nemotron's mamba norm) is WRONG here. Matches the HF reference forward (normalize → weight
+    → ``* silu(gate)``)."""
+    xf = x.astype(mx.float32)
+    xf = xf * mx.rsqrt(mx.mean(xf * xf, axis=-1, keepdims=True) + eps)   # RMSNorm of x ALONE
+    xf = weight.astype(mx.float32) * xf                                  # weight
+    return xf * silu(gate.astype(mx.float32))                            # then silu-gate
 
 
 class GatedDeltaNet(nn.Module):
@@ -250,14 +254,14 @@ class GatedDeltaNet(nn.Module):
             qkv_pre = qkv
             qkv = silu(causal_conv1d(qkv, self.conv_weight, self.conv_bias))
             q, k, v = self._split_qkv(qkv, b, t)
-            q, k = _l2norm(q), _l2norm(k)
+            q, k = _l2norm(q) * (self.dk ** -0.5), _l2norm(k)    # HF scales q by 1/√dk for the readout
             o, state = self._prefill(q, k, v, g, beta, state)
             conv_state = qkv_pre[:, -(self.k - 1):]               # for decode continuation
         else:  # decode step (t == 1)
             conv_out, conv_state = causal_conv1d_step(qkv[:, 0], self.conv_weight, conv_state,
                                                       self.conv_bias)
             q, k, v = self._split_qkv(silu(conv_out)[:, None], b, 1)
-            q, k = _l2norm(q), _l2norm(k)
+            q, k = _l2norm(q) * (self.dk ** -0.5), _l2norm(k)    # HF scales q by 1/√dk for the readout
             if state is None:
                 state = mx.zeros((b, self.hv, self.dk, self.dv), dtype=mx.float32)
             o, state = gdn_step(q[:, 0], k[:, 0], v[:, 0], g[:, 0], beta[:, 0], state)

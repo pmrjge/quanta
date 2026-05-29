@@ -21,8 +21,8 @@ MTP ``norm`` + the shared LM head — mirroring the main model's tail.
 
 The inherited block is reused verbatim (the SAME ``Qwen35Block`` forward prefill uses), so the MTP head
 adds no new attention / MoE math; it only assembles the combine + readout around it. The MTP block's
-routed experts ship **per-expert** in the source (un-fused), so the runtime fuses gate+up into the
-``[E, 2*inter, hidden]`` stack the block's MoE consumes (see :func:`build_mtp_block`).
+routed experts ship **pre-stacked + gate/up-fused** in the source, exactly like a main-decoder block,
+so the runtime wires them straight into the block's MoE (see :func:`build_mtp_block`).
 
 This module is the pure forward, gated against the reference in ``parity/qwen35_mtp_spec_test.py``
 (structurally, model-free) and — deferred — the real teacher-forced check.
@@ -102,8 +102,8 @@ def mtp_forward(prev_hidden: mx.array, next_ids: mx.array, embed: mx.array, head
 def build_mtp_block(art, cfg: Qwen35Config) -> tuple[Qwen35Block, dict]:
     """Assemble the MTP head from a :class:`quanta.qwen35.artifact.Qwen35Artifact`.
 
-    Returns ``(block, p)``: a runnable full-attention :class:`Qwen35Block` (its routed experts fused
-    gate+up from the per-expert MTP stacks) plus the combine/readout param dict
+    Returns ``(block, p)``: a runnable full-attention :class:`Qwen35Block` (its routed experts wired
+    straight from the fused pre-stacked MTP stacks) plus the combine/readout param dict
     (``fc`` / ``pre_fc_norm_embedding`` / ``pre_fc_norm_hidden`` / ``norm``). The MTP block types as a
     full-attention layer regardless of the main schedule, so we force ``layer_types`` to a full slot.
     """
@@ -112,23 +112,29 @@ def build_mtp_block(art, cfg: Qwen35Config) -> tuple[Qwen35Block, dict]:
     full_id = next(i for i in range(cfg.num_hidden_layers) if cfg.is_full_attention(i))
     blk = Qwen35Block(cfg, full_id)
     assert isinstance(blk.mixer, Qwen35Attention)
-    blk.input_layernorm.weight = t["input_layernorm"]
-    blk.post_attention_layernorm.weight = t["post_attention_layernorm"]
+    # norms follow the (1+w) Qwen3_5MoeRMSNorm convention (same as the main decoder; the MTP block is
+    # the same arch — HF omits MTP so this is unverified vs the oracle, but spec-decode is lossless).
+    blk.input_layernorm.weight = t["input_layernorm"] + 1.0
+    blk.post_attention_layernorm.weight = t["post_attention_layernorm"] + 1.0
     attn = t["attention"]
     for proj in ("q_proj", "k_proj", "v_proj", "o_proj"):
         getattr(blk.mixer, proj).weight = attn[f"{proj}.weight"]
-    blk.mixer.q_norm = attn["q_norm.weight"]
-    blk.mixer.k_norm = attn["k_norm.weight"]
+    blk.mixer.q_norm = attn["q_norm.weight"] + 1.0
+    blk.mixer.k_norm = attn["k_norm.weight"] + 1.0
     moe = t["moe"]
     blk.mlp.gate = moe["gate"]
-    # MTP source stores experts un-fused (separate gate/up); fuse to [E, 2*inter, hidden] for the block.
-    gate_up = mx.concatenate([moe["experts_gate_proj"], moe["experts_up_proj"]], axis=1)
-    blk.mlp.set_experts(gate_up, moe["experts_down_proj"])
+    # MTP MoE is laid out exactly like a main-decoder block — routed experts ship pre-stacked + gate/up
+    # fused ([E, 2*inter, hidden]) — so wire them straight in (no per-expert fuse).
+    blk.mlp.set_experts(moe["experts_gate_up"], moe["experts_down"])
     blk.mlp.shared_gate_proj = moe["shared_gate_proj"]
     blk.mlp.shared_up_proj = moe["shared_up_proj"]
     blk.mlp.shared_down_proj = moe["shared_down_proj"]
     blk.mlp.shared_expert_gate = moe["shared_expert_gate"]
-    p = {k: t[k] for k in ("fc", "pre_fc_norm_embedding", "pre_fc_norm_hidden", "norm")}
+    # fc is a Linear; the three combine/readout norms follow the (1+w) Qwen3_5MoeRMSNorm convention
+    p = {"fc": t["fc"],
+         "pre_fc_norm_embedding": t["pre_fc_norm_embedding"] + 1.0,
+         "pre_fc_norm_hidden": t["pre_fc_norm_hidden"] + 1.0,
+         "norm": t["norm"] + 1.0}
     return blk, p
 
 

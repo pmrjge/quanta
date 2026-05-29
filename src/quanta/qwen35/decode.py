@@ -157,6 +157,10 @@ class Qwen35Cache:
             else KVCache(quantized=quantized, group_size=group_size)
             for i in range(n_layers)
         ]
+        # Pinned per-request YaRN seq-len (None ⇒ derive from the live position). Holds the dynamic
+        # YaRN factor fixed for the request's lifetime so the rotate-then-cache roped K stay
+        # consistent; set via pin_yarn(), read via yarn_seq(). See yarn_seq for the >native rule.
+        self.yarn_seq_hint: int | None = None
 
     def __getitem__(self, i: int):
         return self.layers[i]
@@ -175,6 +179,41 @@ class Qwen35Cache:
             elif lc.offset:
                 return lc.offset
         return 0
+
+    def pin_yarn(self, max_seq_len: int) -> None:
+        """Pin the dynamic-YaRN factor for this request to ``max_seq_len`` — the largest absolute
+        position it will reach (e.g. ``prompt_len + max_new``). Every prefill/decode forward sharing
+        this cache then uses the SAME factor, so the rotate-then-cache roped K stay consistent. Below
+        the native window this is a no-op (factor 1.0); above it, pinning is what stops the dynamic
+        factor drifting per step. Raises on a nonsensical value (rule 6)."""
+        if max_seq_len < 1:
+            raise ValueError(f"pin_yarn(max_seq_len) needs max_seq_len >= 1 (got {max_seq_len})")
+        self.yarn_seq_hint = int(max_seq_len)
+
+    def yarn_seq(self, live_pos: int, cfg: Qwen35Config) -> int:
+        """Resolve the YaRN seq-len for a *cached* forward holding ``live_pos`` tokens (== offset+T).
+
+        Static policy (``yarn_dynamic=False``): the factor ignores length, so the live position is
+        safe. Dynamic policy: return the pinned value if :meth:`pin_yarn` was set, else the live
+        position while it fits the native window. Refuses (rule 6) to derive a >native factor from the
+        live position without a pin — that factor changes every step while the cached K were roped at
+        the old factor, silently corrupting attention. Refuses a position past the pinned budget too."""
+        if not cfg.yarn_dynamic:
+            return live_pos
+        pin = self.yarn_seq_hint
+        if pin is None:
+            if live_pos > cfg.yarn_original_max:
+                raise RuntimeError(
+                    f"qwen35: decode position {live_pos} exceeds the native window "
+                    f"{cfg.yarn_original_max} with no pinned YaRN factor — call "
+                    f"cache.pin_yarn(prompt_len + max_new) before decoding past native (rule 6: "
+                    f"refusing to silently corrupt the rotate-then-cache KV with a drifting factor).")
+            return live_pos
+        if live_pos > pin:
+            raise RuntimeError(
+                f"qwen35: decode position {live_pos} exceeds the pinned YaRN budget {pin} "
+                f"(request outgrew its pinned max length; re-pin or cap generation).")
+        return pin
 
     def truncate(self, length: int) -> None:
         """Roll every layer back to exactly the state after consuming ``length`` tokens — losslessly
@@ -219,6 +258,7 @@ class Qwen35Cache:
         new.quantized = self.quantized
         new.group_size = self.group_size
         new.max_rollback = self.max_rollback
+        new.yarn_seq_hint = self.yarn_seq_hint     # replicas inherit the request's pinned factor
         new.layers = [lc._copy() for lc in self.layers]
         return new
 

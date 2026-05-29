@@ -255,6 +255,13 @@ class Qwen35Config:
         eos_ids = tuple(int(x) for x in (eos if isinstance(eos, list) else [eos] if eos is not None
                                          else []))
         native_max = int(tc.get("max_position_embeddings", 262_144))
+        # pad_token_id is present-but-null in Qwen3.6's config.json text_config; ``.get(k, default)``
+        # returns None (not the default) for an explicit null, so coalesce gen → text_config → default.
+        # Guards a re-opened artifact that lacks generation_config.json from crashing on int(None).
+        pad_raw = gen.get("pad_token_id")
+        if pad_raw is None:
+            pad_raw = tc.get("pad_token_id")
+        pad_token_id = int(pad_raw) if pad_raw is not None else 248044
 
         return cls(
             vocab_size=int(tc["vocab_size"]),
@@ -291,7 +298,7 @@ class Qwen35Config:
             max_position_embeddings=native_max,
             eos_token_id=int(eos_ids[0]) if eos_ids else 248046,
             eos_token_ids=eos_ids or (248046, 248044),
-            pad_token_id=int(gen.get("pad_token_id", tc.get("pad_token_id", 248044))),
+            pad_token_id=pad_token_id,
             tie_word_embeddings=bool(cfg.get("tie_word_embeddings", tc.get("tie_word_embeddings",
                                                                           False))),
             bos_token_id=(int(gen["bos_token_id"]) if gen.get("bos_token_id") is not None else None),

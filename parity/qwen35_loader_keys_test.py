@@ -12,8 +12,9 @@ deliberately does not exercise it.
 
 Coverage: top-level (embed / norm / lm_head), a sample LINEAR-attention layer, a sample FULL-attention
 layer, the MoE block of some layer (pre-stacked 3D routed experts + shared expert), and the native MTP
-block (full-attn + per-expert MoE). The loader's own suffix constants and key prefixes are imported so
-the gate checks the *actual* enumeration, not a hand-copied list that could drift.
+block (full-attn + MoE with the SAME fused pre-stacked experts as a main-decoder block). The loader's
+own suffix constants and key prefixes are imported so the gate checks the *actual* enumeration, not a
+hand-copied list that could drift.
 
     uv run --with numpy python -m parity.qwen35_loader_keys_test
 
@@ -37,7 +38,7 @@ from quanta.qwen35.loader import (
     SHARED_EXPERT_PROJS,
 )
 
-MODEL_DIR = Path("/Users/pmrj/models/Qwen3.5-397B-A17B")
+MODEL_DIR = Path("/Users/pmrj/models/Qwen3.6-35B-A3B")
 
 
 class HeaderIndex:
@@ -165,7 +166,7 @@ def run() -> None:
     assert set(SHARED_EXPERT_PROJS) == {"gate_proj", "up_proj", "down_proj"}
     group(f"MoE layer {moe_layer}: router + pre-stacked experts + shared", n, f)
 
-    # --- the native MTP block (full-attn + PER-EXPERT MoE) --------------------
+    # --- the native MTP block (full-attn + MoE; SAME fused pre-stacked experts as main decoder) ---
     n, f = checked, failures
     check_shape("mtp.fc.weight", (H, 2 * H))
     check_shape("mtp.pre_fc_norm_embedding.weight", (H,))
@@ -180,14 +181,10 @@ def run() -> None:
     check_shape(lp + "mlp.shared_expert_gate.weight", (1, H))
     for proj, want in (("gate_proj", (si, H)), ("up_proj", (si, H)), ("down_proj", (H, si))):
         check_shape(f"{lp}mlp.shared_expert.{proj}.weight", want)
-    # MTP routed experts are PER-EXPERT (not stacked): spot-check the boundary experts of each proj
-    want_expert = {"gate_proj": (cfg.moe_intermediate_size, H),
-                   "up_proj": (cfg.moe_intermediate_size, H),
-                   "down_proj": (H, cfg.moe_intermediate_size)}
-    for proj in SHARED_EXPERT_PROJS:
-        for e in (0, E - 1):
-            check_shape(f"{lp}mlp.experts.{e}.{proj}.weight", want_expert[proj])
-    group("MTP block: fc + norms + full-attn + per-expert MoE", n, f)
+    # MTP routed experts are PRE-STACKED + gate/up-FUSED, exactly like the main decoder (no per-expert)
+    check_shape(lp + "mlp.experts.gate_up_proj", (E, cfg.moe_gate_up_out, H))   # PRE-STACKED 3D
+    check_shape(lp + "mlp.experts.down_proj", (E, H, cfg.moe_intermediate_size))  # PRE-STACKED 3D
+    group("MTP block: fc + norms + full-attn + fused pre-stacked MoE", n, f)
 
     # --- visual exclusion: the loader must reach NO model.visual.* key ---------
     # Reconstruct the exact key set the loader enumerates across every layer + MTP, then assert none of
@@ -213,8 +210,7 @@ def run() -> None:
                    lp + "mlp.gate.weight", lp + "mlp.shared_expert_gate.weight"}
     enumerated |= {f"{lp}self_attn.{s}" for s in FULL_ATTN_SUFFIXES}
     enumerated |= {f"{lp}mlp.shared_expert.{proj}.weight" for proj in SHARED_EXPERT_PROJS}
-    enumerated |= {f"{lp}mlp.experts.{e}.{proj}.weight"
-                   for proj in SHARED_EXPERT_PROJS for e in range(E)}
+    enumerated |= {lp + "mlp.experts.gate_up_proj", lp + "mlp.experts.down_proj"}
     leaked = sorted(k for k in enumerated if k.startswith("model.visual."))
     missing = sorted(k for k in enumerated if not idx.has(k))
     excl_ok = (not leaked) and (not missing) and n_visual_ckpt > 0

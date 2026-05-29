@@ -129,9 +129,9 @@ def batched_decode_step(
         after_mixer: list[mx.array] = []
         for s in range(b):
             lc = stream_caches[s][layer_i]
-            # YaRN factor pinned to the per-stream sequence length so it matches the
-            # single-stream runtime at the same absolute position.
-            seq_hint_s = offsets[s] + 1
+            # YaRN factor resolved per stream so it matches the single-stream runtime at the same
+            # absolute position; >native requires a pinned factor (rule 6 — see Qwen35Cache.yarn_seq).
+            seq_hint_s = stream_caches[s].yarn_seq(offsets[s] + 1, cfg)
             if blk.is_linear:
                 out_s = _gdn_step_through_cache(blk, lc, hs[s])
             else:
@@ -370,7 +370,7 @@ class Qwen35BatchedResidentModel:
         hs: list[mx.array] = [h_b[i:i + 1] for i in range(b)]                   # B × [1,1,hidden]
 
         captured: mx.array | None = None
-        seq_hint = offset + 1                                                   # YaRN pin (shared)
+        seq_hint = caches[0].yarn_seq(offset + 1, self.cfg)                     # YaRN pin (shared replicas)
 
         for layer_i, blk in enumerate(self.layers):
             # 1) per-stream mixer step — bounded B-loop, rule-3 OK. GDN / GQA work is vectorized

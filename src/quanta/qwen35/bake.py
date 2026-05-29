@@ -22,9 +22,9 @@ bakes. Per-tensor scheme follows the project quant policy + the #115 recipe:
 
 The native **MTP** block (``mtp.*``) is baked like a decoder layer: its routed experts → int4 g64,
 its full-attn projections + shared expert → int8, and its norms + the ``fc`` embed/hidden fusion
-(``fc`` / ``pre_fc_norm_embedding`` / ``pre_fc_norm_hidden`` / ``norm``) → bf16. NB the MTP block
-stores experts **per-expert** in the source, so the loader hands them back as **separate** stacks
-(``experts_gate_proj`` / ``experts_up_proj`` / ``experts_down_proj``), each baked int4 g64.
+(``fc`` / ``pre_fc_norm_embedding`` / ``pre_fc_norm_hidden`` / ``norm``) → bf16. Its MoE has the SAME
+fused pre-stacked layout as a main-decoder block (``experts.gate_up_proj`` + ``experts.down_proj``),
+so it bakes through the same :func:`_bake_moe_block` path — no per-expert special-casing.
 
 **Dynamic-YaRN 1M policy:** the resident artifact must serve 1M context by default, so the bake
 writes the quanta long-context policy (``max_context`` / ``yarn_factor`` / ``yarn_original_max`` /
@@ -46,6 +46,7 @@ real bake.
 from __future__ import annotations
 
 import json
+import shutil
 from collections.abc import Iterable
 from pathlib import Path
 
@@ -68,6 +69,20 @@ from quanta.qwen35.loader import (
 
 _EXPERT_BITS = 4
 _INT8_BITS = 8
+
+# Source metadata copied verbatim into the artifact so the bundle is **self-contained** + servable:
+# the Qwen3.5 tokenizer reads ``generation_config.json`` for the authoritative two-eos stop set
+# (``<|im_end|>`` 248046 + ``<|endoftext|>`` 248044) — dropping it would silently serve the wrong eos
+# (rule-6) — and renders chat from ``chat_template.jinja`` + the BPE ``vocab.json``/``merges.txt``.
+# ``config.json``/``manifest.json``/the index are written by the ArtifactWriter; these are the rest.
+_METADATA_SIDECARS: tuple[str, ...] = (
+    "generation_config.json",
+    "tokenizer_config.json",
+    "tokenizer.json",
+    "vocab.json",
+    "merges.txt",
+    "chat_template.jinja",
+)
 
 # --- per-kind suffix policy (mirror the loader's enumeration; classify each, fail loud on a miss) ---
 # Linear-attention (Gated DeltaNet): which suffixes are int8 matmuls vs bf16 SSM control.
@@ -140,8 +155,9 @@ def _bake_moe_block(writer: ArtifactWriter, prefix: str, moe: dict, gs: int,
 
 def _bake_mtp(writer: ArtifactWriter, ck: Qwen35SourceCheckpoint, cfg: Qwen35Config,
               j: int, gs: int, scale_dtype: mx.Dtype | None) -> None:
-    """Bake the native MTP block like a decoder layer: fc-fusion + norms bf16; full-attn int8;
-    shared expert int8; per-expert routed stacks int4 g64."""
+    """Bake the native MTP block like a decoder layer: fc-fusion + norms bf16; full-attn int8; MoE
+    identical to a main-decoder block (shared expert int8, fused pre-stacked routed experts int4 g64)
+    via :func:`_bake_moe_block`."""
     t = ck.mtp(j)
     p = f"mtp.{j}."
     # fc embed/hidden fusion + its pre-norms + the block's final norm → bf16
@@ -152,15 +168,9 @@ def _bake_mtp(writer: ArtifactWriter, ck: Qwen35SourceCheckpoint, cfg: Qwen35Con
     writer.add_dense(p + "input_layernorm.weight", t["input_layernorm"])
     writer.add_dense(p + "post_attention_layernorm.weight", t["post_attention_layernorm"])
     _write_suffix_sub(writer, p + "self_attn.", t["attention"], _FULL_INT8, _FULL_BF16, gs, scale_dtype)
-    moe = t["moe"]
-    mp = p + "mlp."
-    writer.add_dense(mp + "gate.weight", moe["gate"])
-    writer.add_dense(mp + "shared_expert_gate.weight", moe["shared_expert_gate"])
-    for proj in SHARED_EXPERT_PROJS:
-        _write_int8(writer, f"{mp}shared_expert.{proj}", moe[f"shared_{proj}"], gs, scale_dtype)
-        # per-expert stacks (the MTP source stores experts un-fused) → int4 g64
-        _write_expert_stack(writer, f"{mp}experts.{proj}", moe[f"experts_{proj}"], gs, scale_dtype)
-    del t, moe
+    # MoE shares the main-decoder layout (fused pre-stacked experts) → same bake path
+    _bake_moe_block(writer, p + "mlp.", t["moe"], gs, scale_dtype)
+    del t
 
 
 def _bake_long_context(out_dir: Path, cfg: Qwen35Config) -> None:
@@ -193,6 +203,21 @@ def _bake_long_context(out_dir: Path, cfg: Qwen35Config) -> None:
     if isinstance(tc, dict):
         tc["quanta_long_context"] = policy
     cfg_path.write_text(json.dumps(conf, indent=2))
+
+
+def _copy_metadata_sidecars(source: Path, out_dir: Path) -> None:
+    """Copy the source tokenizer + generation metadata (:data:`_METADATA_SIDECARS`) into the artifact
+    so the baked bundle is self-contained and servable. Each file is copied only if present; missing
+    optional files are skipped. ``generation_config.json`` carries the two-eos stop set the tokenizer
+    serves, so its absence on a re-opened artifact would lose ``<|im_end|>`` — fail loud (rule-6)."""
+    for name in _METADATA_SIDECARS:
+        src = source / name
+        if src.exists():
+            shutil.copyfile(src, out_dir / name)
+    if not (out_dir / "generation_config.json").exists():
+        raise FileNotFoundError(
+            f"{source}/generation_config.json missing — refusing to bake an artifact without the "
+            "authoritative two-eos stop set (would silently serve the wrong eos; rule-6)")
 
 
 def bake_qwen35(
@@ -282,6 +307,7 @@ def bake_qwen35(
     }
     writer.finalize(policy)  # flushes shards + writes index/config/manifest
     _bake_long_context(Path(out_dir), cfg)  # bake the dynamic-YaRN 1M policy into config.json
+    _copy_metadata_sidecars(Path(source), Path(out_dir))  # tokenizer + generation_config (two-eos)
 
     out = Path(out_dir)
     total_bytes = sum(p.stat().st_size for p in out.glob("model-*.safetensors"))

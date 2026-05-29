@@ -20,7 +20,7 @@ Two equivalent paths (gated in ``parity/qwen35_forward_test.py``):
 
 * fast (default): ``mx.fast.rope(freqs=...)`` + ``mx.fast.scaled_dot_product_attention`` (tiled,
   never materializes a T×T score matrix — memory-safe at the 1M context).
-* naive: explicit interleaved RoPE + manual softmax — the short-sequence parity reference.
+* naive: explicit rotate-half RoPE + manual softmax — the short-sequence parity reference.
 
 Incremental decode (KV cache) is gated == prefill: the same q/k/v/gate per position regardless of
 chunking.
@@ -148,29 +148,31 @@ def yarn_inv_freq(cfg: Qwen35Config, seq_len: int) -> mx.array:
 
 
 def _rope_fast(x: mx.array, inv_freq: mx.array, rd: int, offset: int) -> mx.array:
-    """``mx.fast.rope`` over the first ``rd`` dims (interleaved), the rest pass through.
+    """``mx.fast.rope`` over the first ``rd`` dims (rotate-half), the rest pass through.
 
-    mlx ``freqs`` is the *period* (angle = pos/freqs), so pass ``1/inv_freq``. ``traditional=True``
-    rotates consecutive pairs — dot-product-equivalent to the explicit de-interleaved form."""
-    return mx.fast.rope(x, dims=rd, traditional=True, base=None, scale=1.0, offset=offset,
+    mlx ``freqs`` is the *period* (angle = pos/freqs), so pass ``1/inv_freq``. ``traditional=False``
+    selects the **rotate-half** (split-half) variant Qwen3.5 uses (HF ``rotate_half``: dim ``i`` pairs
+    with ``i+rd/2``), NOT the interleaved/consecutive-pair form."""
+    return mx.fast.rope(x, dims=rd, traditional=False, base=None, scale=1.0, offset=offset,
                         freqs=1.0 / inv_freq)
 
 
 def _rope_explicit(x: mx.array, inv_freq: mx.array, rd: int, offset: int) -> mx.array:
-    """Explicit interleaved RoPE on the first ``rd`` dims (the rest pass through). ``x`` ``[B,H,T,D]``.
+    """Explicit **rotate-half** RoPE on the first ``rd`` dims (the rest pass through). ``x`` ``[B,H,T,D]``.
 
-    Reference for :func:`_rope_fast`: rotate consecutive pairs ``(x0,x1)`` by the position angle.
+    Reference for :func:`_rope_fast`: HF ``rotate_half`` — split the rotated slice into halves
+    ``(x1, x2)`` (dim ``i`` paired with ``i+rd/2``) and rotate by the position angle.
     """
     b, h, t, d = x.shape
     pos = (mx.arange(t, dtype=mx.float32) + offset)[:, None]           # [T,1]
     ang = pos * inv_freq[None, :]                                      # [T, rd/2]
     cos = mx.cos(ang)[None, None]                                      # [1,1,T,rd/2]
     sin = mx.sin(ang)[None, None]
-    xr = x[..., :rd].reshape(b, h, t, rd // 2, 2)
-    x0, x1 = xr[..., 0], xr[..., 1]
-    o0 = x0 * cos - x1 * sin
-    o1 = x0 * sin + x1 * cos
-    rot = mx.stack([o0, o1], axis=-1).reshape(b, h, t, rd)
+    xr = x[..., :rd]
+    x1, x2 = xr[..., : rd // 2], xr[..., rd // 2:]                     # split-half (rotate_half)
+    o1 = x1 * cos - x2 * sin
+    o2 = x2 * cos + x1 * sin
+    rot = mx.concatenate([o1, o2], axis=-1)
     return mx.concatenate([rot, x[..., rd:]], axis=-1)
 
 
