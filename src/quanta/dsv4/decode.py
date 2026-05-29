@@ -549,6 +549,38 @@ def _pool_one_window(cur: mx.array, prev: mx.array | None, ape: mx.array, norm_w
     return rope_partial(pooled, cos_c, sin_c, rope_head_dim)
 
 
+def _pool_one_window_b(cur: mx.array, prev: mx.array | None, prev_valid: mx.array, ape: mx.array,
+                       norm_w: mx.array, wkv: mx.array, wgate: mx.array, *, ratio: int, head_dim: int,
+                       rope_head_dim: int, eps: float, cos_c_b: mx.array, sin_c_b: mx.array,
+                       overlap: bool) -> mx.array:
+    """Batched (#18 M3) sibling of :func:`_pool_one_window`: pool one window for ALL ``B`` streams at
+    once, carrying the two things that are global in the single-stream pool but ragged across a batch —
+    a PER-ROW previous-window validity mask and a PER-ROW window-start RoPE row. ``prev_valid[b]``
+    ``False`` ⇒ that row's previous window is the window-0 pad (``kv=0``, ``score=-inf``), exactly
+    :func:`_pool_one_window`'s ``prev is None`` branch; ``True`` ⇒ the projected ``prev`` window.
+    ``cos_c_b``/``sin_c_b``: ``[B,1,rd/2]`` RoPE row at each row's window-start position ``c*ratio``.
+    ``cur``/``prev``: ``[B,ratio,dim]`` (``prev`` is unused/ignored when ``overlap=False``). Returns
+    ``[B,1,head_dim]``; row ``b`` is bit-identical to :func:`_pool_one_window` for that row's window
+    (same per-element matmul / softmax / weighted-RMSNorm / partial-RoPE — only the prev branch and the
+    RoPE row vary per row instead of being shared)."""
+    kv_cur, score_cur = _project_window(cur, wkv, wgate)         # [B,ratio,coff*hd]
+    if overlap:
+        d = head_dim
+        kv_prev, score_prev = _project_window(prev, wkv, wgate)
+        valid = prev_valid[:, None, None]                       # [B,1,1] broadcast over [B,ratio,d]
+        prev_kv = mx.where(valid, kv_prev[..., :d], mx.array(0.0, kv_prev.dtype))
+        prev_sc = mx.where(valid, score_prev[..., :d] + ape[:, :d],
+                           mx.array(float("-inf"), score_prev.dtype))   # per-row window-0 pad
+        kv_win = mx.concatenate([prev_kv, kv_cur[..., d:]], axis=1)            # [B,2*ratio,hd]
+        score_win = mx.concatenate([prev_sc, score_cur[..., d:] + ape[:, d:]], axis=1)
+    else:
+        kv_win = kv_cur                                          # [B,ratio,hd]
+        score_win = score_cur + ape
+    pooled = mx.sum(kv_win * mx.softmax(score_win, axis=1), axis=1, keepdims=True)
+    pooled = _rms_w(pooled, norm_w, eps)                         # [B,1,head_dim]
+    return rope_partial_b(pooled, cos_c_b, sin_c_b, rope_head_dim)
+
+
 def _maybe_pool(lc: _LayerCache, p: dict, cfg: DeepSeekV4Config, layer_id: int, ratio: int,
                 offset: int, cos: mx.array, sin: mx.array) -> None:
     """If position ``offset`` closes a window, pool one main (and, on ratio-4 layers, one indexer)
@@ -896,7 +928,7 @@ class _KVArenaSet:
     :class:`~quanta.dsv4.batched_runtime.DSV4BatchedResidentModel` when ``kv_arena=True``; a stream
     leases a row via :meth:`alloc` (the SAME row index across every layer) and returns it via
     :meth:`free` on release. Model-free constructible for the parity gate. (Compressed-layer
-    ckv/ikv/ring arenas join the set in #18 M3.)"""
+    ckv/ikv/ring arenas are :class:`_CompArena` (#18 M3); they join this set in M4.)"""
 
     def __init__(self, n_layers: int, rows: int, *, group_size: int, quantized: bool,
                  bits: int = BITS) -> None:
@@ -965,6 +997,62 @@ class _ArenaLayerView(_LayerCache):
         self._arena.truncate_row(self._row, length)
 
 
+class _CompArena:
+    """Compressed-layer (#18 M3) batched extras that ride alongside the latent :class:`_KVArena`: the
+    pooled-KV stream (``ckv``, a :class:`_KVArena` on the same :mod:`quanta.cache_quant` codec), the
+    indexer-KV stream (``ikv``, a bf16 :class:`_KVArena` — ratio-4 DSA layers only) and the
+    fixed-width raw-hidden ring ``[R, ring_cap, dim]`` that drives the compressor pooling state
+    machine. All three are ``R``-row, row-indexed exactly like the latent arena: a stream's row index
+    is the SAME across the latent + ckv + ikv + ring. ckv/ikv grow in lockstep (one pooled token each
+    per CLOSED window) so they share the per-row count :meth:`n_comp` (``ckv.length(row)``). Built
+    model-free for the M3 gate; wired into :class:`_KVArenaSet` + the runtime in M4."""
+
+    __slots__ = ("rows", "ratio", "overlap", "ring_cap", "ckv", "ikv", "ring")
+
+    def __init__(self, rows: int, *, ratio: int, overlap: bool, max_rollback: int = 1,
+                 group_size: int, quantized: bool, has_indexer: bool, bits: int = BITS) -> None:
+        if rows < 1:
+            raise ValueError(f"_CompArena rows must be >= 1 (got {rows})")
+        if ratio < 1:
+            raise ValueError(f"_CompArena ratio must be >= 1 (got {ratio})")
+        self.rows = int(rows)
+        self.ratio = int(ratio)
+        self.overlap = bool(overlap)
+        self.ring_cap = _ring_cap(ratio, overlap, max(1, int(max_rollback)))
+        self.ckv = _KVArena(rows, group_size=group_size, quantized=quantized, bits=bits)
+        # ikv is matmul'd into a top-k mask (never SDPA-read), so it stays bf16 like _LayerCache.ikv.
+        self.ikv = _KVArena(rows, group_size=group_size, quantized=False) if has_indexer else None
+        self.ring: mx.array | None = None        # [R, ring_cap, dim]; lazily allocated on first roll
+
+    def n_comp(self, row: int) -> int:
+        """Per-row count of pooled (compressed-KV) tokens — the ckv/ikv stream length for ``row``."""
+        return self.ckv.length(row)
+
+    def roll_ring(self, rows: list[int], x_t: mx.array) -> mx.array:
+        """Roll the ``B`` active rows' rings by one position (push ``x_t`` ``[B,1,dim]``): gather the
+        active rows, :func:`_push_ring_batched` them, scatter back, and return the rolled active ring
+        ``[B, ring_cap, dim]`` (newest at ``[:, -1]``, front zero-padded) for pooling. Idle rows are
+        untouched (1-D fancy-index row scatter). Lazily allocates the ``[R, ring_cap, dim]`` store on
+        first use (learning ``dim``/dtype from ``x_t``), mirroring the latent arena's lazy first-write."""
+        if self.ring is None:
+            self.ring = mx.zeros((self.rows, self.ring_cap, x_t.shape[-1]), dtype=x_t.dtype)
+        rows_arr = mx.array(rows, dtype=mx.int32)
+        active = _push_ring_batched(mx.take(self.ring, rows_arr, axis=0), x_t, cap=self.ring_cap)
+        self.ring[rows_arr] = active             # scatter back; idle rows untouched
+        return active
+
+    def append_pooled(self, closing_rows: list[int], ck: mx.array, ik: mx.array | None) -> None:
+        """Masked scatter-append of one pooled token to each row in ``closing_rows`` (the streams whose
+        window closed this step) — ONE batched append into ckv (and ikv) that bumps their ``n_comp``.
+        Equivalent to :func:`_maybe_pool` firing on exactly those rows. ``ck``/``ik`` are the already
+        gathered ``[len(closing_rows),1,·]`` pooled tokens for those rows."""
+        self.ckv.append_batched(closing_rows, ck)
+        if self.ikv is not None:
+            if ik is None:
+                raise ValueError("_CompArena.append_pooled: indexer layer needs an ikv token")  # rule 6
+            self.ikv.append_batched(closing_rows, ik)
+
+
 def decode_step_dense_batched(x_t: mx.array, p: dict, cfg: DeepSeekV4Config, layer_id: int,
                               lcs: list[_LayerCache] | None, cos: mx.array, sin: mx.array,
                               offsets: list[int], *, arena: _KVArena | None = None,
@@ -1005,18 +1093,20 @@ def decode_step_dense_batched(x_t: mx.array, p: dict, cfg: DeepSeekV4Config, lay
     return output_proj_b(o, p, cfg, cos_b, sin_b)
 
 
-def _decode_indexer_select_batched(x_t: mx.array, qr: mx.array, lcs: list[_LayerCache], idx_p: dict,
+def _decode_indexer_select_batched(x_t: mx.array, qr: mx.array, ikv_pad: mx.array, idx_p: dict,
                                    cfg: DeepSeekV4Config, cos_b: mx.array, sin_b: mx.array,
                                    ncomp_max: int, ncomps: list[int]) -> mx.array:
     """Batched Lightning-indexer top-k selection: ``[B,1,ncomp_max]`` bool mask of the compressed
     tokens each stream keeps. Per-stream-offset sibling of :func:`_decode_indexer_select` over the
-    padded indexer-KV; padded columns (``t >= n_comp_b``) are scored ``-inf`` so they never win the
-    per-stream top-``index_topk`` (k clamped to ``n_comp_b``). B=1 reproduces the single-stream mask."""
+    padded indexer-KV ``ikv_pad`` ``[B,ncomp_max,index_head_dim]`` (built by ``_pad_stack`` on the
+    per-stream path, or one gather on the #18 arena path). Padded columns (``t >= n_comp_b``) are
+    scored ``-inf`` so they never win the per-stream top-``index_topk`` (k clamped to ``n_comp_b``).
+    B=1 reproduces the single-stream mask."""
     inh, ihd, rd = cfg.index_n_heads, cfg.index_head_dim, cfg.rope_head_dim
     b = x_t.shape[0]
     qb = (qr @ idx_p["wq_b"].T).reshape(b, 1, inh, ihd)
     qb = rope_partial_b(qb, cos_b, sin_b, rd).astype(mx.float32)
-    ikv = _pad_stack([lc.ikv for lc in lcs], ncomp_max).astype(mx.float32)   # [B,ncomp_max,index_head_dim]
+    ikv = ikv_pad.astype(mx.float32)                            # [B,ncomp_max,index_head_dim]
     weights = (x_t @ idx_p["weights_proj"].T).astype(mx.float32) * (ihd ** -0.5 * inh ** -0.5)
     score = mx.einsum("bqhd,btd->bqht", qb, ikv)               # [B,1,inh,ncomp_max]
     score = (mx.maximum(score, 0.0) * weights[..., None]).sum(axis=2)   # [B,1,ncomp_max]
@@ -1033,31 +1123,114 @@ def _decode_indexer_select_batched(x_t: mx.array, qr: mx.array, lcs: list[_Layer
     return (score >= thr) & valid                              # exclude padding (redundant w/ -inf)
 
 
+def _compressed_update_arena(x_t: mx.array, kv: mx.array, p: dict, cfg: DeepSeekV4Config,
+                             layer_id: int, ratio: int, overlap: bool, has_idx: bool,
+                             arena: "_KVArena", comp: "_CompArena", rows: list[int],
+                             offsets: list[int], cos: mx.array, sin: mx.array) -> None:
+    """Arena-path (#18 M3) compressed cache update — the batched kill of
+    :func:`decode_step_compressed_batched`'s per-stream ``for s in range(b)`` body. Three batched
+    surfaces, NO per-stream tensor compute: (1) ONE latent scatter (:meth:`_KVArena.append_batched`),
+    (2) ONE batched ring roll (:meth:`_CompArena.roll_ring`), (3) ONE compute-all compressor pool
+    (:func:`_pool_one_window_b` over ALL ``B`` rows) masked-scattered into the ckv (and ikv) arenas —
+    only the rows whose window closes this step (``(offset+1) % ratio == 0``) append a pooled token and
+    bump ``n_comp``. The only Python is bounded O(B) accounting (which rows close, their RoPE window
+    positions, prev-window validity), never per-element tensor work (rule-3). Bit-identical per row to
+    the per-stream loop + :func:`_maybe_pool`."""
+    b = x_t.shape[0]
+    arena.append_batched(rows, kv)                              # (1) latent KV: ONE scatter (kills loop)
+    ring = comp.roll_ring(rows, x_t)                           # (2) [B, ring_cap, dim] rolled ring
+
+    closing = [i for i in range(b) if (offsets[i] + 1) % ratio == 0]   # rows closing a window (bounded)
+    if not closing:
+        return                                                 # no window closed this step: nothing to pool
+
+    # (3) compute-all pool: per-row window-start RoPE row at c*ratio (c=offset//ratio, == _maybe_pool's
+    # cos[c*ratio]) + per-row prev-window validity (overlap AND c>=1; else the window-0 pad, masked -inf).
+    pos_c = [(offsets[i] // ratio) * ratio for i in range(b)]
+    cos_c_b, sin_c_b = gather_rope_rows(cos, sin, pos_c)       # [B,1,rd/2]
+    prev_valid = mx.array([overlap and (offsets[i] // ratio >= 1) for i in range(b)], dtype=mx.bool_)
+    cur = ring[:, -ratio:]                                     # [B,ratio,dim] this (just-closed) window
+    prev = ring[:, -2 * ratio:-ratio] if overlap else None     # [B,ratio,dim] previous window (overlap)
+    cidx = mx.array(closing, dtype=mx.int32)
+    closing_rows = [rows[i] for i in closing]
+
+    cp = p["compressor"]
+    ck_all = _pool_one_window_b(cur, prev, prev_valid, cp["ape"].astype(mx.float32),
+                                cp["norm"].astype(mx.float32), cp["wkv"].astype(mx.float32),
+                                cp["wgate"].astype(mx.float32), ratio=ratio, head_dim=cfg.head_dim,
+                                rope_head_dim=cfg.rope_head_dim, eps=cfg.norm_eps,
+                                cos_c_b=cos_c_b, sin_c_b=sin_c_b, overlap=overlap)   # [B,1,head_dim]
+    ik_close = None
+    if has_idx:
+        icp = p["indexer"]["compressor"]
+        ik_all = _pool_one_window_b(cur, prev, prev_valid, icp["ape"].astype(mx.float32),
+                                    icp["norm"].astype(mx.float32), icp["wkv"].astype(mx.float32),
+                                    icp["wgate"].astype(mx.float32), ratio=4, head_dim=cfg.index_head_dim,
+                                    rope_head_dim=cfg.rope_head_dim, eps=cfg.norm_eps,
+                                    cos_c_b=cos_c_b, sin_c_b=sin_c_b, overlap=True)   # [B,1,index_head_dim]
+        ik_close = ik_all[cidx]
+    comp.append_pooled(closing_rows, ck_all[cidx], ik_close)   # masked append + bump n_comp (closers only)
+
+
 def decode_step_compressed_batched(x_t: mx.array, p: dict, cfg: DeepSeekV4Config, layer_id: int,
-                                   lcs: list[_LayerCache], cos: mx.array, sin: mx.array,
-                                   offsets: list[int]) -> mx.array:
+                                   lcs: list[_LayerCache] | None, cos: mx.array, sin: mx.array,
+                                   offsets: list[int], *, arena: "_KVArena | None" = None,
+                                   rows: list[int] | None = None,
+                                   comp: "_CompArena | None" = None) -> mx.array:
     """Batched compressed decode across ``B`` streams (ratio-4 + indexer / ratio-128) —
-    per-stream-offset sibling of :func:`decode_step_compressed`. Per-stream (rule-3): the latent-KV
-    append, the raw-hidden ring push, and the window-closing compressor pool (``_maybe_pool``, which
-    appends one compressed/indexer token when ``(offset_b+1) % ratio == 0``). Batched: ONE projection,
-    and ONE softmax over the per-stream-padded window-latent ++ compressed keys with per-stream window
-    / visibility / indexer-top-k masks (so each stream attends exactly the keys its single-stream step
-    would). Returns ``[B,1,dim]``."""
+    per-stream-offset sibling of :func:`decode_step_compressed`. ONE projection and ONE softmax over
+    the per-stream-padded window-latent ++ compressed keys with per-stream window / visibility /
+    indexer-top-k masks (each stream attends exactly the keys its single-stream step would). Returns
+    ``[B,1,dim]``. Two interchangeable, output-equivalent cache stores (#18 M3; gated in
+    ``parity/dsv4_batched_attention_test.py``):
+
+    * **arena path** (``arena``/``rows``/``comp`` given — the loop-kill): :func:`_compressed_update_arena`
+      does the whole cache update batched — ONE latent scatter, ONE batched ring roll, ONE compute-all
+      pool masked-scattered into the ckv/ikv arenas — then the window-latent / ckv / ikv are read with
+      ONE gather each (no ``_pad_stack``). ``rows[b]`` is stream ``b``'s arena row. Bit-identical
+      contents to the per-stream store (same codec + pool arithmetic; affine quant is row-independent).
+    * **per-stream path** (``lcs`` given, ``arena`` None — the proven reference, default): per-stream
+      (rule-3) latent-KV append + raw-hidden ring push + window-closing pool (:func:`_maybe_pool`), then
+      ``_pad_stack`` the streams to ``[B,·,·]``.
+    """
     b = x_t.shape[0]
     ratio = cfg.compress_ratio(layer_id)
     overlap = cfg.overlap(layer_id)
+    has_idx = cfg.has_indexer(layer_id)
     cos_b, sin_b = gather_rope_rows(cos, sin, offsets)         # [B,1,rd/2]
     qr, q, kv = project_qkv_b(x_t, p, cfg, cos_b, sin_b)       # qr [B,1,qlora], q [B,1,H,hd], kv [B,1,hd]
-    for s in range(b):                                         # per-stream cache update + pool (IO, rule-3)
-        lc = lcs[s]
-        lc.ratio = ratio
-        lc.append_kv(kv[s:s + 1])
-        _push_ring(lc, x_t[s:s + 1], ratio, overlap)
-        _maybe_pool(lc, p, cfg, layer_id, ratio, offsets[s], cos, sin)
 
+    if arena is not None:                                      # ARENA path: kills the per-stream loop
+        if rows is None or comp is None or len(rows) != b:
+            raise ValueError(
+                f"decode_step_compressed_batched: arena path needs comp + rows of length B={b} "
+                f"(got comp={comp is not None}, rows={None if rows is None else len(rows)})")    # rule 6
+        _compressed_update_arena(x_t, kv, p, cfg, layer_id, ratio, overlap, has_idx,
+                                 arena, comp, rows, offsets, cos, sin)
+        kv_pad = arena.read_batched(rows).astype(mx.float32)              # ONE gather + dequant
+        ncomps = [comp.n_comp(r) for r in rows]
+        ncomp_max = max(ncomps)
+        ckv = comp.ckv.read_batched(rows).astype(mx.float32) if ncomp_max > 0 else None
+        ikv_pad = comp.ikv.read_batched(rows) if (has_idx and ncomp_max > 0) else None
+    else:                                                     # PER-STREAM reference path (default)
+        if rows is not None or comp is not None:
+            raise ValueError("decode_step_compressed_batched: rows/comp given without an arena")  # rule 6
+        for s in range(b):                                    # per-stream cache update + pool (IO, rule-3)
+            lc = lcs[s]
+            lc.ratio = ratio
+            lc.append_kv(kv[s:s + 1])
+            _push_ring(lc, x_t[s:s + 1], ratio, overlap)
+            _maybe_pool(lc, p, cfg, layer_id, ratio, offsets[s], cos, sin)
+        kv_pad = _pad_stack([lc.kv for lc in lcs]).astype(mx.float32)     # [B,L_max,hd]
+        ncomps = [lc.n_comp() for lc in lcs]
+        ncomp_max = max(ncomps)
+        ckv = _pad_stack([lc.ckv for lc in lcs], ncomp_max).astype(mx.float32) if ncomp_max > 0 else None
+        ikv_pad = (_pad_stack([lc.ikv for lc in lcs], ncomp_max)
+                   if (has_idx and ncomp_max > 0) else None)
+
+    # --- shared windowed-sink SDPA tail (identical for both stores) ---
     qf = q.astype(mx.float32)
     scale = cfg.attn_scale
-    kv_pad = _pad_stack([lc.kv for lc in lcs]).astype(mx.float32)           # [B,L_max,hd]
     l_max = kv_pad.shape[1]
     sc = mx.einsum("bqhd,bsd->bqhs", qf, kv_pad) * scale                   # [B,1,H,L_max]
     ki = mx.arange(l_max)[None, :]
@@ -1066,13 +1239,10 @@ def decode_step_compressed_batched(x_t: mx.array, p: dict, cfg: DeepSeekV4Config
     sc = sc + mx.where(win, 0.0, _NEG)[:, None, None, :]
     kv_all = kv_pad
 
-    ncomps = [lc.n_comp() for lc in lcs]
-    ncomp_max = max(ncomps)
     if ncomp_max > 0:
-        ckv = _pad_stack([lc.ckv for lc in lcs], ncomp_max).astype(mx.float32)   # [B,ncomp_max,hd]
         sc_c = mx.einsum("bqhd,btd->bqht", qf, ckv) * scale                # [B,1,H,ncomp_max]
-        if cfg.has_indexer(layer_id):
-            sel = _decode_indexer_select_batched(x_t, qr, lcs, p["indexer"], cfg, cos_b, sin_b,
+        if has_idx:
+            sel = _decode_indexer_select_batched(x_t, qr, ikv_pad, p["indexer"], cfg, cos_b, sin_b,
                                                  ncomp_max, ncomps)        # [B,1,ncomp_max]
         else:                                                              # ratio-128: all cached visible
             ncs = mx.array(ncomps, dtype=mx.int32)[:, None]
