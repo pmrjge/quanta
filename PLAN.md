@@ -80,14 +80,16 @@ length is sent to `-inf` by the existing SDPA window/pad mask → numerically in
 | **M2** — Stage B1: batched ring buffer | ✅ DONE | `05d1171` | extend `parity/dsv4_kv_arena_test.py` (ring) |
 | **M3** — Stage B2: compressed stepper on arena | ✅ DONE | `bf7af6b` | `parity/dsv4_batched_attention_test.py` (compressed + arena) |
 | **M4** — flip default + session/prefill + regression | ✅ DONE | `e08888d` | full suite (parity trio + omlx/paged/tree-verify + pytest/ruff/compileall) |
-| **M5** — real-model B-sweep bench | ☐ (deferred, solo GPU) | — | `parity/dsv4_batched_bench.py` |
+| **M5** — real-model B-sweep bench | ✅ DONE (run thru B=32) | `f4935b5` | `parity/dsv4_batched_bench.py` |
 
 Flag `kv_arena` was **default OFF** through M0–M3 (each proved its sub-parity with
 the arena toggled ON *inside the test*, by calling the stepper with an arena).
 **M4 flipped the default ON** (`e08888d`): the serving path now leases an arena row
 per stream via `make_cache`; a discrete `DSV4Cache` still takes the proven
 per-stream loop (the batched steppers dispatch on the cache TYPE, not the flag).
-Only M5 (the real-model bench, solo GPU) remains.
+**M5 ran on the real DeepSeek-V4-Flash bake** (`f4935b5`): the arena is greedy-exact
+vs the per-stream loop AND 1.37× faster at B=32 (the prod operating point). **#18 is
+DONE (M0–M5).**
 
 ---
 
@@ -156,7 +158,7 @@ waste KV memory; batched-paged is the noted future option if that bites.
 - **`parity/dsv4_kv_arena_test.py`** *(model-free)* — M0 round-trip + M2 ring (done).
 - **`parity/dsv4_batched_attention_test.py`** — M1 dense arena + M3 compressed arena (done).
 - **`parity/dsv4_batched_test.py`** — Design-A regression **+ M4 end-to-end arena serving check** (done).
-- **`parity/dsv4_batched_bench.py`** — M5 arena-vs-loop real-model sweep (deferred; see M5 note).
+- **`parity/dsv4_batched_bench.py`** — **M5 (done, `f4935b5`).** 3-path sweep (looped/batched/arena) + greedy-exact gate; real-model run thru B=32, `arena/bat` +37% @ B=32, all `tok=ok`.
 
 ---
 
@@ -241,15 +243,41 @@ retained flagged reference; **dispatch keys off the cache TYPE, not the flag**, 
 **Wiring caveat (from M3, now handled):** the compressed stepper's prev-window validity keys off
 `offset//ratio>=1`, NOT `ring.shape[1]` — inside `_compressed_update_arena`; M4 only feeds the arena.
 
-### M5 — real-model DSV4 B-sweep bench ☐ (deferred, solo GPU)
-`parity/dsv4_batched_bench.py` (arena vs per-stream loop) on the baked DSV4 bake
-**alone** (verify memory clear first; one model at a time). Not a blocker for M0–M4.
-**Update before running (M4 fallout):** M4 flipped `kv_arena` default ON, so `make_cache()`
-returns an `_ArenaCacheHandle`. The bench's looped path (`model._fused=False`) must use a discrete
-`DSV4Cache` (or build the looped runtime with `kv_arena=False`) — a handle on the non-fused/T>1
-path now fails loud (rule 6). Target comparison: **arena** (`kv_arena=True`, `make_cache`→handle,
-fused) vs **per-stream loop** (`DSV4Cache`, `_fused=False`). Expect the arena to cut the per-stream
-KV-update IO; the win grows with B and with compressed-layer share.
+### M5 — real-model DSV4 B-sweep bench ✅ DONE (`f4935b5`)
+`parity/dsv4_batched_bench.py` rewritten to a **3-path** sweep that isolates the #18
+win (M4 fallout fixed: `make_cache()` now returns an `_ArenaCacheHandle`, and a handle
+on the non-fused/T>1 path fails loud, so the looped/batched paths build a discrete
+`DSV4Cache` directly — one resident model serves all three, dispatch keys off the
+cache TYPE):
+- **looped** — `_fused=False` + discrete `DSV4Cache` (Design-A per-stream attention);
+- **batched** — `_fused=True` + discrete `DSV4Cache` (fused attn, per-stream `_LayerCache` KV);
+- **arena** (#18) — `_fused=True` + `make_cache()` handle (fused attn, ONE scatter + ONE gather).
+
+`arena/bat` is THE #18 number (same fused attention, only the KV store differs);
+`bat/loop` is the attention-batching win; `arena/loop` the total. Added a real-model
+correctness gate too: the three paths' greedy token streams must be equal
+(`looped == batched == arena`) — the first live exercise of the int8 latent arena
+(real `head_dim=128` ⇒ int8; the model-free gates only reached the bf16 tiny-config).
+
+Run on the baked DeepSeek-V4-Flash int4-g64 bake (~180 GiB resident), solo GPU,
+through **B=32** (the prod operating point; B=48/64 skipped for wall-clock — prefill
+is token-by-token so seeding is O(B), and the curve is already monotone). **Every row
+`tok=ok`** — the arena is greedy-exact vs the per-stream loop on the real model:
+
+```
+   B    looped   batched     arena  bat/loop  arena/bat  arena/loop   tok
+   1       6.2       6.2       6.0     1.00x      0.96x       0.96x    ok
+   2       7.5      10.6      10.7     1.41x      1.02x       1.43x    ok
+   4       8.6      19.5      20.8     2.27x      1.07x       2.42x    ok
+   8       8.7      33.8      38.1     3.87x      1.13x       4.36x    ok
+  16       8.4      54.9      67.9     6.54x      1.24x       8.09x    ok
+  32       8.3      79.0     108.5     9.49x      1.37x      13.04x    ok
+```
+
+The #18 KV-loop-kill (`arena/bat`) is monotone and grows with B — **+37% decode
+throughput at B=32** (108.5 vs 79.0 tok/s) with identical fused attention. Memory
+184/191 GiB active/peak, under the 220 GiB wired limit. To extend to B=48/64 later:
+`uv run --with tokenizers python -u -m parity.dsv4_batched_bench 48,64` (solo GPU).
 
 ---
 
@@ -269,20 +297,19 @@ uv run python -m compileall -q src tests
 uv lock --check
 git diff --check
 ```
-M5 (solo GPU, deferred): `uv run python -u -m parity.dsv4_batched_bench`.
+M5 (solo GPU, ✅ done `f4935b5` — run thru B=32): `uv run --with tokenizers python -u -m parity.dsv4_batched_bench` (append e.g. `48,64` to sweep specific B).
 
 ---
 
 ## Immediate next action (for the resuming agent)
 
-**M0–M4 are complete and committed** (M4 = `e08888d`). The batched KV arena is the **default**
-serving decode path and is parity-green end-to-end (per-stream loop retained as the flagged
-reference; dispatch keys off the cache type). The ONLY remaining item is **M5 — the real-model
-B-sweep bench** (`parity/dsv4_batched_bench.py`), which is **deferred** (solo GPU, one model at a
-time) and **not a correctness blocker** — #18's correctness is fully gated model-free.
+**#18 is COMPLETE — all milestones M0–M5 are done and committed** (M5 = `f4935b5`; bench
+results recorded in the M5 section above and in that commit message). The batched KV arena is
+the default serving decode path, parity-green end-to-end (model-free gates) AND validated on
+the real DeepSeek-V4-Flash bake: greedy-exact vs the per-stream loop, +37% decode throughput
+at B=32. The per-stream loop is retained as the flagged reference (dispatch keys off the
+cache type).
 
-To run M5 (only when the GPU is free and no other model is resident): first update the bench per the
-M5 note above (looped path on a discrete `DSV4Cache`), confirm memory is clear, then
-`uv run python -u -m parity.dsv4_batched_bench`. Otherwise **#18 is effectively done**.
-
-Per the standing cadence, STOP here and wait for the user to compact before any M5 work.
+**There is no further #18 work.** Optional, non-blocking: extend the bench to B=48/64 on a
+free solo GPU (`uv run --with tokenizers python -u -m parity.dsv4_batched_bench 48,64`) — the
+`arena/bat` curve is already monotone through B=32, so this only confirms the asymptote.

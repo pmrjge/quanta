@@ -17,20 +17,19 @@ That is the mistake this project exists to not repeat.
 
 ## Active task (transient — full handover in PLAN.md)
 
-**#18 — kill the per-stream KV-update IO loop** in DSV4 batched decode: replace the
-`B` ragged per-stream `_LayerCache` streams (per-stream `append_kv` loop + per-step
-`_pad_stack`) with a persistent `max_batch`-sized **batched KV arena** — ONE scatter
-write + ONE gather read. Staged M0–M5, flag-guarded (`kv_arena`, **default ON since
-M4**). **M0 ✅ `41a4d0f`, M1 ✅ `6f33cc1`, M2 ✅ `05d1171`, M3 ✅ `bf7af6b`, M4 ✅
-`e08888d`** (flipped default ON + `_CompArena`→`_KVArenaSet` + `_ArenaCacheHandle` +
-`make_cache`/`prefill`-seed/`step_batch`/`free_cache` + session `release` + full
-regression; serving leases an arena row per stream, a discrete `DSV4Cache` still takes
-the per-stream loop — dispatch keys off the cache type). **Only M5 remains — the
-real-model B-sweep bench (`parity/dsv4_batched_bench.py`), DEFERRED (solo GPU, not a
-correctness blocker).** So #18 is effectively done. Full context, design, file/line
-anchors, gates, and the M5 note are in **`PLAN.md`** (repo root). Cadence (standing user
-instruction): single thread, NO subagents, commit each milestone, then STOP for the user
-to compact before the next.
+**#18 — kill the per-stream KV-update IO loop** in DSV4 batched decode (replace the
+`B` ragged per-stream `_LayerCache` streams with a persistent `max_batch`-sized
+**batched KV arena** — ONE scatter write + ONE gather read; flag `kv_arena`, **default
+ON since M4**) is **COMPLETE — all milestones M0–M5 done & committed**: M0 ✅ `41a4d0f`,
+M1 ✅ `6f33cc1`, M2 ✅ `05d1171`, M3 ✅ `bf7af6b`, M4 ✅ `e08888d` (default ON; serving
+leases an arena row per stream, a discrete `DSV4Cache` still takes the per-stream loop —
+dispatch keys off the cache type), **M5 ✅ `f4935b5`** (real-model B-sweep bench on the
+DeepSeek-V4-Flash int4-g64 bake: arena **greedy-exact** vs the per-stream loop AND
+**+37% decode throughput at B=32**, the prod operating point; `arena/bat` monotone in B).
+**No #18 work remains** (optional non-blocking follow-up: extend the bench to B=48/64 on
+a free solo GPU). Full context, design, file/line anchors, gates, and the M5 results
+table are in **`PLAN.md`** (repo root). Cadence (standing user instruction): single
+thread, NO subagents, commit each milestone, then STOP for the user to compact.
 
 ---
 
