@@ -568,7 +568,7 @@ class _BaseBatchedSession:
                  runtime: Any | None = None, manager: Any | None = None,
                  rec_cache: Any | None = None, paged_kv: bool = False,
                  block_size: int = 32, max_blocks: int = 4096, rec_capacity: int = 4096,
-                 model_name: str = "") -> None:
+                 model_name: str = "", native_decode: bool = True) -> None:
         if runtime is None:
             if root is None:
                 raise OmlxShimError(f"{type(self).__name__}: artifact root required when runtime is unset")
@@ -576,6 +576,17 @@ class _BaseBatchedSession:
         self._rt = runtime
         self.capacity = int(capacity)
         self.num_layers = getattr(runtime, "num_layers", 0)
+        # --- form-2 native decode (#153): if the runtime exposes the persistent-batched-state API
+        # (Nemotron's step_batch_native + make_batched_state), hold ONE BatchedMambaState across steps
+        # for the current alive-slot set so the Mamba recurrence is never re-concatenated per step. Other
+        # runtimes (no native API) transparently fall back to the form-1 step_batch dispatch. The state is
+        # flushed back into the per-stream triples on any slot-set change (admit/release) — see
+        # _flush_native / _run_native. Gated model-free in parity/nemotron_native_serving_test.py.
+        self._native_capable = (hasattr(runtime, "step_batch_native")
+                                and hasattr(runtime, "make_batched_state"))
+        self._native_decode = bool(native_decode) and self._native_capable
+        self._nat: Any | None = None                       # cached BatchedMambaState | None
+        self._nat_slots: tuple[int, ...] = ()              # the alive slots it was assembled for
         self._caches: dict[int, Any] = {}                  # unpaged: slot -> per-stream cache
         # --- paged mode (#152): a manager may be injected (tests) or built here from the runtime's
         # paged spec when ``paged_kv`` is on. Engaged iff a PagedKVCacheManager ends up present. ------
@@ -626,6 +637,32 @@ class _BaseBatchedSession:
     def _step_offsets(self, caches: list[Any]) -> list[int] | None:
         return [c.offset for c in caches]
 
+    # --- form-2 native decode helpers (#153) ---------------------------------
+    def _state_for(self, slot: int) -> Any:
+        """The per-stream state triple for a slot, in whichever mode is active (paged or unpaged)."""
+        return self._slots[slot][1] if self._manager is not None else self._caches[slot]
+
+    def _flush_native(self) -> None:
+        """Write the cached batched recurrent state back into its slots' per-stream triples and drop it.
+        Called whenever the alive-slot set is about to change (admit/release) or differs from the cached
+        set, so a subsequent rebuild reads CURRENT per-stream state. KV lives in the (shared-by-ref)
+        per-stream caches so only ssm/conv need un-batching; cheap (slice views, MLX-immutable)."""
+        if self._nat is None:
+            return
+        self._nat.scatter_to([self._state_for(s) for s in self._nat_slots])
+        self._nat = None
+        self._nat_slots = ()
+
+    def _run_native(self, slots: list[int], states: list[Any], tokens: list[Any]) -> list[Any]:
+        """One form-2 decode step over ``slots``: reuse the cached BatchedMambaState if it matches the
+        current alive-slot set, else flush the old one and reassemble from the (now-current) per-stream
+        states. The recurrence threads in place across steps with no per-step concat (the IO win)."""
+        if self._nat is None or self._nat_slots != tuple(slots):
+            self._flush_native()
+            self._nat = self._rt.make_batched_state(states)
+            self._nat_slots = tuple(slots)
+        return self._rt.step_batch_native(tokens, self._nat)
+
     # --- engine-facing slot contract -----------------------------------------
     def admit(self, slot: int, prompt_ids: list[int]) -> mx.array:
         if not prompt_ids:
@@ -635,6 +672,7 @@ class _BaseBatchedSession:
                 f"{type(self).__name__}: admit slot {slot} out of range [0, {self.capacity})")
         if slot in self._caches or slot in self._slots:
             raise OmlxShimError(f"{type(self).__name__}: admit slot {slot} already in use")
+        self._flush_native()                               # alive-slot set changes -> rebuild next step
         if self._manager is not None:
             return self._admit_paged(slot, prompt_ids)
         cache = self._new_cache()
@@ -655,7 +693,10 @@ class _BaseBatchedSession:
             raise OmlxShimError(f"{type(self).__name__}: step_batch on unadmitted slots {missing}")
         caches = [self._caches[s] for s in slots]
         tokens = self._to_step_tokens([slot_to_token[s] for s in slots])
-        outs = self._rt.step_batch(tokens, caches, self._step_offsets(caches))
+        if self._native_decode:
+            outs = self._run_native(slots, caches, tokens)               # form-2 persistent state
+        else:
+            outs = self._rt.step_batch(tokens, caches, self._step_offsets(caches))
         if len(outs) != len(slots):
             raise OmlxShimError(
                 f"{type(self).__name__}: step_batch returned {len(outs)} rows for {len(slots)} slots")
@@ -664,6 +705,7 @@ class _BaseBatchedSession:
         return result
 
     def release(self, slot: int) -> None:
+        self._flush_native()                               # write back before the slot's triple is dropped
         if self._manager is not None:
             entry = self._slots.pop(slot, None)
             if entry is not None:
@@ -717,7 +759,10 @@ class _BaseBatchedSession:
         states = [self._slots[s][1] for s in slots]
         offsets = [self._slots[s][0].length - 1 for s in slots]    # abs position of each new token
         tokens = self._to_step_tokens([slot_to_token[s] for s in slots])
-        outs = self._rt.step_batch(tokens, states, offsets)
+        if self._native_decode:
+            outs = self._run_native(slots, states, tokens)               # form-2 persistent state
+        else:
+            outs = self._rt.step_batch(tokens, states, offsets)
         if len(outs) != len(slots):
             raise OmlxShimError(
                 f"{type(self).__name__}: step_batch returned {len(outs)} rows for {len(slots)} slots")
@@ -725,7 +770,10 @@ class _BaseBatchedSession:
             seq = self._slots[s][0]
             mgr.commit(seq)
             if self._has_recurrent and rec is not None and seq.length % self._block_size == 0:
-                rec.store_at(seq.token_ids, seq.length, self._rt.get_recurrent_state(states[i]))
+                # form-2 holds the live recurrent state batched -> snapshot row i, not the stale triple.
+                payload = (self._nat.recurrent_row(i) if self._native_decode
+                           else self._rt.get_recurrent_state(states[i]))
+                rec.store_at(seq.token_ids, seq.length, payload)
         result = {s: outs[i][0, -1] for i, s in enumerate(slots)}
         mx.eval(list(result.values()))
         return result

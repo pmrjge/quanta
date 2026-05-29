@@ -337,6 +337,19 @@ class BatchedMambaState:
                 stream_states[s][1][i] = self.ssm[i][s:s + 1]
                 stream_states[s][2][i] = self.conv[i][s:s + 1]
 
+    def recurrent_row(self, s: int) -> tuple[list, list]:
+        """Stream ``s``'s live recurrent state as ``(ssm_rows, conv_rows)`` — per-layer ``[1,...]`` slices
+        (``None`` off Mamba layers), matching :meth:`NemotronBatchedResidentModel.get_recurrent_state`'s
+        ``(list(ssm), list(conv))`` shape. Lets the paged block-boundary snapshot read the current
+        recurrent state from here (form-2 holds it batched) instead of the now-stale per-stream triple.
+        The slices reference the current arrays; a later in-place step reassigns the list entries to new
+        arrays (MLX immutability), so the snapshot stays intact."""
+        if not 0 <= s < self.b:
+            raise ValueError(f"recurrent_row: stream {s} out of range [0, {self.b})")
+        ssm_row = [None if a is None else a[s:s + 1] for a in self.ssm]
+        conv_row = [None if a is None else a[s:s + 1] for a in self.conv]
+        return ssm_row, conv_row
+
 
 def batched_decode_step_native(
     layers: list[NemotronBlock],
