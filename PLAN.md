@@ -77,9 +77,9 @@ length is sent to `-inf` by the existing SDPA window/pad mask → numerically in
 |---|---|---|---|
 | **M0** — arena store + free-list + flag | ✅ DONE | `41a4d0f` | `parity/dsv4_kv_arena_test.py` |
 | **M1** — Stage A: dense stepper on arena | ✅ DONE | `6f33cc1` | `parity/dsv4_batched_attention_test.py` (dense + arena) |
-| **M2** — Stage B1: batched ring buffer | ⏭ NEXT | — | extend `parity/dsv4_kv_arena_test.py` (ring) |
-| **M3** — Stage B2: compressed stepper on arena | ☐ | — | `parity/dsv4_batched_attention_test.py` (compressed + arena) |
-| **M4** — flip default + session/prefill + regression | ☐ | — | full suite |
+| **M2** — Stage B1: batched ring buffer | ✅ DONE | `05d1171` | extend `parity/dsv4_kv_arena_test.py` (ring) |
+| **M3** — Stage B2: compressed stepper on arena | ✅ DONE | `bf7af6b` | `parity/dsv4_batched_attention_test.py` (compressed + arena) |
+| **M4** — flip default + session/prefill + regression | ⏭ NEXT | — | full suite |
 | **M5** — real-model B-sweep bench | ☐ (deferred, solo GPU) | — | `parity/dsv4_batched_bench.py` |
 
 Flag `kv_arena` stays **default OFF** through M0–M3 (each proves its sub-parity
@@ -125,15 +125,20 @@ waste KV memory; batched-paged is the noted future option if that bites.
 ## Files (with current line anchors)
 
 - **`src/quanta/dsv4/decode.py`** — primary.
-  - M0 (done): `_grow_seq` (716), `_KVArena` (725) with `append_row` (790),
-    `append_batched` (807), `read_batched` (840), `truncate_row`/`reset_row`;
-    `_KVArenaSet` (868); `_ArenaLayerView` (909).
-  - M1 (done): `decode_step_dense_batched` (942) now takes keyword-only
-    `arena`/`rows`; arena path = `append_batched` + `read_batched`, else the
-    per-stream `lcs` loop + `_pad_stack` (reference). Fail-loud on arena/rows mismatch.
-  - M2: add a **batched ring** helper next to `_push_ring` (581) — a `[R,cap,…]`
-    roll. M3: `decode_step_compressed_batched` (1010) rewrite + masked-batched
-    `_maybe_pool`/`_pool_one_window` (518/552) + `append_ckv`/`ikv` arenas.
+  - M0 (done): `_grow_seq` (774), `_KVArena` (783) with `append_row` (848),
+    `append_batched` (865), `read_batched` (898), `truncate_row`/`reset_row`;
+    `_KVArenaSet` (926); `_ArenaLayerView` (967).
+  - M1 (done): `decode_step_dense_batched` (1056) takes keyword-only `arena`/`rows`;
+    arena path = `append_batched` + `read_batched`, else the per-stream `lcs` loop +
+    `_pad_stack` (reference). Fail-loud on arena/rows mismatch.
+  - M2 (done): `_ring_cap` (613, shared) + `_push_ring_batched` (632) — a fixed-width
+    `[R,cap,dim]` roll (zero-padded front, newest at `[:,-1]`) next to `_push_ring` (621).
+  - M3 (done): `decode_step_compressed_batched` (1175) arena path via keyword-only
+    `arena`/`rows`/`comp`; `_compressed_update_arena` (1126) = latent scatter + ring
+    roll + masked compute-all pool. New `_pool_one_window_b` (552, batched sibling of
+    `_pool_one_window` (518): per-row prev-valid + per-row window-start RoPE) and
+    `_CompArena` (1000: ckv/ikv `_KVArena`s + `[R,cap,dim]` ring; `roll_ring`/
+    `append_pooled`). `_decode_indexer_select_batched` (1096) now takes a padded `ikv`.
 - **`src/quanta/dsv4/batched_runtime.py`** — M4.
   - `_kv_arena` flag set in `_init_from_inner` (165, INERT today). `make_cache`
     (168) → return arena-backed handle; `prefill` (173) seeds via `_ArenaLayerView`;
@@ -145,8 +150,8 @@ waste KV memory; batched-paged is the noted future option if that bites.
   `admit` (711) / `release` (752) / `_new_cache` (851) alloc/free the arena row.
   Arena is the **non-paged** batched path; the paged path (`has_recurrent_state`,
   `_admit_paged` 762) is separate and unchanged.
-- **`parity/dsv4_kv_arena_test.py`** *(model-free)* — M0 round-trip (done) + M2 ring.
-- **`parity/dsv4_batched_attention_test.py`** — M1 dense arena (done) + M3 compressed.
+- **`parity/dsv4_kv_arena_test.py`** *(model-free)* — M0 round-trip + M2 ring (both done).
+- **`parity/dsv4_batched_attention_test.py`** — M1 dense arena + M3 compressed arena (both done).
 - **`parity/dsv4_batched_bench.py`** — M5 arena-vs-loop real-model sweep (deferred).
 
 ---
@@ -178,34 +183,48 @@ runtime parity + ruff + compileall all still green.
 > parity exercises the bf16 arena path; the int8 codec round-trip is M0's gate.
 > This division is intentional (stepper wiring is dtype-agnostic past the codec).
 
-### M2 — Stage B1: batched ring buffer ⏭ NEXT
-Replace per-stream `_push_ring` (decode.py:581) with a batched `[R, cap, …]` roll
-(isolated; no quant ⇒ bit-exact; **not yet wired into a stepper**). `_push_ring`
-keeps the last `cap = (2 if overlap else 1)*ratio + (max_rollback-1)` raw-hidden
-positions via concat-then-trim; the batched form holds `[R, cap, dim]` and rolls
-all rows at once. **Parity:** add a model-free ring check to
-`parity/dsv4_kv_arena_test.py` — batched roll == per-stream `_push_ring` roll,
-bit-exact, across ragged per-row push counts (some rows past `cap`, some not).
-Then commit (`#18 M2`), STOP for compaction.
+### M2 — Stage B1: batched ring buffer ✅ (`05d1171`)
+Added `_push_ring_batched` (decode.py:632) + a shared `_ring_cap` (613) used by both
+`_push_ring` and the batched form. The batched ring is a **fixed-width** `[R, cap, dim]`
+(`cap = (2 if overlap else 1)*ratio + (max_rollback-1)`), zero-padded at the FRONT with
+the newest vector at `[:, -1]`; a row pushed `n` times holds its valid tail in the last
+`min(n,cap)` columns — bit-identical to that row's per-stream `_push_ring`. Isolated (no
+stepper wiring; wired in M3). Gate (model-free, `dsv4_kv_arena_test.py`): batched roll ==
+per-stream `_push_ring` bit-exact across ragged push counts (some rows past `cap`).
 
-### M3 — Stage B2: compressed stepper on the arena ☐
-Wire `decode_step_compressed_batched` (decode.py:1010): latent write/read (reuse
-M1) + batched ring (M2) + **masked compute-all pool** with masked scatter-append
-into `ckv`/`ikv` arenas (bump `n_comp`) — compute the pooled window for ALL streams,
-then masked-scatter only rows where `(offset+1) % ratio == 0`. The `for s in
-range(b)` body is fully gone. **Parity:** extend
-`parity/dsv4_batched_attention_test.py` compressed case (layers 1 ratio-4-indexer,
-2 ratio-3, ragged lens) arena-path vs per-stream — same bar; `n_comp()` /
-`kv_length()` match.
+### M3 — Stage B2: compressed stepper on the arena ✅ (`bf7af6b`)
+`decode_step_compressed_batched` (decode.py:1175) gained the arena path behind keyword-only
+`arena`/`rows`/`comp`, killing the per-stream `for s in range(b)` cache-update + pool loop
+for ratio>0 layers. `_compressed_update_arena` (1126) = ONE latent scatter
+(`_KVArena.append_batched`, reused M1) + ONE batched ring roll (`_CompArena.roll_ring`:
+gather active rows → `_push_ring_batched` → scatter back) + ONE **compute-all pool**
+(`_pool_one_window_b` (552) over all `B` rows) **masked-scattered** into the ckv/ikv arenas
+(`_CompArena.append_pooled`) — only rows where `(offset+1) % ratio == 0` append + bump
+`n_comp`. `_pool_one_window_b` carries the two things global single-stream but ragged in a
+batch: per-row prev-window validity (`overlap and offset//ratio>=1`; else the window-0
+`-inf` pad) and per-row window-start RoPE row (gathered at `(offset//ratio)*ratio`). New
+`_CompArena` (1000: ckv/ikv `_KVArena`s + `[R,cap,dim]` ring). `_decode_indexer_select_batched`
+(1096) now takes a padded `ikv` array so both stores feed the shared SDPA tail. Per-stream
+`lcs` path stays the proven default (`arena=None`); runtime/session wiring deferred to M4.
+Gate (`dsv4_batched_attention_test.py` compressed, ratio-4-indexer + ratio-3, ragged offsets
+incl. window-closing cases — B=1 close, ragged 3/4, all-close; ratio-4 hits both prev-valid
+`c>=1` and the `c==0` window-0 pad in one batched pool): B=1 bit-exact, B≥2 ≤1.83e-07 (<5e-4),
+arena == `_LayerCache` batched path **bit-exact (0.0)**, `kv_length()`/`n_comp()` match.
 
-### M4 — flip default + session/prefill integration + regression ☐
-`make_cache()` reserves a row via the free-list and returns an
-`_ArenaLayerView`-backed handle (`.row`, `__getitem__(i)`); `prefill` seeds that row
-unchanged; `admit`/`release` (omlx.py) call alloc/free; `_decode_batched_single`
-dispatches to the arena steppers; flip `kv_arena` default **ON** (per-stream loop
-retained as the flagged reference). **Parity:** full
-`dsv4_batched_attention_test.py` green by default; tree-verify + paged gates + the
-broad suite. Before M4's commit run the full regression (below).
+### M4 — flip default + session/prefill integration + regression ⏭ NEXT
+Wire `_CompArena` (M3) into `_KVArenaSet` (decode.py:926) — one per compressed layer,
+built from the runtime's per-layer `ratio`/`overlap`/`has_indexer`/`group_size`/`quantized`,
+alongside the existing `self.latent` list (alloc/free reset the comp rows too).
+`make_cache()` reserves a row via the free-list and returns an `_ArenaLayerView`-backed
+handle (`.row`, `__getitem__(i)`); `prefill` seeds that row unchanged; `admit`/`release`
+(omlx.py) call alloc/free; `_decode_batched_single` dispatches to the arena steppers
+(`decode_step_dense_batched` **and** `decode_step_compressed_batched`, passing the latent
+`_KVArena` + `_CompArena` + rows); flip `kv_arena` default **ON** (per-stream loop retained
+as the flagged reference). **Wiring caveat (from M3):** the compressed stepper's prev-window
+validity keys off the per-row count/offset (`offset//ratio>=1`), NOT `ring.shape[1]` (always
+`cap` for the batched ring) — already handled inside `_compressed_update_arena`; M4 only feeds
+it the arena. **Parity:** full `dsv4_batched_attention_test.py` green by default; tree-verify
++ paged gates + the broad suite. Before M4's commit run the full regression (below).
 
 ### M5 — real-model DSV4 B-sweep bench ☐ (deferred, solo GPU)
 `parity/dsv4_batched_bench.py` (arena vs per-stream loop) on the baked DSV4 bake
@@ -235,13 +254,16 @@ M5 (solo GPU, deferred): `uv run python -u -m parity.dsv4_batched_bench`.
 
 ## Immediate next action (for the resuming agent)
 
-Start **M2 — batched ring buffer**, exactly as scoped above:
-1. Add a batched `[R, cap, …]` roll helper in `decode.py` (alongside `_push_ring`,
-   line 581) — isolated, no stepper wiring yet.
-2. Add a model-free ring check to `parity/dsv4_kv_arena_test.py`: batched roll ==
-   per-stream `_push_ring`, bit-exact, ragged push counts.
-3. Run `uv run python -m parity.dsv4_kv_arena_test` (+ ruff + compileall on touched
-   files). Green ⇒ commit `#18 M2` (named files, project trailer, no push).
-4. **STOP and wait for the user to compact** before M3.
+Start **M4 — flip default + session/prefill integration + regression**, as scoped above:
+1. Wire `_CompArena` into `_KVArenaSet` (decode.py:926) — one per compressed layer from the
+   runtime's per-layer config; alloc/free reset comp rows alongside latent.
+2. `batched_runtime.py`: `make_cache` (168) → arena-backed handle; `prefill` (173) seeds via
+   `_ArenaLayerView`; `_decode_batched_single` (426) → dispatch to BOTH arena steppers (dense +
+   compressed, passing latent `_KVArena` + `_CompArena` + rows); flip `kv_arena` default **ON**.
+3. `omlx.py`: `_DSV4BatchedSession` admit/release call alloc/free.
+4. Run the FULL regression (gate commands below: parity trio + pytest + ruff + compileall +
+   `uv lock --check` + `git diff --check`). Green ⇒ commit `#18 M4` (named files, project
+   trailer, no push).
+5. **STOP and wait for the user to compact** before M5.
 
-Do not start M2 until the user says go (they compact between milestones).
+Do not start M4 until the user says go (they compact between milestones).

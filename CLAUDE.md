@@ -21,10 +21,11 @@ That is the mistake this project exists to not repeat.
 `B` ragged per-stream `_LayerCache` streams (per-stream `append_kv` loop + per-step
 `_pad_stack`) with a persistent `max_batch`-sized **batched KV arena** — ONE scatter
 write + ONE gather read. Staged M0–M5, flag-guarded (`kv_arena`, default OFF until
-M4). **M0 ✅ `41a4d0f`, M1 ✅ `6f33cc1`; M2 (batched ring buffer) is next.** Full
-context, design, file/line anchors, gates, and the exact next action are in
-**`PLAN.md`** (repo root). Cadence (standing user instruction): single thread, NO
-subagents, commit each milestone, then STOP for the user to compact before the next.
+M4). **M0 ✅ `41a4d0f`, M1 ✅ `6f33cc1`, M2 ✅ `05d1171`, M3 ✅ `bf7af6b`; M4 (flip
+default ON + session/prefill + `_CompArena`→`_KVArenaSet` wiring + full regression)
+is next.** Full context, design, file/line anchors, gates, and the exact next action
+are in **`PLAN.md`** (repo root). Cadence (standing user instruction): single thread,
+NO subagents, commit each milestone, then STOP for the user to compact before the next.
 
 ---
 
