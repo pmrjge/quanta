@@ -41,6 +41,7 @@ import mlx.core as mx
 
 from parity.dsv4_ppl import PROSE
 from quanta.dsv4.batched_runtime import DSV4BatchedResidentModel
+from quanta.dsv4.decode import DSV4Cache
 from quanta.dsv4.tokenizer import DeepSeekV4Tokenizer
 from quanta.paged import PagedKVCacheManager
 
@@ -69,8 +70,9 @@ def _ppl_top1(logits: mx.array, ids: mx.array) -> tuple[float, float]:
 
 def _score_off(rt: DSV4BatchedResidentModel, ids: mx.array) -> mx.array:
     """PAGED OFF: one-shot prefill into a fresh discrete ``DSV4Cache`` (discrete latent stream + fresh
-    derived ckv/ikv/ring), all positions."""
-    return rt._inner(ids, caches=rt.make_cache(), offset=0)
+    derived ckv/ikv/ring), all positions. A discrete cache (not ``rt.make_cache``, which since #18 M4
+    leases an arena row when ``kv_arena`` defaults on) keeps this the plain non-arena scoring path."""
+    return rt._inner(ids, caches=DSV4Cache(rt.num_layers), offset=0)
 
 
 def _score_paged(rt: DSV4BatchedResidentModel, ids: mx.array,

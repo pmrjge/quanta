@@ -489,6 +489,49 @@ def run() -> None:
     ok = ok and good
     print(f"  [{'OK' if good else 'FAIL'}] batched_generate([]) -> {out_empty}")
 
+    # --- (7) #18 M4 arena serving path: make_cache (arena handle) + prefill (latent -> arena row,
+    #         derived ckv/ikv/ring migrated into the _CompArena set) + batched decode == single-stream.
+    #         End-to-end gate now that kv_arena defaults ON: step_batch dispatches the handles to the
+    #         arena steppers (ONE scatter + ONE gather per layer), while checks 1-6 above still take the
+    #         per-stream _LayerCache loop for their discrete DSV4Caches (dispatch keys off cache type).
+    B7 = 3
+    a_caches = [batched.make_cache() for _ in range(B7)]          # arena handles, distinct leased rows
+    ref7 = [DSV4Cache(cfg.num_hidden_layers) for _ in range(B7)]
+    for s in range(B7):
+        batched.prefill(mx.array(PROMPT), a_caches[s])           # arena: latent->row, ckv/ikv/ring->comp
+        inner(mx.array(PROMPT), caches=ref7[s], offset=0)        # discrete single-stream reference
+    seed_off_ok = all(c.offset == len(PROMPT) for c in a_caches)  # handle.offset reads the latent row len
+    arena_ok = seed_off_ok
+    offs7 = [len(PROMPT)] * B7
+    for t in (17, 19, 23, 29):                                   # 4 steps — crosses window boundaries
+        ref_step = [inner(mx.array([t]), caches=ref7[s], offset=offs7[s]) for s in range(B7)]
+        mx.eval(ref_step)
+        bat_step = batched.step_batch([mx.array([t])] * B7, a_caches, offs7)   # fused -> arena steppers
+        mx.eval(bat_step)
+        if any(_maxdiff(bat_step[s], ref_step[s]) >= 5e-4 for s in range(B7)):
+            arena_ok = False
+        offs7 = [o + 1 for o in offs7]
+    # per-stream pooled-token counts (n_comp) on every compressed layer must match the single-stream ref
+    nc_ok = all(batched._arena_set.comp[i].n_comp(a_caches[s].row) == ref7[s][i].n_comp()
+                for s in range(B7) for i in range(cfg.num_hidden_layers)
+                if batched._arena_set.comp[i] is not None)
+    off_final_ok = all(c.offset == len(PROMPT) + 4 for c in a_caches)
+    # release returns the rows; a fresh round of make_cache must then succeed (free-list restored)
+    for c in a_caches:
+        batched.free_cache(c)
+    try:
+        reb = [batched.make_cache() for _ in range(B7)]
+        for c in reb:
+            batched.free_cache(c)
+        realloc_ok = True
+    except RuntimeError:
+        realloc_ok = False
+    good = arena_ok and nc_ok and off_final_ok and realloc_ok
+    ok = ok and good
+    print(f"  [{'OK' if good else 'FAIL'}] #18 arena serving path: decode==single-stream "
+          f"arena_ok={arena_ok} nc_ok={nc_ok} offsets_ok={seed_off_ok and off_final_ok} "
+          f"free/realloc_ok={realloc_ok}")
+
     print("PASS" if ok else "FAIL")
 
 

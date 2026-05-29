@@ -116,6 +116,7 @@ def batched_generate(
         if first in stops:
             # eos as the very first generated token → empty completion, retire immediately.
             outputs[i] = []
+            model.free_cache(cache)           # return the leased #18 arena row (no-op if non-arena)
             return
         st.out.append(first)
         st.last_token = first
@@ -124,46 +125,56 @@ def batched_generate(
         # outputs). If the first token already exhausts the quota, retire without entering decode.
         if len(st.out) >= st.max_new:
             outputs[i] = list(st.out)
+            model.free_cache(cache)           # return the leased #18 arena row (no-op if non-arena)
             return
         active.append(st)
 
-    # Seed the active set up to cap.
-    while pending and len(active) < cap:
-        _admit_next()
-
-    # Continuous-batching main loop: step the active set in lock-step, then retire / admit.
-    while active:
-        # Each stream feeds its last sampled token at its next absolute position; step_batch grows
-        # all caches by exactly one position.
-        ids_per_stream = [mx.array([st.last_token]) for st in active]
-        caches = [st.cache for st in active]
-        offsets = [st.offset for st in active]
-        logits_per_stream = model.step_batch(ids_per_stream, caches, offsets)
-        mx.eval(logits_per_stream)
-
-        next_active: list[_Stream] = []
-        for st, logits in zip(active, logits_per_stream, strict=True):
-            st.offset += 1
-            st.key, sub = mx.random.split(st.key)
-            tok = int(sample_logits(
-                logits[0, -1], temperature=temperature, top_k=top_k, top_p=top_p,
-                min_p=min_p, key=sub,
-            ).item())
-            if tok in stops:
-                st.done = True
-                outputs[st.idx] = list(st.out)
-                continue
-            st.out.append(tok)
-            st.last_token = tok
-            if len(st.out) >= st.max_new:
-                st.done = True
-                outputs[st.idx] = list(st.out)
-                continue
-            next_active.append(st)
-
-        # Backfill freed slots from the pending queue (keeps the batch saturated).
-        active = next_active
+    # Seed the active set up to cap, then run the continuous-batching loop. The try/finally guarantees
+    # every still-leased active stream's #18 arena row is returned on ANY early exit (e.g. a later empty
+    # prompt raising mid-admit while earlier streams already leased rows) — a raise never leaks rows
+    # (rule 6). On normal completion ``active`` is already empty (each stream freed its row on retire).
+    try:
         while pending and len(active) < cap:
             _admit_next()
+
+        # Continuous-batching main loop: step the active set in lock-step, then retire / admit.
+        while active:
+            # Each stream feeds its last sampled token at its next absolute position; step_batch grows
+            # all caches by exactly one position.
+            ids_per_stream = [mx.array([st.last_token]) for st in active]
+            caches = [st.cache for st in active]
+            offsets = [st.offset for st in active]
+            logits_per_stream = model.step_batch(ids_per_stream, caches, offsets)
+            mx.eval(logits_per_stream)
+
+            next_active: list[_Stream] = []
+            for st, logits in zip(active, logits_per_stream, strict=True):
+                st.offset += 1
+                st.key, sub = mx.random.split(st.key)
+                tok = int(sample_logits(
+                    logits[0, -1], temperature=temperature, top_k=top_k, top_p=top_p,
+                    min_p=min_p, key=sub,
+                ).item())
+                if tok in stops:
+                    st.done = True
+                    outputs[st.idx] = list(st.out)
+                    model.free_cache(st.cache)    # #18: return the row on retire (no-op if non-arena)
+                    continue
+                st.out.append(tok)
+                st.last_token = tok
+                if len(st.out) >= st.max_new:
+                    st.done = True
+                    outputs[st.idx] = list(st.out)
+                    model.free_cache(st.cache)    # #18: return the row on retire (no-op if non-arena)
+                    continue
+                next_active.append(st)
+
+            # Backfill freed slots from the pending queue (keeps the batch saturated).
+            active = next_active
+            while pending and len(active) < cap:
+                _admit_next()
+    finally:
+        for st in active:
+            model.free_cache(st.cache)            # free any row still leased on an early/error exit
 
     return outputs

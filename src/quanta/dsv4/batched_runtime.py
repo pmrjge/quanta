@@ -45,6 +45,8 @@ from quanta.cache_quant import BITS
 from quanta.dsv4.attention import _rms_w
 from quanta.dsv4.decode import (
     DSV4Cache,
+    _ArenaCacheHandle,
+    _KVArenaSet,
     decode_step_compressed,
     decode_step_compressed_batched,
     decode_step_dense,
@@ -102,7 +104,7 @@ class DSV4BatchedResidentModel:
         max_batch: int = 32,
         packed_experts: bool = True,
         load_mtp: bool = False,
-        kv_arena: bool = False,
+        kv_arena: bool = True,
         n_layers: int | None = None,
     ) -> None:
         if max_batch < 1:
@@ -125,7 +127,7 @@ class DSV4BatchedResidentModel:
     @classmethod
     def from_inner(cls, inner, *, max_batch: int = 32, packed_experts: bool = True,
                    mtp_params: dict | None = None,
-                   kv_arena: bool = False) -> "DSV4BatchedResidentModel":
+                   kv_arena: bool = True) -> "DSV4BatchedResidentModel":
         """Build a batched runtime around an EXISTING single-stream-shaped inner (parity tests).
 
         The inner must expose the :class:`DSV4ResidentModel` surface this runtime consumes:
@@ -139,7 +141,7 @@ class DSV4BatchedResidentModel:
         return obj
 
     def _init_from_inner(self, inner, *, max_batch: int, packed_experts: bool,
-                         mtp_params: dict | None, kv_arena: bool = False) -> None:
+                         mtp_params: dict | None, kv_arena: bool = True) -> None:
         """Common init: bind the inner + mirror its surface so callers can drop a batched model in
         wherever a single-stream one is expected (same ``.cfg``/``.num_layers``/``.embed_w``/...)."""
         if max_batch < 1:
@@ -158,19 +160,50 @@ class DSV4BatchedResidentModel:
         # decode_step_*_batched siblings). Gated model-free in parity/dsv4_batched_attention_test.py;
         # the per-stream Design-A loop stays the reference + the multi-token-tail fallback.
         self._fused = True
-        # #18 batched KV arena: replace the B ragged per-stream caches' per-stream KV-update loop with
-        # a persistent max_batch-sized padded arena (one scatter write + one gather read). INERT here
-        # (no stepper consumes it yet) — wired dense in M1, compressed in M3; the default flips ON in
-        # M4 once the whole path is parity-green (rule 4: default = proven per-stream path until then).
+        # #18 batched KV arena: replace the B ragged per-stream caches' per-stream KV-update loop with a
+        # persistent max_batch-sized arena set (one scatter write + one gather read per layer). Default
+        # ON since M4: ``make_cache`` leases a row and returns an _ArenaCacheHandle; prefill seeds the
+        # latent arena (via the handle's views) + migrates the derived ckv/ikv/ring into the _CompArena
+        # set; ``_decode_batched_single`` dispatches to the arena steppers when the cache is a handle.
+        # The proven per-stream _LayerCache loop is retained as the flagged reference (kv_arena=False)
+        # and is still what a discrete DSV4Cache takes (dispatch keys off the cache type, not the flag).
         self._kv_arena = bool(kv_arena)
+        self._arena_set: _KVArenaSet | None = None
+        self._arena_quant: tuple[int, bool] = (0, False)
+        if self._kv_arena:
+            gs, q = _latent_quant(self.cfg.head_dim)
+            self._arena_quant = (gs, q)
+            comp_specs = [
+                ({"ratio": self.cfg.compress_ratio(i), "overlap": self.cfg.overlap(i),
+                  "has_indexer": self.cfg.has_indexer(i)}
+                 if self.cfg.compress_ratio(i) > 0 else None)
+                for i in range(self.num_layers)
+            ]
+            self._arena_set = _KVArenaSet(self.num_layers, self.max_batch, group_size=gs,
+                                          quantized=q, comp_specs=comp_specs)
 
     # --- convenience pass-throughs --------------------------------------------
-    def make_cache(self) -> DSV4Cache:
-        """A fresh per-stream decode cache (one ``_LayerCache`` per attention block)."""
+    def make_cache(self):
+        """A fresh per-stream decode cache. With ``kv_arena`` on (#18, default) an
+        :class:`~quanta.dsv4.decode._ArenaCacheHandle` leasing one row of the shared arena set
+        (latent + compressed extras), presented as a :class:`DSV4Cache`-shaped object that prefill /
+        batched decode drive unchanged; otherwise a discrete :class:`DSV4Cache` (one ``_LayerCache``
+        per attention block). Fails loud (rule 6) when all ``max_batch`` arena rows are leased."""
+        if self._kv_arena:
+            gs, q = self._arena_quant
+            row = self._arena_set.alloc()
+            return _ArenaCacheHandle(self._arena_set, row, quantized=q, group_size=gs)
         return DSV4Cache(self.num_layers)
 
+    def free_cache(self, cache) -> None:
+        """Return an arena-backed cache's leased row to the free-list (serving release, #18). No-op for
+        a discrete :class:`DSV4Cache` or when the arena is off — keyed off the cache having a ``row``."""
+        row = getattr(cache, "row", None)
+        if self._kv_arena and self._arena_set is not None and row is not None:
+            self._arena_set.free(row)
+
     # --- prefill --------------------------------------------------------------
-    def prefill(self, prompt_ids: mx.array, cache: DSV4Cache) -> mx.array:
+    def prefill(self, prompt_ids: mx.array, cache) -> mx.array:
         """Seed ``cache`` with ``prompt_ids`` (single-stream prefill via the parity-correct
         single-stream forward) and return the final-position logits ``[1, T, vocab]``.
 
@@ -178,12 +211,21 @@ class DSV4BatchedResidentModel:
         each token through the single-stream decode path (the exact pattern
         :func:`quanta.dsv4.generate.generate` uses). This routes through the inner model's
         ``__call__`` which is the parity reference — the same code the single-stream gate
-        validates — so prefill is byte-for-byte single-stream-equivalent."""
+        validates — so prefill is byte-for-byte single-stream-equivalent.
+
+        With an :class:`~quanta.dsv4.decode._ArenaCacheHandle` (#18 arena path) the prefill above
+        wrote the latent KV straight into the arena row (through each layer view's ``append_kv``) but
+        left the derived ckv/ikv/ring per-object on the views; :meth:`_ArenaCacheHandle.seed_comp`
+        migrates them into the shared ``_CompArena`` set (bit-exact code-copy) so batched decode reads
+        all state from the arenas."""
         ids = prompt_ids if isinstance(prompt_ids, mx.array) else mx.array(prompt_ids)
         ids = ids.reshape(-1)
         if ids.shape[0] == 0:
             raise ValueError("prefill: empty prompt_ids (need >= 1 token to seed the cache)")
-        return self._inner(ids, caches=cache, offset=0)
+        logits = self._inner(ids, caches=cache, offset=0)
+        if hasattr(cache, "seed_comp"):
+            cache.seed_comp()
+        return logits
 
     # --- #152/#175 paged contract (driven by quanta.shim.omlx._BaseBatchedSession paged mode) -------
     @property
@@ -366,6 +408,15 @@ class DSV4BatchedResidentModel:
             stream_ids.append(arr)
             seq_lens.append(int(arr.shape[1]))
 
+        # #18 arena handles carry their KV in the shared arena set and MUST take the fused single-token
+        # path (decode_step_*_batched on the arena). The per-stream Design-A loop / multi-token tail
+        # below writes the derived ckv/ikv/ring per-object on the view and would silently diverge from
+        # the arena decode reads — so fail loud (rule 6) rather than corrupt a stream.
+        if any(hasattr(c, "row") for c in caches) and not (self._fused and all(t == 1 for t in seq_lens)):
+            raise ValueError(
+                "step_batch: arena cache handles require the fused single-token decode path (T==1 per "
+                "stream); multi-token / non-fused decode must use a discrete DSV4Cache (#18)")
+
         # Fast path — every stream is a plain single-token decode (T_b == 1): fuse the per-stream
         # attention loop into ONE batched pass (decode_step_*_batched). Multi-token tails (T_b > 1,
         # spec replay) keep the position-by-position Design-A loop below — it is also the reference
@@ -437,16 +488,33 @@ class DSV4BatchedResidentModel:
         b = int(ids_b.shape[0])
         h = hc_expand(self.embed_w[ids_b].astype(mx.bfloat16), hc)               # [B,1,hc,dim]
         max_len = max(offsets) + 1
+        # #18: dispatch on the cache TYPE (not the flag) so an _ArenaCacheHandle takes the loop-kill
+        # arena path (ONE scatter + ONE gather per layer) while a discrete DSV4Cache always keeps the
+        # proven per-stream _LayerCache loop — even if the runtime was built with the arena on.
+        arena_path = b > 0 and hasattr(caches[0], "row")
+        rows = [c.row for c in caches] if arena_path else None
         for i, p in enumerate(self.layers):
             cos, sin = self._inner._rope(i, max_len)                             # full RoPE tables
-            lcs = [caches[s][i] for s in range(b)]                               # this layer per stream
-            step_b = (decode_step_dense_batched if cfg.compress_ratio(i) == 0
-                      else decode_step_compressed_batched)
+            dense = cfg.compress_ratio(i) == 0
             res = h                                                              # attention sub-block
             x, post, comb = hc_pre(h, p["hc_attn_fn"], p["hc_attn_scale"], p["hc_attn_base"],
                                    hc, iters, eps, heps)
             x = _rms_w(x, p["attn_norm"], eps)
-            x = step_b(x, p["attn"], cfg, i, lcs, cos, sin, offsets)
+            if arena_path:
+                latent = self._arena_set.latent[i]
+                if dense:
+                    x = decode_step_dense_batched(x, p["attn"], cfg, i, None, cos, sin, offsets,
+                                                  arena=latent, rows=rows)
+                else:
+                    x = decode_step_compressed_batched(x, p["attn"], cfg, i, None, cos, sin, offsets,
+                                                       arena=latent, rows=rows,
+                                                       comp=self._arena_set.comp[i])
+            else:
+                lcs = [caches[s][i] for s in range(b)]                           # this layer per stream
+                if dense:
+                    x = decode_step_dense_batched(x, p["attn"], cfg, i, lcs, cos, sin, offsets)
+                else:
+                    x = decode_step_compressed_batched(x, p["attn"], cfg, i, lcs, cos, sin, offsets)
             h = hc_post(x, res, post, comb)
             h = self._ffn_batched(h, ids_b, p, i)                               # batched MoE sub-block
         mx.eval(h)

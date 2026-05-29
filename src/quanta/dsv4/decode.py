@@ -922,16 +922,38 @@ class _KVArena:
         """Free-list reset: drop row ``row`` to empty so a new stream can lease it (:meth:`free`)."""
         self.lengths[row] = 0
 
+    def seed_row(self, row: int, *, q: mx.array | None, s: mx.array | None,
+                 b: mx.array | None, bf16: mx.array | None, n: int) -> None:
+        """Seed row ``row`` from an already-encoded ``[1, n, ·]`` stream by copying its STORED
+        representation verbatim (int-bits codes ``q``/``s``/``b`` when :attr:`quantized`, else
+        ``bf16``) — bit-exact, NO re-quantize (re-quantizing a dequantized stream is not idempotent at
+        bf16; the bf16-drift trap). Used once per request at admit to migrate a prefilled per-object
+        :class:`_LayerCache` derived stream (ckv/ikv) into the shared arena row (#18 M4). ``n == 0``
+        (no token yet) just sets the row empty."""
+        if n == 0:
+            self.lengths[row] = 0
+            return
+        if self.quantized:
+            self._ensure_q(n, q, s, b)
+            self._q[row, :n, :] = q[0]
+            self._s[row, :n, :] = s[0]
+            self._b[row, :n, :] = b[0]
+        else:
+            self._ensure_bf16(n, bf16)
+            self._bf16[row, :n, :] = bf16[0]
+        self.lengths[row] = n
+
 
 class _KVArenaSet:
-    """The ``R``-row free-list + one :class:`_KVArena` per layer (latent KV). Owned by
+    """The ``R``-row free-list + one :class:`_KVArena` per layer (latent KV) + one :class:`_CompArena`
+    per compressed (ratio>0) layer (#18 M4). Owned by
     :class:`~quanta.dsv4.batched_runtime.DSV4BatchedResidentModel` when ``kv_arena=True``; a stream
-    leases a row via :meth:`alloc` (the SAME row index across every layer) and returns it via
-    :meth:`free` on release. Model-free constructible for the parity gate. (Compressed-layer
-    ckv/ikv/ring arenas are :class:`_CompArena` (#18 M3); they join this set in M4.)"""
+    leases a row via :meth:`alloc` (the SAME row index across every layer, latent AND comp) and returns
+    it via :meth:`free` on release (which resets the row in every store). Model-free constructible for
+    the parity gate; ``comp_specs=None`` (the latent-only M0/M2 gate) builds no compressed extras."""
 
     def __init__(self, n_layers: int, rows: int, *, group_size: int, quantized: bool,
-                 bits: int = BITS) -> None:
+                 bits: int = BITS, comp_specs: "list[dict | None] | None" = None) -> None:
         if rows < 1:
             raise ValueError(f"_KVArenaSet rows must be >= 1 (got {rows})")
         if n_layers < 1:
@@ -941,6 +963,19 @@ class _KVArenaSet:
             _KVArena(rows, group_size=group_size, quantized=quantized, bits=bits)
             for _ in range(n_layers)
         ]
+        # One _CompArena per ratio>0 layer (None for dense), built from the runtime's per-layer
+        # compression config so a leased row's ckv/ikv/ring ride the SAME row index as its latent.
+        self.comp: list[_CompArena | None] = [None] * n_layers
+        if comp_specs is not None:
+            if len(comp_specs) != n_layers:
+                raise ValueError(
+                    f"_KVArenaSet: comp_specs len {len(comp_specs)} != n_layers {n_layers}")  # rule 6
+            for i, spec in enumerate(comp_specs):
+                if spec is not None:
+                    self.comp[i] = _CompArena(
+                        rows, ratio=int(spec["ratio"]), overlap=bool(spec["overlap"]),
+                        has_indexer=bool(spec["has_indexer"]), group_size=group_size,
+                        quantized=quantized, bits=bits, max_rollback=int(spec.get("max_rollback", 1)))
         self._free: list[int] = list(reversed(range(rows)))     # pop() hands out 0,1,2,...
 
     def alloc(self) -> int:
@@ -955,6 +990,9 @@ class _KVArenaSet:
             raise RuntimeError(f"_KVArenaSet: double-free of row {row}")                 # rule 6
         for a in self.latent:
             a.reset_row(row)
+        for c in self.comp:
+            if c is not None:
+                c.reset_row(row)
         self._free.append(row)
 
     def __len__(self) -> int:
@@ -966,10 +1004,12 @@ class _KVArenaSet:
 
 class _ArenaLayerView(_LayerCache):
     """A :class:`_LayerCache` whose LATENT KV lives in a shared :class:`_KVArena` row (the batched
-    arena, #18), while the derived ckv/ikv/ring stay per-object (inherited — batched into the arena set
-    in M3). Mirrors the :class:`_PagedLayerCache` pattern: prefill / the single-stream decode path call
-    ``append_kv`` / read ``kv`` / ``kv_length`` / ``truncate_kv`` exactly as before; only the latent
-    storage swaps to the arena row here, so prefill seeds an arena row directly (no migration)."""
+    arena, #18), while the derived ckv/ikv/ring stay per-object (inherited). Mirrors the
+    :class:`_PagedLayerCache` pattern: prefill / the single-stream decode path call ``append_kv`` / read
+    ``kv`` / ``kv_length`` / ``truncate_kv`` exactly as before; only the latent storage swaps to the
+    arena row here, so prefill seeds an arena row directly (latent: no migration). The per-object
+    ckv/ikv/ring prefill writes are migrated into the shared :class:`_CompArena` set once at admit by
+    :meth:`_ArenaCacheHandle.seed_comp` (#18 M4), so batched decode reads all state from the arenas."""
 
     __slots__ = ("_arena", "_row")
 
@@ -1051,6 +1091,91 @@ class _CompArena:
             if ik is None:
                 raise ValueError("_CompArena.append_pooled: indexer layer needs an ikv token")  # rule 6
             self.ikv.append_batched(closing_rows, ik)
+
+    def reset_row(self, row: int) -> None:
+        """Free-list reset: drop the compressed extras for ``row`` so a new stream can lease it. ckv/ikv
+        lengths go to 0 (their stale tail is never read past ``n_comp``); the ring row is zeroed so a
+        future lease's :meth:`seed_row` / first roll never reads a prior tenant's raw hidden."""
+        self.ckv.reset_row(row)
+        if self.ikv is not None:
+            self.ikv.reset_row(row)
+        if self.ring is not None:
+            self.ring[row] = mx.zeros((self.ring_cap, self.ring.shape[-1]), dtype=self.ring.dtype)
+
+    def seed_row(self, row: int, lc: _LayerCache) -> None:
+        """Migrate one prefilled compressed :class:`_LayerCache` ``lc`` into ``row`` (#18 M4): copy the
+        pooled-KV stream (``ckv`` codes/bf16), the indexer-KV stream (``ikv``, bf16) and the raw-hidden
+        ring VERBATIM (bit-exact — no re-quantize / re-pool). Called once at admit, after the
+        single-stream prefill seeds ``lc`` (the arena handle's per-layer view) through the proven decode
+        path; the latent KV is already in the latent arena (written via ``append_kv`` during prefill),
+        so only the derived state moves here. ``n_comp == 0`` (no window closed in the prompt) leaves
+        the ckv/ikv streams empty; ckv/ikv grow in lockstep so they share ``n``."""
+        n = lc.n_comp()
+        self.ckv.seed_row(row, q=lc._ckv_q, s=lc._ckv_s, b=lc._ckv_b, bf16=lc._ckv_bf16, n=n)
+        if self.ikv is not None:
+            self.ikv.seed_row(row, q=None, s=None, b=None, bf16=lc.ikv, n=n)
+        self._seed_ring(row, lc.ring)
+
+    def _seed_ring(self, row: int, ring: mx.array | None) -> None:
+        """Right-align a prefilled per-stream ring ``[1, w0, dim]`` into ``row`` of the fixed-width
+        ``[R, ring_cap, dim]`` arena (newest at ``[:, -1]``, zero-padded at the FRONT — the
+        :func:`_push_ring_batched` layout), lazily allocating the store. Overwrites the WHOLE row, so any
+        stale raw hidden a prior lease left is dropped (defense-in-depth with :meth:`reset_row`)."""
+        if ring is None:
+            return
+        dim = ring.shape[-1]
+        if self.ring is None:
+            self.ring = mx.zeros((self.rows, self.ring_cap, dim), dtype=ring.dtype)
+        w = min(int(ring.shape[1]), self.ring_cap)
+        tail = ring[0, -w:]
+        if w < self.ring_cap:
+            tail = mx.concatenate([mx.zeros((self.ring_cap - w, dim), dtype=ring.dtype), tail], axis=0)
+        self.ring[row] = tail
+
+
+class _ArenaCacheHandle:
+    """Per-stream serving handle (#18 M4) presenting a leased :class:`_KVArenaSet` ROW as a
+    :class:`DSV4Cache`-shaped object. ``__getitem__(i)`` returns layer ``i``'s :class:`_ArenaLayerView`
+    (latent KV → the shared arena row); :attr:`offset` reads the row's latent length; :attr:`row` is the
+    leased row. The single-stream prefill drives these views through the proven decode path (latent →
+    arena; derived ckv/ikv/ring → each view's per-object :class:`_LayerCache` fields), then
+    :meth:`seed_comp` migrates the derived state into the shared :class:`_CompArena` set so batched
+    decode reads it. Returned by :meth:`DSV4BatchedResidentModel.make_cache` when ``kv_arena`` is on."""
+
+    __slots__ = ("row", "_set", "layers")
+
+    def __init__(self, arena_set: _KVArenaSet, row: int, *, quantized: bool, group_size: int,
+                 max_rollback: int = 1) -> None:
+        self.row = row
+        self._set = arena_set
+        self.layers: list[_ArenaLayerView] = [
+            _ArenaLayerView(arena_set.latent[i], row, quantized=quantized,
+                            group_size=group_size, max_rollback=max_rollback)
+            for i in range(len(arena_set.latent))
+        ]
+
+    def __getitem__(self, i: int) -> _ArenaLayerView:
+        return self.layers[i]
+
+    def __len__(self) -> int:
+        return len(self.layers)
+
+    @property
+    def offset(self) -> int:
+        """Absolute decode position (== the latent row length; every layer advances in lock-step)."""
+        for v in self.layers:
+            n = v.kv_length()
+            if n > 0:
+                return n
+        return 0
+
+    def seed_comp(self) -> None:
+        """Migrate each compressed layer's prefilled derived ckv/ikv/ring (held per-object on its view)
+        into the shared :class:`_CompArena` set at this row — bit-exact, once per request at admit."""
+        for i, view in enumerate(self.layers):
+            comp = self._set.comp[i]
+            if comp is not None:
+                comp.seed_row(self.row, view)
 
 
 def decode_step_dense_batched(x_t: mx.array, p: dict, cfg: DeepSeekV4Config, layer_id: int,

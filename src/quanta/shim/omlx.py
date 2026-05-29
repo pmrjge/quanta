@@ -838,10 +838,12 @@ class _BaseBatchedSession:
 
 
 class _DSV4BatchedSession(_BaseBatchedSession):
-    """DeepSeek-V4-Flash batched session — one :class:`quanta.dsv4.decode.DSV4Cache` per slot, fused
-    batched MoE across the alive slots. DSV4's ``step_batch`` validates each stream's declared offset
-    against its cache, so the offsets come straight from ``DSV4Cache.offset``. Lazy-imports the
-    batched runtime so the shim still loads when that module is absent (loud on use, rule 6)."""
+    """DeepSeek-V4-Flash batched session — one per-slot decode cache, fused batched MoE across the alive
+    slots. With the runtime's #18 KV arena on (default), ``make_cache`` hands out an
+    ``_ArenaCacheHandle`` leasing one ``max_batch`` row (latent + compressed extras); a discrete
+    ``DSV4Cache`` otherwise. DSV4's ``step_batch`` validates each stream's declared offset against its
+    cache, so the offsets come straight from the cache's ``offset``. Lazy-imports the batched runtime
+    so the shim still loads when that module is absent (loud on use, rule 6)."""
 
     def _make_runtime(self, root: str | Path, capacity: int) -> Any:
         from quanta.dsv4 import batched_runtime as _dbr  # lazy
@@ -850,6 +852,18 @@ class _DSV4BatchedSession(_BaseBatchedSession):
 
     def _new_cache(self) -> Any:
         return self._rt.make_cache()
+
+    def release(self, slot: int) -> None:
+        """Free the slot AND return its #18 KV-arena row to the runtime's free-list. With ``kv_arena``
+        on (default), ``make_cache`` leases one ``max_batch`` row per stream; that row MUST be returned
+        on release so a later admit can reuse it (else the arena caps total served requests at
+        ``max_batch``). No-op for a discrete ``DSV4Cache`` (no ``row``) or the paged path (its state
+        lives in ``_slots``, freed by the base via the manager) — keyed off the cache having a ``row``,
+        so a stub runtime without ``free_cache`` is never called into."""
+        cache = self._caches.get(slot)
+        super().release(slot)
+        if cache is not None and getattr(cache, "row", None) is not None:
+            self._rt.free_cache(cache)
 
 
 class _NemotronBatchedSession(_BaseBatchedSession):
