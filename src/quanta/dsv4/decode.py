@@ -940,18 +940,39 @@ class _ArenaLayerView(_LayerCache):
 
 
 def decode_step_dense_batched(x_t: mx.array, p: dict, cfg: DeepSeekV4Config, layer_id: int,
-                              lcs: list[_LayerCache], cos: mx.array, sin: mx.array,
-                              offsets: list[int]) -> mx.array:
+                              lcs: list[_LayerCache] | None, cos: mx.array, sin: mx.array,
+                              offsets: list[int], *, arena: _KVArena | None = None,
+                              rows: list[int] | None = None) -> mx.array:
     """Batched ratio-0 decode across ``B`` streams — per-stream-offset sibling of
-    :func:`decode_step_dense`. ``x_t``: ``[B,1,dim]``; ``lcs[b]``: stream ``b``'s :class:`_LayerCache`
-    for this layer; ``cos``/``sin``: full RoPE tables for ``[0, max(offsets)+1)``; ``offsets[b]``:
-    stream ``b``'s absolute position. Returns ``[B,1,dim]``."""
+    :func:`decode_step_dense`. ``x_t``: ``[B,1,dim]``; ``cos``/``sin``: full RoPE tables for
+    ``[0, max(offsets)+1)``; ``offsets[b]``: stream ``b``'s absolute position. Returns ``[B,1,dim]``.
+
+    Two interchangeable, output-equivalent latent-KV stores (#18; gated in
+    ``parity/dsv4_batched_attention_test.py``):
+
+    * **arena path** (``arena``/``rows`` given — the loop-kill): write the ``B`` new latent tokens with
+      ONE scatter (:meth:`_KVArena.append_batched`) and read the padded window with ONE gather + dequant
+      (:meth:`_KVArena.read_batched`) — no per-stream Python loop, no ``_pad_stack``. ``rows[b]`` is
+      stream ``b``'s arena row. Contents are bit-identical to the per-stream store (same
+      :mod:`quanta.cache_quant` codec; affine quant over the last axis is row-independent).
+    * **per-stream path** (``lcs`` given, ``arena`` None — the proven reference, default): grow each
+      stream's :class:`_LayerCache` (bounded IO loop, rule-3) then ``_pad_stack`` to ``[B,L_max,hd]``.
+    """
     b = x_t.shape[0]
     cos_b, sin_b = gather_rope_rows(cos, sin, offsets)          # [B,1,rd/2] per-stream rows
     _, q, kv = project_qkv_b(x_t, p, cfg, cos_b, sin_b)         # q [B,1,H,hd], kv [B,1,hd]
-    for s in range(b):                                          # bounded per-stream KV append (IO, rule-3)
-        lcs[s].append_kv(kv[s:s + 1])
-    kv_pad = _pad_stack([lc.kv for lc in lcs])                  # [B, L_max, hd]
+    if arena is not None:                                       # arena path: ONE scatter + ONE gather
+        if rows is None or len(rows) != b:
+            raise ValueError(f"decode_step_dense_batched: arena path needs rows of length B={b} "
+                             f"(got rows={None if rows is None else len(rows)})")           # rule 6
+        arena.append_batched(rows, kv)                         # ONE scatter write (kills the loop)
+        kv_pad = arena.read_batched(rows)                      # ONE gather + dequant (kills _pad_stack)
+    else:                                                      # per-stream reference path
+        if rows is not None:
+            raise ValueError("decode_step_dense_batched: rows given without an arena")      # rule 6
+        for s in range(b):                                     # bounded per-stream KV append (IO, rule-3)
+            lcs[s].append_kv(kv[s:s + 1])
+        kv_pad = _pad_stack([lc.kv for lc in lcs])             # [B, L_max, hd]
     o = sdpa_window_sink_batched(q.astype(mx.float32), kv_pad.astype(mx.float32),
                                  p["attn_sink"].astype(mx.float32), cfg.attn_scale,
                                  cfg.sliding_window, offsets)
