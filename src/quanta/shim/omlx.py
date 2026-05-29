@@ -62,6 +62,43 @@ except Exception:  # pragma: no cover - standalone use
 # templates that use it (e.g. DSV4) and harmlessly ignored by templates that don't.
 _TEMPLATE_KEYS = ("thinking", "enable_thinking", "preserve_thinking", "reasoning_effort")
 
+# Per-model batched-decode operating point: the measured **throughput knee** — the largest B where
+# aggregate tok/s still climbs meaningfully and peak memory stays safely under the ~490 GiB working
+# set (criterion fixed with the user). Measured per model in ``parity/<model>_batched_bench.py``;
+# the per-model DEFAULT serving capacity (concurrent decode slots) when the caller passes no explicit
+# ``batch_size`` (an explicit ``batch_size`` always wins, so benches/tests still pin B). Two kinds of
+# entry: a throughput WORKER's measured knee (rule 6 — only a knee we have ACTUALLY benched appears;
+# never an invented one), and the latency-first ORCHESTRATOR operating point (Qwen3.5), a deliberately
+# LOW B chosen because the agentic loop is single-stream-ish, not a throughput regime — so it is NOT a
+# measured knee and makes no aggregate-tok/s claim. A model absent here ⇒ the generic fallback.
+# Prefix-matched to mirror ``_make_batched_session``.
+BEST_BATCH: tuple[tuple[str, int], ...] = (
+    ("deepseek_v4", 48),  # DSV4 worker (#19): agg ~92.8 tok/s @48, ~11.5x over the per-stream loop; B=64
+    #                       OOMs the looped path's ~490 GiB lazy graph and agg has flattened by 48.
+    ("nemotron", 32),     # Nemotron worker (#20): agg peaks 136.6 tok/s @32 (2.46x); REGRESSES at 48
+    #                       (131.4 tok/s) though memory is fine (108 GiB) — the knee is below 48.
+    ("internlm2", 32),    # InternLM2.5 worker (#21): agg peaks 243.1 tok/s @32 (4.49x over the loop);
+    #                       REGRESSES to 213.6 @48 then plateaus ~210-221 through 128 — KV-light but the
+    #                       knee is still 32 (per-stream decay outpaces B past 32; memory flat ~9 GiB).
+    ("qwen3_5", 4),       # Qwen3.5 orchestrator (#26): latency-first low-B default, NOT a throughput
+    #                       knee. The agentic loop runs single-stream-ish (capacity clamps to prompts
+    #                       on hand, so a lone request still decodes at B=1); B=4 caps concurrency low
+    #                       to keep per-token latency down while still amortizing the routed-MoE read
+    #                       across a few overlapping agent traces. Pin an explicit batch_size to sweep.
+)
+DEFAULT_BATCH_CAPACITY = 8  # generic fallback for a model class with no measured operating point
+
+
+def _best_batch_for(model_type: str | None) -> int | None:
+    """The measured best-B (throughput knee) for ``model_type`` via first-matching prefix, or ``None``
+    when the model's knee has not been measured. Prefixes mirror the ``_make_batched_session``
+    dispatch so a best-B is only ever declared for a model that actually has a batched runtime."""
+    mt = model_type or ""
+    for prefix, best in BEST_BATCH:
+        if mt.startswith(prefix):
+            return best
+    return None
+
 
 class OmlxShimError(RuntimeError):
     """Raised when the quanta oMLX engine cannot load or run an artifact."""
@@ -538,7 +575,7 @@ class _BatchedSession(Protocol):
     capacity: int
     num_layers: int
 
-    def admit(self, slot: int, prompt_ids: list[int]) -> mx.array: ...
+    def admit(self, slot: int, prompt_ids: list[int], max_new: int | None = None) -> mx.array: ...
     def step_batch(self, slot_to_token: dict[int, int]) -> dict[int, mx.array]: ...
     def release(self, slot: int) -> None: ...
 
@@ -637,6 +674,13 @@ class _BaseBatchedSession:
     def _step_offsets(self, caches: list[Any]) -> list[int] | None:
         return [c.offset for c in caches]
 
+    def _configure_cache(self, cache: Any, prompt_ids: list[int], max_new: int | None) -> None:
+        """Per-request cache setup after construction, BEFORE prefill. Default no-op; a subclass whose
+        cache carries request-lifetime state (Qwen3.5's dynamic-YaRN factor) overrides this to fix that
+        state from the request's known span (``len(prompt_ids) + max_new``) so prefill and every decode
+        step share it. ``max_new`` is the stream's generation budget (``None`` when the caller did not
+        budget the request)."""
+
     # --- form-2 native decode helpers (#153) ---------------------------------
     def _state_for(self, slot: int) -> Any:
         """The per-stream state triple for a slot, in whichever mode is active (paged or unpaged)."""
@@ -664,7 +708,7 @@ class _BaseBatchedSession:
         return self._rt.step_batch_native(tokens, self._nat)
 
     # --- engine-facing slot contract -----------------------------------------
-    def admit(self, slot: int, prompt_ids: list[int]) -> mx.array:
+    def admit(self, slot: int, prompt_ids: list[int], max_new: int | None = None) -> mx.array:
         if not prompt_ids:
             raise OmlxShimError(f"{type(self).__name__}: admit got an empty prompt")
         if not 0 <= slot < self.capacity:
@@ -674,8 +718,9 @@ class _BaseBatchedSession:
             raise OmlxShimError(f"{type(self).__name__}: admit slot {slot} already in use")
         self._flush_native()                               # alive-slot set changes -> rebuild next step
         if self._manager is not None:
-            return self._admit_paged(slot, prompt_ids)
+            return self._admit_paged(slot, prompt_ids)     # paged keepers carry no request-lifetime state
         cache = self._new_cache()
+        self._configure_cache(cache, prompt_ids, max_new)  # request-lifetime cache state (YaRN pin) pre-prefill
         logits = self._rt.prefill(self._to_prefill_ids(prompt_ids), cache)
         self._caches[slot] = cache
         row = logits[0, -1]  # [vocab] at the final prompt position
@@ -862,6 +907,18 @@ class _Qwen35BatchedSession(_BaseBatchedSession):
 
     def _to_step_tokens(self, tokens: list[int]) -> list[Any]:
         return [int(t) for t in tokens]
+
+    def _configure_cache(self, cache: Any, prompt_ids: list[int], max_new: int | None) -> None:
+        """Pin the dynamic-YaRN factor to the request's largest absolute position
+        (``len(prompt_ids) + max_new``) BEFORE prefill, so the rotate-then-cache roped K use ONE
+        consistent factor across prefill and every decode step. Serving past the native window REQUIRES
+        this — :meth:`Qwen35Cache.yarn_seq` refuses to derive a drifting factor from the live position
+        (rule 6: never silently corrupt the cached KV); at or below native it is a harmless no-op
+        (factor 1.0). With no budget (``max_new is None``) the pin is skipped: the live-position path
+        then serves correctly to the native window and fails loud past it (still never silent)."""
+        if max_new is None:
+            return
+        cache.pin_yarn(len(prompt_ids) + int(max_new))
 
 
 @dataclass(slots=True)
@@ -1226,7 +1283,7 @@ class QuantaOmlxEngine(_OmlxBaseEngine):
         if per_request and len(per_request) != len(prompts):
             raise OmlxShimError(
                 f"per_request length {len(per_request)} != len(prompts) {len(prompts)}")
-        capacity = int(kwargs.pop("batch_size", min(len(prompts), 8)))
+        capacity = int(kwargs.pop("batch_size", self._default_capacity(len(prompts))))
         if capacity < 1:
             raise OmlxShimError(f"batched_stream_generate: batch_size must be >= 1 (got {capacity})")
         capacity = min(capacity, len(prompts))
@@ -1257,7 +1314,10 @@ class QuantaOmlxEngine(_OmlxBaseEngine):
                     sidx = pending.pop(0)
                     slot = free_slots.pop(0)
                     slot_owner[slot] = sidx
-                    slot_logits[slot] = session.admit(slot, streams[sidx].prompt_ids)
+                    # pass the request's generation budget so a YaRN-scaled model (Qwen3.5) can pin its
+                    # dynamic factor across prefill + decode at admit (no-op for the other sessions).
+                    slot_logits[slot] = session.admit(slot, streams[sidx].prompt_ids,
+                                                      max_new=streams[sidx].max_tokens)
                 if not slot_owner:
                     break
                 # sample one token per alive slot from its prefilled / stepped logits row
@@ -1427,6 +1487,12 @@ class QuantaOmlxEngine(_OmlxBaseEngine):
             # model_type, so an unrecognized one still fails loud below (rule 6 — no mis-routing).
             return _SingleTokenStepper(self._runtime, None)
         raise OmlxShimError(f"no decode stepper for quanta artifact model_type={mt!r}")
+
+    def _default_capacity(self, n_prompts: int) -> int:
+        """Concurrent decode slots when the caller passes no ``batch_size``: this model's measured
+        throughput knee (:data:`BEST_BATCH`) if known, else :data:`DEFAULT_BATCH_CAPACITY` — never more
+        than the prompts on hand. An explicit ``batch_size`` bypasses this (benches/tests pin B)."""
+        return min(n_prompts, _best_batch_for(self.model_type) or DEFAULT_BATCH_CAPACITY)
 
     def _make_batched_session(self, *, capacity: int) -> _BatchedSession:
         """Build the engine's batched decode session for this artifact's model class (``model_type``).
