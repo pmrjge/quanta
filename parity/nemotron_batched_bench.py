@@ -46,10 +46,10 @@ from quanta.nemotron.batched_runtime import (
 )
 
 ART = "/Users/pmrj/models/NVIDIA-Nemotron-3-Super-120B-A12B-quanta_int4g64"
-WARMUP_PROMPT_LEN = 1024
+WARMUP_PROMPT_LEN = 256           # short seed: decode tok/s ~context-independent here, keeps O(B) seeding cheap
 GEN = 64                          # timed decode tokens per stream
 WARMUP_STEPS = 4                  # steady-state ramp-up (JIT + KV warm) — not timed
-BATCH_SIZES = (1, 2, 4, 8, 16, 32)
+BATCH_SIZES = (1, 2, 4, 8, 16, 32, 48)
 
 
 def _gib(nbytes: int) -> float:

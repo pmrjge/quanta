@@ -3,9 +3,10 @@
 HEAVY: loads the resident int4-g64 DSV4-Flash bake (~180 GiB). RUN SOLO — no other model resident
 (one-model-at-a-time; an over-subscribed load OOM-reboots the host). Orchestrator/standalone only:
 
-    uv run --with tokenizers python -m parity.dsv4_batched_bench
+    uv run --with tokenizers python -m parity.dsv4_batched_bench           # full B sweep
+    uv run --with tokenizers python -m parity.dsv4_batched_bench 48,64      # only B=48,64
 
-Sweeps ``B in {1,2,4,8,16,32}`` over identical prompts (uniform KV load) on a single resident
+Sweeps ``B in {1,2,4,8,16,32,48,64}`` (override via argv) over identical prompts (uniform KV load) on a single resident
 :class:`quanta.dsv4.batched_runtime.DSV4BatchedResidentModel`, and for each B times TWO decode paths
 on the SAME weights:
 
@@ -23,7 +24,7 @@ Memory is read with MLX's own counters (``get_active_memory`` / ``get_peak_memor
 (which undercounts mmap'd weights + the Metal pool ~10×); ``clear_cache`` + ``reset_peak_memory`` run
 between every path/B so a peak is that configuration's true transient, not a cumulative cache high-water.
 
-Geometry: WARMUP prefill = 1024 tok (single-stream, parity-correct), GEN = 64 decoded tok/stream
+Geometry: WARMUP prefill = 256 tok (single-stream, parity-correct), GEN = 64 decoded tok/stream
 (steady state; 4 warmup steps not timed), EOS disabled (every stream decodes exactly GEN).
 """
 
@@ -37,10 +38,11 @@ from quanta.dsv4.batched_runtime import DSV4BatchedResidentModel
 from quanta.dsv4.decode import DSV4Cache
 
 ART = "/Users/pmrj/models/DeepSeek-V4-Flash-quanta_int4g64"
-WARMUP_PROMPT_LEN = 1024
+WARMUP_PROMPT_LEN = 256           # short seed: decode tok/s is MoE-dominated (~context-independent),
+                                  # so a shorter seed barely moves throughput but keeps O(B) seeding cheap
 GEN = 64                          # decoded tokens per stream
 WARMUP_STEPS = 4                  # steady-state ramp-up (not timed)
-BATCH_SIZES = (1, 2, 4, 8, 16, 32)
+BATCH_SIZES = (1, 2, 4, 8, 16, 32, 48, 64)
 
 
 def _gib(nbytes: int) -> float:
@@ -90,10 +92,10 @@ def _time_path(model: DSV4BatchedResidentModel, prompt_ids: mx.array, B: int, fu
             "active_gib": _gib(mx.get_active_memory()), "peak_gib": _gib(mx.get_peak_memory())}
 
 
-def run() -> None:
+def run(batch_sizes: tuple[int, ...] = BATCH_SIZES) -> None:
     # Pin the resident weight set (DSV4-Flash int4-g64 ≈ 180 GiB — keep MLX from paging it).
     mx.set_wired_limit(int(220 * 1024 ** 3))
-    model = DSV4BatchedResidentModel(ART, max_batch=max(BATCH_SIZES), packed_experts=True)
+    model = DSV4BatchedResidentModel(ART, max_batch=max(batch_sizes), packed_experts=True)
 
     bos = model.cfg.bos_token_id
     prompt_ids = mx.array([bos] + list(range(1, WARMUP_PROMPT_LEN)))
@@ -102,7 +104,7 @@ def run() -> None:
           f"{GEN} gen/stream): looped (per-stream attn) vs batched (fused attn) ===")
     print(f"{'B':>4}  {'looped per/agg':>22}  {'batched per/agg':>22}  {'bat/loop':>9}  "
           f"{'act/peak GiB':>16}")
-    for B in BATCH_SIZES:
+    for B in batch_sizes:
         lp = _time_path(model, prompt_ids, B, fused=False)
         ba = _time_path(model, prompt_ids, B, fused=True)
         ratio = ba["aggregate"] / lp["aggregate"] if lp["aggregate"] else float("nan")
@@ -112,4 +114,7 @@ def run() -> None:
 
 
 if __name__ == "__main__":
-    run()
+    import sys
+
+    bs = tuple(int(x) for x in sys.argv[1].split(",")) if len(sys.argv) > 1 else BATCH_SIZES
+    run(bs)

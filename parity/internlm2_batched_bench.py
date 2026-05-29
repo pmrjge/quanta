@@ -16,8 +16,10 @@ Two parts:
        A2. ``B=4`` ragged offsets must be **greedy-exact** — once batched matmul + padded SDPA engage,
            ``|Δlogit|`` is non-zero (per-row-independent reduction-order ULP, input-dependent), but
            argmax-stable: the equivalence class the project accepts for every batched/tiled path.
-  B. **throughput** — ``B in {1,2,4,8,16,32}``, uniform 1024-tok prefill, ``GEN=64`` decode/stream:
-     per-stream + aggregate tok/s for the fused and looped paths, and the fused/looped speedup.
+  B. **throughput** — ``B in {1,2,4,8,16,32,48,64,96,128}``, uniform 256-tok prefill, ``GEN=64``
+     decode/stream: per-stream + aggregate tok/s for the fused and looped paths + the fused/looped
+     speedup. Swept high (to 128) because InternLM2.5 is the KV-light model — its aggregate-tok/s knee
+     may sit well above the DSV4 (48) / Nemotron (32) knees, so the sweep must reach the flattening.
 
 One model only (int8-g64 ≈ 8.3 GB on disk, ~6.2 GB resident) — safe to run solo on the M3 Ultra.
 
@@ -35,10 +37,10 @@ import mlx.core as mx
 from quanta.internlm2.batched_runtime import InternLM2BatchedResidentModel
 
 ART = "/Users/pmrj/models/internlm2_5-7b-chat-1m-quanta_int8g64"
-WARMUP_PROMPT_LEN = 1024
+WARMUP_PROMPT_LEN = 256           # short seed: decode tok/s ~context-independent here, keeps O(B) seeding cheap
 GEN = 64                          # timed decode tokens per stream
 WARMUP_STEPS = 4                  # steady-state ramp-up (JIT + KV warm) — not timed
-BATCH_SIZES = (1, 2, 4, 8, 16, 32)
+BATCH_SIZES = (1, 2, 4, 8, 16, 32, 48, 64, 96, 128)   # swept high: KV-light ⇒ knee may be >>32
 
 
 def _peak_rss_gib() -> float:
@@ -140,7 +142,7 @@ def _time_path(model: InternLM2BatchedResidentModel, prompt_ids: mx.array, b: in
 
 
 def run() -> None:
-    mx.set_wired_limit(int(24 * 1024 ** 3))           # ~6.2 GB resident + KV + transient — bounded
+    mx.set_wired_limit(int(32 * 1024 ** 3))           # ~6.2 GB resident + B≤128 KV + transient — bounded
     model = InternLM2BatchedResidentModel(ART, max_batch=max(BATCH_SIZES))
     assert model._fused, "batched runtime must default to the fused decode path"
     prompt_ids = _prompt(WARMUP_PROMPT_LEN, model.cfg.bos_token_id)
