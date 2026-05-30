@@ -2,8 +2,9 @@
 
 > Durable, repo-tracked handover for the NEXT task. Read `CLAUDE.md` first (permanent
 > rules + model facts), then `PLAN.md` (#18, the batched KV arena — DONE M0–M5; the
-> machinery #153 reuses), then this. **Status: M0 DONE — storage primitives landed +
-> gated model-free; M1 (wire the dense stepper) next.**
+> machinery #153 reuses), then this. **Status: M0–M1 DONE — storage primitives + the dense
+> stepper on the paged arena (`_PagedKVArena`), gated bit-exact model-free; M2 (compressed
+> stepper) next.**
 
 ---
 
@@ -155,9 +156,22 @@ and #18-arena paths are untouched.
   `parity/dsv4_paged_batched_test.py` green: batched write/read == per-stream
   (`write_one`/`gather_one` and `write`/`gather`) bit-exact across ragged + boundary-crossing
   block tables + a COW case. Regressions + ruff/compileall/lock/diff clean.
-- **M1 — dense stepper on the paged-arena.** Add the paged dispatch branch in
-  `_decode_batched_single`; wire `decode_step_dense_batched(arena=paged latent, …)`. Gate:
-  dense paged-batched == per-stream paged `lcs` loop (extend the M0 test / paged-latent test).
+- **M1 ✅ DONE — dense stepper on the paged-arena.** `_PagedKVArena`
+  (`quanta.dsv4.decode`): a thin per-layer adapter `(manager, seqs, layer)` presenting
+  `_KVArena`'s `append_batched`/`read_batched` over the manager's `write_one_batched`/
+  `gather_one_batched` (codec-agnostic — forwards, so int8 latent AND bf16 both ride it).
+  `decode_step_dense_batched`'s arena path runs UNCHANGED on it (`rows` == `range(B)`). New
+  dispatch branch in `_decode_batched_single` routes a paged DSV4Cache's DENSE layers through it,
+  **gated on `self._paged_kv_batched`** (← `PAGED_KV_BATCHED_DEFAULT`, OFF, rule 4): paged caches
+  already reach this method and take the per-stream `lcs` branch, so the FLAG (not cache type)
+  engages the new path — M3 flips it. Compressed paged layers keep the per-stream loop until M2
+  (both write the SAME paged latent store; M0 proved batched-scatter == per-stream-write bit-exact,
+  so a mixed forward stays exact). Gate (`parity/dsv4_paged_batched_test.py`): dense paged-batched
+  == per-stream paged `lcs` loop, **BIT-exact (`max|Δ|=0`)** across ragged B=4 (boundary-crossing,
+  3 steps) + B=1 — both paths run the SAME batched SDPA, differing only in how the latent window is
+  materialized (masked padding inert), so even B≥2 is exact. Regressions green
+  (`dsv4_batched_attention_test`, `dsv4_paged_latent_test` incl. real `_DSV4BatchedSession`
+  admit/reuse `|Δ|=0` with the flag off, `dsv4_batched_test`) + ruff/compileall/lock/diff/pytest.
 - **M2 — compressed stepper + batched derived.** Reuse `_CompArena` for ckv/ikv/ring, seeded
   from each stream's per-stream paged-cache derived state (the snapshot/restore lifecycle) and
   snapshotted at boundaries. The hard milestone (derived batching × paged boundary snapshots).
@@ -199,7 +213,7 @@ and #18-arena paths are untouched.
 
 ## Gate commands
 ```bash
-uv run python -m parity.dsv4_paged_batched_test          # M0–M2 (new, model-free)
+uv run --with numpy python -m parity.dsv4_paged_batched_test  # M0–M2 (model-free; M1+ needs numpy fixtures)
 uv run --with numpy python -m parity.dsv4_paged_latent_test  # M3 regression (paged latent)
 uv run --with numpy python -m parity.dsv4_batched_test       # #18 regression (unchanged)
 # Before M3 commit: pytest tests/ -q · ruff check src tests · compileall · uv lock --check · git diff --check

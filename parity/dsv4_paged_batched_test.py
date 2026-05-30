@@ -30,15 +30,37 @@ already gated in ``parity/dsv4_paged_latent_test.py`` (single) and the Nemotron 
 ``_LayerCache`` is used directly as the single-stream ground truth, and the per-stream paged path is the
 k/v ground truth.
 
-    uv run python -m parity.dsv4_paged_batched_test
+**M1 — the dense decode stepper on the paged store.** ``_PagedKVArena`` (a thin per-layer adapter
+presenting :class:`_KVArena`'s ``append_batched`` / ``read_batched`` over the manager's
+``write_one_batched`` / ``gather_one_batched``) is driven through :func:`decode_step_dense_batched` and
+asserted BIT-identical to the per-stream paged ``lcs`` loop (per-stream ``write_one`` + ``_pad_stack``)
+across ``B`` ragged streams and several decode steps — proving the M0 primitive is a faithful drop-in
+UNDER the stepper, not just in isolation. The latent read is gather+dequant with no SDPA reorder, and
+the SDPA itself is the SAME batched call on both paths, so even ``B >= 2`` is exact (``Δ == 0``). Uses
+the tiny DSV4 attn-param fixtures from ``parity.dsv4_batched_test`` (head_dim 8 → bf16 latent, which
+also exercises the batched store's bf16 path that M0's int8 round-trip does not).
+
+    uv run --with numpy python -m parity.dsv4_paged_batched_test
 """
 
 from __future__ import annotations
 
+import numpy as np
+
 import mlx.core as mx
 
+from parity.dsv4_batched_test import _attn_params, _cfg, _r
 from quanta.cache_quant import BITS
-from quanta.dsv4.decode import _LayerCache, _pad_stack
+from quanta.dsv4.attention import rope_cos_sin
+from quanta.dsv4.batched_runtime import _latent_quant
+from quanta.dsv4.config import DeepSeekV4Config
+from quanta.dsv4.decode import (
+    _LayerCache,
+    _PagedKVArena,
+    _PagedLayerCache,
+    _pad_stack,
+    decode_step_dense_batched,
+)
 from quanta.paged import PagedKVCacheManager
 
 HEAD_DIM = 128
@@ -55,9 +77,10 @@ def _eq(a: mx.array, b: mx.array) -> bool:
     return tuple(a.shape) == tuple(b.shape) and bool(mx.all(a == b).item())
 
 
-def _mgr(*, single_stream: bool, block_size: int, name: str) -> PagedKVCacheManager:
+def _mgr(*, single_stream: bool, block_size: int, name: str,
+         quantized: bool = True) -> PagedKVCacheManager:
     return PagedKVCacheManager(num_layers=1, block_size=block_size, max_blocks=256, group_size=GROUP,
-                               bits=BITS, quantized=True, model_name=name, single_stream=single_stream)
+                               bits=BITS, quantized=quantized, model_name=name, single_stream=single_stream)
 
 
 def _run_single_stream(*, block_size: int, label: str) -> bool:
@@ -217,12 +240,85 @@ def _run_cow(*, block_size: int) -> bool:
     return ok
 
 
+def _maxdiff(a: mx.array, b: mx.array) -> float:
+    """Max abs fp32 difference (``0.0`` == bit-exact)."""
+    return float(mx.max(mx.abs(a.astype(mx.float32) - b.astype(mx.float32))).item())
+
+
+def _rope_full(cfg: DeepSeekV4Config, layer_id: int, length: int) -> tuple[mx.array, mx.array]:
+    """Full per-layer RoPE tables for ``[0, length)`` — mirrors ``DSV4ResidentModel._rope``."""
+    orig, theta = cfg.attn_rope(layer_id)
+    return rope_cos_sin(cfg.rope_head_dim, length, orig, theta,
+                        cfg.rope_factor, cfg.beta_fast, cfg.beta_slow)
+
+
+def _run_dense_stepper(*, block_size: int, pre_len: list[int], steps: int, label: str) -> bool:
+    """M1: ``decode_step_dense_batched`` on the paged store via :class:`_PagedKVArena` (ONE block-table
+    scatter + ONE gather) == the per-stream paged ``lcs`` loop (per-stream ``write_one`` + ``_pad_stack``),
+    BIT-exact across ``B = len(pre_len)`` ragged streams and ``steps`` decode steps. Two managers are
+    seeded identically with a raw-latent prefix so the comparison isolates the decode write/read path;
+    each step both paths run the SAME ``decode_step_dense_batched`` (so the batched SDPA is identical),
+    differing ONLY in how the latent window is materialized — hence the output is bit-identical (``Δ==0``,
+    even ``B>=2``) and the per-stream written lengths agree."""
+    mx.random.seed(3)
+    cfg = _cfg()                                          # layer 0 is dense (RATIOS[0] == 0)
+    rng = np.random.default_rng(11)
+    p0 = _attn_params(rng, cfg, 0)
+    gs, q = _latent_quant(cfg.head_dim)                   # the runtime's latent codec for this head_dim
+    b = len(pre_len)
+    d = cfg.head_dim
+    pre = [_rand((1, pre_len[s], d)) for s in range(b)]   # identical raw-latent prefix per stream (like M0)
+
+    # two managers seeded IDENTICALLY by the per-stream prefill write; only the decode path differs.
+    ref_mgr = _mgr(single_stream=True, block_size=block_size, name="m153m1", quantized=q)
+    bat_mgr = _mgr(single_stream=True, block_size=block_size, name="m153m1", quantized=q)
+    ref_seqs, bat_seqs = [], []
+    for s in range(b):
+        for mgr, seqs in ((ref_mgr, ref_seqs), (bat_mgr, bat_seqs)):
+            seq = mgr.new_sequence()
+            mgr.advance(seq, list(range(pre_len[s])))     # open prefill positions (ids irrelevant to KV)
+            mgr.write_one(seq, 0, pre[s])
+            seqs.append(seq)
+
+    lcs = [_PagedLayerCache(ref_mgr.view_one(ref_seqs[s], 0), quantized=q, group_size=gs)
+           for s in range(b)]                             # per-stream paged loop reference (reads live)
+    arena = _PagedKVArena(bat_mgr, bat_seqs, 0)           # batched paged adapter (reads live)
+    rows = list(range(b))
+
+    worst = 0.0
+    len_ok = True
+    for t in range(steps):
+        offs = [pre_len[s] + t for s in range(b)]         # each stream's next absolute position
+        for s in range(b):                                # open the decode position on BOTH managers
+            ref_mgr.advance(ref_seqs[s], [9000 + s * 17 + t])
+            bat_mgr.advance(bat_seqs[s], [9000 + s * 17 + t])
+        x_b = mx.concatenate([_r(rng, 1, 1, cfg.hidden_size) for _ in range(b)], axis=0)   # [B,1,dim]
+        cos, sin = _rope_full(cfg, 0, max(offs) + 1)
+        ref = decode_step_dense_batched(x_b, p0, cfg, 0, lcs, cos, sin, offs)              # per-stream loop
+        bat = decode_step_dense_batched(x_b, p0, cfg, 0, None, cos, sin, offs,
+                                        arena=arena, rows=rows)                            # ONE scatter+gather
+        mx.eval(ref, bat)
+        worst = max(worst, _maxdiff(bat, ref))
+        len_ok = len_ok and all(
+            bat_seqs[s].n_written[0] == ref_seqs[s].n_written[0] == pre_len[s] + t + 1 for s in range(b))
+
+    ok = worst == 0.0 and len_ok
+    print(f"  [{'OK' if ok else 'FAIL'}] {label}: dense paged-batched == per-stream paged loop "
+          f"(B={b} lens={[n + steps for n in pre_len]} steps={steps} blk={block_size} "
+          f"max|Δ|={worst:.2e} len_ok={len_ok})")
+    return ok
+
+
 def run() -> None:
     ok = True
     print("\n=== #153 batched-paged KV: ONE scatter/gather == per-stream paged loop (model-free) ===")
+    print("M0 — storage primitive (write_*_batched / gather_*_batched) == per-stream loop:")
     ok &= _run_single_stream(block_size=3, label="single-stream latent int8 g128 hd=128")
     ok &= _run_kv_pair(block_size=3, label="k/v pair         int8 g128 hd=128")
     ok &= _run_cow(block_size=4)
+    print("M1 — dense decode stepper on the paged store (_PagedKVArena == per-stream paged lcs loop):")
+    ok &= _run_dense_stepper(block_size=3, pre_len=[5, 2, 8, 1], steps=3, label="ragged B=4")
+    ok &= _run_dense_stepper(block_size=4, pre_len=[6], steps=2, label="B=1 bit-exact")
     print("PASS" if ok else "FAIL")
     assert ok
 

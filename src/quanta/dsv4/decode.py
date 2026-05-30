@@ -944,6 +944,48 @@ class _KVArena:
         self.lengths[row] = n
 
 
+class _PagedKVArena:
+    """A thin per-layer adapter presenting :class:`_KVArena`'s BATCHED interface
+    (``append_batched`` / ``read_batched``) over the shared block-paged
+    :class:`~quanta.paged.PagedKVCacheManager` (#153 M1) — the paged sibling of the #18 arena. Holds
+    ``(manager, seqs, layer)``: the ``B`` lock-step streams' :class:`~quanta.paged.SeqHandle` list and
+    this layer index. ``append_batched`` delegates to ``manager.write_one_batched`` (ONE quantize + ONE
+    block-table scatter across the streams' tail blocks) and ``read_batched`` to
+    ``manager.gather_one_batched`` (ONE ``mx.take`` over a padded block-id matrix + ONE batched dequant),
+    so :func:`decode_step_dense_batched`'s arena path runs UNCHANGED on the paged store — no per-stream
+    Python loop, no ``_pad_stack``. ``rows`` indexes into ``seqs`` (identity ``range(B)`` in the
+    all-active fused decode), so the projected ``kv[i]`` lands in stream ``seqs[rows[i]]`` exactly as a
+    real arena row maps. The stored codes are bit-identical to the per-stream paged ``write_one`` /
+    ``gather_one`` loop (M0 proved it), so the round-trip matches the per-stream paged reference."""
+
+    __slots__ = ("_m", "_seqs", "_layer")
+
+    def __init__(self, manager, seqs, layer: int) -> None:
+        self._m = manager
+        self._seqs = seqs
+        self._layer = layer
+
+    def length(self, row: int) -> int:
+        return self._seqs[row].n_written[self._layer]
+
+    def max_length(self, rows: list[int]) -> int:
+        return max((self._seqs[r].n_written[self._layer] for r in rows), default=0)
+
+    def append_batched(self, rows: list[int], kv_new: mx.array) -> None:
+        """ONE batched block-table scatter of the active rows' new latent token (``kv_new``
+        ``[k, 1, head_dim]``) into their paged tail blocks — the paged sibling of
+        :meth:`_KVArena.append_batched`. Each stream must already be ``advance``'d to open the position
+        (the per-stream paged write requires the same)."""
+        self._m.write_one_batched([self._seqs[r] for r in rows], self._layer, kv_new)
+
+    def read_batched(self, rows: list[int]) -> mx.array:
+        """ONE gather + ONE batched dequant of the active rows → ``[k, L_max, head_dim]`` bf16 — the
+        paged sibling of :meth:`_KVArena.read_batched` (replaces per-stream ``gather_one`` +
+        ``_pad_stack``). Positions past each stream's written length are stale block-0 rows the SDPA
+        window/pad mask sends to ``-inf`` (numerically inert — the #18 argument)."""
+        return self._m.gather_one_batched([self._seqs[r] for r in rows], self._layer)
+
+
 class _KVArenaSet:
     """The ``R``-row free-list + one :class:`_KVArena` per layer (latent KV) + one :class:`_CompArena`
     per compressed (ratio>0) layer (#18 M4). Owned by
