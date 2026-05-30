@@ -67,7 +67,8 @@ _TEMPLATE_KEYS = ("thinking", "enable_thinking", "preserve_thinking", "reasoning
 # aggregate tok/s still climbs meaningfully and peak memory stays safely under the ~490 GiB working
 # set (criterion fixed with the user). Measured per model in ``parity/<model>_batched_bench.py``;
 # the per-model DEFAULT serving capacity (concurrent decode slots) when the caller passes no explicit
-# ``batch_size`` (an explicit ``batch_size`` always wins, so benches/tests still pin B). Two kinds of
+# ``batch_size`` (an explicit ``batch_size`` wins up to the uniform :data:`SERVING_BATCH_CAP` for a
+# throughput worker — sweep past it via a direct session). Two kinds of
 # entry: a throughput WORKER's measured knee (rule 6 — only a knee we have ACTUALLY benched appears;
 # never an invented one), and the latency-first ORCHESTRATOR operating point (Qwen3.5), a deliberately
 # LOW B chosen because the agentic loop is single-stream-ish, not a throughput regime — so it is NOT a
@@ -75,7 +76,8 @@ _TEMPLATE_KEYS = ("thinking", "enable_thinking", "preserve_thinking", "reasoning
 # Prefix-matched to mirror ``_make_batched_session``.
 BEST_BATCH: tuple[tuple[str, int], ...] = (
     ("deepseek_v4", 48),  # DSV4 worker (#19): agg ~92.8 tok/s @48, ~11.5x over the per-stream loop; B=64
-    #                       OOMs the looped path's ~490 GiB lazy graph and agg has flattened by 48.
+    #                       OOMs the looped path's ~490 GiB lazy graph and agg has flattened by 48. This
+    #                       is the benched KNEE; serving HARD-caps it to SERVING_BATCH_CAP=32 (uniform).
     ("nemotron", 32),     # Nemotron worker (#20): agg peaks 136.6 tok/s @32 (2.46x); REGRESSES at 48
     #                       (131.4 tok/s) though memory is fine (108 GiB) — the knee is below 48. The
     #                       #153 paged KV loop-kill (default since 7f49bd9) REAFFIRMS 32: decode-only
@@ -84,6 +86,7 @@ BEST_BATCH: tuple[tuple[str, int], ...] = (
     ("internlm2", 32),    # InternLM2.5 worker (#21): agg peaks 243.1 tok/s @32 (4.49x over the loop);
     #                       REGRESSES to 213.6 @48 then plateaus ~210-221 through 128 — KV-light but the
     #                       knee is still 32 (per-stream decay outpaces B past 32; memory flat ~9 GiB).
+    #                       HARD cap (like Nemotron): the #153 loop-kill bench reaffirms 332→322 @32→48.
     ("qwen3_5", 4),       # Qwen3.5 orchestrator (#26): latency-first low-B default, NOT a throughput
     #                       knee. The agentic loop runs single-stream-ish (capacity clamps to prompts
     #                       on hand, so a lone request still decodes at B=1); B=4 caps concurrency low
@@ -91,6 +94,14 @@ BEST_BATCH: tuple[tuple[str, int], ...] = (
     #                       across a few overlapping agent traces. Pin an explicit batch_size to sweep.
 )
 DEFAULT_BATCH_CAPACITY = 8  # generic fallback for a model class with no measured operating point
+SERVING_BATCH_CAP = 32      # UNIFORM hard ceiling on concurrent decode slots for every throughput WORKER
+#   (user directive 2026-05-30: "B=32 as hard-coded default ... do the same for nemotron and deepseek").
+#   Serving clamps DOWN to this even on an explicit ``batch_size`` — DECOUPLED from the measured
+#   :data:`BEST_BATCH` knee, so DSV4's benched knee (48; it scales there per #18 M5) stays honest in
+#   ``BEST_BATCH`` while serving is held at 32; Nemotron (#20) / InternLM2.5 (#21) regress past 32 anyway.
+#   The Qwen3.5 ORCHESTRATOR is EXEMPT (its B=4 is a sweepable latency pin, not a ceiling; rule 6). A
+#   bench that must sweep B>32 drives the batched SESSION directly (``DSV4BatchedResidentModel.step_batch``),
+#   bypassing this engine-layer policy — e.g. ``parity/dsv4_batched_bench.py``, ``parity/dsv4_b48_noise.py``.
 
 
 def _best_batch_for(model_type: str | None) -> int | None:
@@ -1505,21 +1516,28 @@ class QuantaOmlxEngine(_OmlxBaseEngine):
 
     def _default_capacity(self, n_prompts: int) -> int:
         """Concurrent decode slots when the caller passes no ``batch_size``: this model's measured
-        throughput knee (:data:`BEST_BATCH`) if known, else :data:`DEFAULT_BATCH_CAPACITY` — never more
-        than the prompts on hand. An explicit ``batch_size`` bypasses this (benches/tests pin B)."""
-        return min(n_prompts, _best_batch_for(self.model_type) or DEFAULT_BATCH_CAPACITY)
+        throughput knee (:data:`BEST_BATCH`) if known, else :data:`DEFAULT_BATCH_CAPACITY`, then clamped
+        to the uniform serving ceiling (:meth:`_hard_batch_cap`) and to the prompts on hand. So a worker
+        whose knee exceeds the cap (DSV4 knee 48) still defaults to the cap (32)."""
+        knee = _best_batch_for(self.model_type) or DEFAULT_BATCH_CAPACITY
+        hard = self._hard_batch_cap()
+        if hard is not None:
+            knee = min(knee, hard)
+        return min(n_prompts, knee)
 
     def _hard_batch_cap(self) -> int | None:
-        """The HARD batch ceiling for this model class, or ``None``. A model whose :data:`BEST_BATCH`
-        entry is a *measured throughput knee that decode regresses past* (not a soft latency default) is
-        clamped DOWN to it even when the caller passes an explicit ``batch_size`` — serving can never be
-        pushed past the operating point. Currently **Nemotron** (decode REGRESSES past B=32 — worker #20;
-        the #153 loop-kill flattens the curve but B=48 is still ≈ no gain at +16 GiB KV —
-        ``parity/nemotron_paged_batched_bench.py``). DSV4/InternLM2 knees are also ceilings but left
-        uncapped until asked; Qwen3.5's low-B is a latency pin ("pin an explicit batch_size to sweep"),
-        NEVER a cap (rule 6: only clamp where the knee is a true ceiling, never a soft default)."""
+        """The HARD batch ceiling for this model class, or ``None``. Every throughput WORKER is clamped to
+        the uniform :data:`SERVING_BATCH_CAP` (32) — even on an explicit ``batch_size``, serving never
+        exceeds it (user directive). This is **decoupled** from each model's measured :data:`BEST_BATCH`
+        knee: DSV4's benched knee is 48 (it scales there — #18 M5 / worker #19) yet serving is held at 32;
+        Nemotron (#20) and InternLM2.5 (#21) regress past 32 anyway, so the cap also sits at their knees.
+        The **Qwen3.5 orchestrator is EXEMPT** — its B=4 is a sweepable latency pin, not a throughput
+        ceiling (rule 6: never clamp a soft default). A model with no measured knee (generic fallback) has
+        no batched worker, so nothing to cap (``None``)."""
         mt = self.model_type or ""
-        return _best_batch_for(mt) if mt.startswith("nemotron") else None
+        if mt.startswith("qwen3_5") or mt.startswith("qwen3.5"):
+            return None  # orchestrator latency pin — sweepable, never a ceiling
+        return SERVING_BATCH_CAP if _best_batch_for(mt) is not None else None
 
     def _resolve_capacity(self, n_prompts: int, requested: int | None) -> int:
         """Final concurrent-decode-slot count for a ``batched_stream_generate`` call. ``requested`` is the
@@ -1534,9 +1552,9 @@ class QuantaOmlxEngine(_OmlxBaseEngine):
             hard = self._hard_batch_cap()
             if hard is not None and cap > hard:
                 warnings.warn(
-                    f"{self.model_type} batch_size={cap} exceeds its measured throughput knee {hard}; "
-                    f"clamping to {hard} (decode does not scale past it — pin a smaller batch_size to "
-                    f"silence this).", stacklevel=3)
+                    f"{self.model_type} batch_size={cap} exceeds the uniform serving batch cap {hard}; "
+                    f"clamping to {hard} (serving never exceeds it — drive the batched session directly "
+                    f"to sweep a larger B).", stacklevel=3)
                 cap = hard
         if cap < 1:
             raise OmlxShimError(f"batched_stream_generate: batch_size must be >= 1 (got {cap})")

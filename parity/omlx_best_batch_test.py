@@ -43,6 +43,7 @@ from pathlib import Path
 from quanta.shim.omlx import (
     BEST_BATCH,
     DEFAULT_BATCH_CAPACITY,
+    SERVING_BATCH_CAP,
     QuantaOmlxEngine,
     _best_batch_for,
 )
@@ -80,23 +81,26 @@ def _run_knee_values() -> bool:
     """The hardcoded constants are exactly the declared operating points (typo/accidental-edit guard)."""
     table = dict(BEST_BATCH)
     ok = (table.get("deepseek_v4") == 48 and table.get("nemotron") == 32
-          and table.get("internlm2") == 32 and table.get("qwen3_5") == 4 and len(BEST_BATCH) == 4)
+          and table.get("internlm2") == 32 and table.get("qwen3_5") == 4 and len(BEST_BATCH) == 4
+          and SERVING_BATCH_CAP == 32)
     print(f"  [{'OK' if ok else 'FAIL'}] operating values: deepseek_v4=48, nemotron=32, internlm2=32, "
-          f"qwen3_5=4, fallback={DEFAULT_BATCH_CAPACITY}, n_declared={len(BEST_BATCH)}")
+          f"qwen3_5=4, fallback={DEFAULT_BATCH_CAPACITY}, serving_cap={SERVING_BATCH_CAP}, "
+          f"n_declared={len(BEST_BATCH)}")
     return ok
 
 
 def _run_engine_default_capacity() -> bool:
     """`_default_capacity(n)` on a fake-artifact engine == the value the serving default resolves to:
-    the declared operating point (worker knee or orchestrator low-B), clamped to prompts on hand, for
-    declared models; the generic fallback for an undeclared one (GLM here)."""
+    the declared operating point (worker knee or orchestrator low-B), clamped to the uniform serving
+    cap (DSV4 knee 48 → 32) and to prompts on hand, for declared models; the generic fallback for an
+    undeclared one (GLM here)."""
     eng_dsv4 = QuantaOmlxEngine(_fake_artifact("deepseek_v4", nested=False))
     eng_nemo = QuantaOmlxEngine(_fake_artifact("nemotron_h", nested=False))
     eng_intern = QuantaOmlxEngine(_fake_artifact("internlm2", nested=False))
     eng_qwen = QuantaOmlxEngine(_fake_artifact("qwen3_5_moe_text", nested=True))
     eng_glm = QuantaOmlxEngine(_fake_artifact("glm_moe_dsa", nested=False))
     checks = {
-        "dsv4 @100→48": eng_dsv4._default_capacity(100) == 48,
+        "dsv4 @100→32 (serving cap; knee 48)": eng_dsv4._default_capacity(100) == 32,
         "dsv4 @4→4 (prompt clamp)": eng_dsv4._default_capacity(4) == 4,
         "nemotron @100→32": eng_nemo._default_capacity(100) == 32,
         "nemotron @16→16 (clamp)": eng_nemo._default_capacity(16) == 16,
@@ -113,30 +117,37 @@ def _run_engine_default_capacity() -> bool:
 
 
 def _run_hard_batch_cap() -> bool:
-    """Nemotron's knee is a HARD ceiling: ``_resolve_capacity`` clamps an explicit ``batch_size`` DOWN to
-    32 (decode regresses past it). Other batched models' BEST_BATCH is a soft default — an explicit
-    over-the-knee batch_size is HONORED (DSV4 64, Qwen3.5 32), only prompt-clamped. ``_hard_batch_cap``
-    is None for them; Nemotron's default + under-knee batch are unaffected."""
+    """Every throughput WORKER's batch is HARD-capped at the uniform :data:`SERVING_BATCH_CAP` (32):
+    ``_resolve_capacity`` clamps an explicit over-cap ``batch_size`` DOWN to 32 for Nemotron, InternLM2.5
+    AND DSV4 — DSV4's benched knee is 48 but serving is held at 32 (decoupled from BEST_BATCH). The
+    Qwen3.5 ORCHESTRATOR is EXEMPT: its B=4 latency pin is a soft default, an over-knee batch is HONORED
+    (32), only prompt-clamped; ``_hard_batch_cap`` is None for it. Under-cap batches pass through."""
     eng_nemo = QuantaOmlxEngine(_fake_artifact("nemotron_h", nested=False))
+    eng_intern = QuantaOmlxEngine(_fake_artifact("internlm2", nested=False))
     eng_dsv4 = QuantaOmlxEngine(_fake_artifact("deepseek_v4", nested=False))
     eng_qwen = QuantaOmlxEngine(_fake_artifact("qwen3_5_moe_text", nested=True))
     with warnings.catch_warnings():
-        warnings.simplefilter("ignore")             # the nemotron 48→32 clamp warns by design (rule 6)
+        warnings.simplefilter("ignore")             # the over-cap clamp warns by design (rule 6)
         checks = {
             "nemotron _hard_batch_cap==32": eng_nemo._hard_batch_cap() == 32,
             "nemotron explicit 48 → 32 (HARD cap)": eng_nemo._resolve_capacity(100, 48) == 32,
-            "nemotron explicit 16 → 16 (under knee, honored)": eng_nemo._resolve_capacity(100, 16) == 16,
+            "nemotron explicit 16 → 16 (under cap, honored)": eng_nemo._resolve_capacity(100, 16) == 16,
             "nemotron default(None) → 32": eng_nemo._resolve_capacity(100, None) == 32,
             "nemotron cap clamps to prompts (48→32→4)": eng_nemo._resolve_capacity(4, 48) == 4,
-            "dsv4 _hard_batch_cap is None": eng_dsv4._hard_batch_cap() is None,
-            "dsv4 explicit 64 → 64 (NOT capped)": eng_dsv4._resolve_capacity(100, 64) == 64,
-            "qwen3_5 _hard_batch_cap is None (latency pin)": eng_qwen._hard_batch_cap() is None,
+            "internlm2 _hard_batch_cap==32": eng_intern._hard_batch_cap() == 32,
+            "internlm2 explicit 48 → 32 (HARD cap)": eng_intern._resolve_capacity(100, 48) == 32,
+            "internlm2 default(None) → 32": eng_intern._resolve_capacity(100, None) == 32,
+            "dsv4 _hard_batch_cap==32 (knee 48, serving-capped)": eng_dsv4._hard_batch_cap() == 32,
+            "dsv4 explicit 64 → 32 (HARD cap, was knee 48)": eng_dsv4._resolve_capacity(100, 64) == 32,
+            "dsv4 default(None) → 32 (capped from knee 48)": eng_dsv4._resolve_capacity(100, None) == 32,
+            "qwen3_5 _hard_batch_cap is None (orchestrator pin)": eng_qwen._hard_batch_cap() is None,
             "qwen3_5 explicit 32 → 32 (NOT capped)": eng_qwen._resolve_capacity(100, 32) == 32,
         }
     ok = all(checks.values())
     bad = [k for k, v in checks.items() if not v]
     print(f"  [{'OK' if ok else 'FAIL'}] hard batch cap: " +
-          ("nemotron clamps >32→32; dsv4/qwen3_5 honor explicit B" if ok else f"WRONG: {bad}"))
+          ("nemotron/internlm2/dsv4 clamp >32→32; qwen3_5 orchestrator honors explicit B"
+           if ok else f"WRONG: {bad}"))
     return ok
 
 
