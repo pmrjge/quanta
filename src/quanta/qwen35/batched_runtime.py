@@ -49,15 +49,20 @@ from quanta.qwen35.config import Qwen35Config
 from quanta.qwen35.decode import Qwen35Cache, _GDNLayerState
 from quanta.qwen35.gated_deltanet import GatedDeltaNet
 
-# --- #153 GQA loop-kill default (Qwen3.5-scoped; UNPAGED — not the shared paged flag) -------------
-# When ON, the serving decode step (:func:`batched_decode_step`) replaces the per-stream GQA mixer loop
-# on full-attention layers with ONE batched attention across all B streams (batched q/k/v/o projections
-# + per-stream RoPE kernel loop + the shared ``batched_decode_attention_kv`` fused padded SDPA) — the
-# #18-style loop-kill brought to the Qwen prod path, but UNPAGED (Qwen serving forces ``paged_kv=False``)
-# so it cannot reuse the shared ``PAGED_KV_BATCHED_DEFAULT``. Defaults OFF (rule 4: naive per-stream path
-# until parity-proven); M1 lands it behind this flag, M3 flips it ON after the real-model B-sweep. Gated
-# greedy-exact vs the per-stream loop in ``parity/qwen35_batched_loopkill_test.py``. The GDN (linear-attn)
-# half of the hybrid stays per-stream until M2; ``batch_step`` (tree-spec verify) is untouched.
+# --- #153 hybrid loop-kill default (Qwen3.5-scoped; UNPAGED — not the shared paged flag) -----------
+# When ON, the serving decode step (:func:`batched_decode_step`) replaces the per-stream mixer loop with
+# ONE batched mixer across all B streams, for BOTH halves of the 3:1 hybrid:
+#   * full-attention (GQA) layers — batched q/k/v/o projections + per-stream RoPE kernel loop + the
+#     shared ``batched_decode_attention_kv`` fused padded SDPA (M1);
+#   * linear-attention (Gated DeltaNet) layers — gather the B streams' (conv,recurrent) state, ONE
+#     batched recurrence, scatter+commit back per-stream via :func:`_gdn_step_batched` (M2, the bigger
+#     lever: 45 of 60 layers are GDN).
+# This is the #18-style loop-kill brought to the Qwen prod path, but UNPAGED (Qwen serving forces
+# ``paged_kv=False``) so it cannot reuse the shared ``PAGED_KV_BATCHED_DEFAULT``. Defaults OFF (rule 4:
+# naive per-stream path until parity-proven); M1+M2 land it behind this flag, M3 flips it ON after the
+# real-model B-sweep. Gated vs the per-stream loop in ``parity/qwen35_batched_loopkill_test.py``: GDN is
+# bit-exact at B=1 / fp-tolerance at B>1 (the projection-GEMM batch-M reorder), GQA is greedy-exact (it
+# also reorders the padded SDPA). ``batch_step`` (tree-spec verify) is untouched (per-replica rollback).
 QWEN35_BATCHED_LOOPKILL_DEFAULT = False
 
 
@@ -93,6 +98,58 @@ def _gqa_step_through_cache(blk, kv: KVCache, x_t: mx.array, seq_hint: int) -> m
     return x_t + y
 
 
+def _gdn_step_batched(m: GatedDeltaNet, lcs: Sequence[_GDNLayerState], h_norm: mx.array) -> mx.array:
+    """Batched Gated-DeltaNet decode step across ``B`` streams — the #153 M2 loop-kill for the
+    serving decode path (the linear-attention half of the Qwen3.5 hybrid). Returns the mixer output
+    ``y`` ``[B,1,hidden]`` (the caller adds the residual ``x_stacked + y``).
+
+    ``h_norm`` ``[B,1,hidden]`` are the ``B`` streams' post-input-norm residuals (stacked);
+    ``lcs[s]`` is stream ``s``'s :class:`_GDNLayerState` for THIS layer (mutated in place). Gathers
+    each stream's recurrent ``(conv_state, recurrent_state)`` into a ``[B,...]`` batch (seeding zeros
+    where a stream is fresh — bit-identical to :func:`_gdn_step_through_cache`'s per-stream seed),
+    runs ONE :meth:`GatedDeltaNet.__call__` decode recurrence over all ``B`` (so ``in_proj_qkv`` /
+    ``out_proj`` / the conv weights are read ONCE for all ``B`` — the memory-bandwidth win, mirroring
+    the MoE expert-read amortization), then scatters the new ``(conv_out, rec_out)`` back into each
+    stream's state via :meth:`_GDNLayerState.commit` (advancing its offset + snapshot ring exactly as
+    the per-stream path does).
+
+    Per-row equivalent to the per-stream loop: the depthwise-conv window, the gated-delta recurrence,
+    and both gated RMSNorms have NO cross-row op, and GDN carries no positional term at all (position
+    lives in the recurrent state), so ragged per-stream offsets are irrelevant to its math. The ONLY
+    batch-size sensitivity is the projection GEMM's accumulation order — so row ``s`` is **bit-exact** to
+    the standalone ``B=1`` call when ``B==1`` (the ``b==1`` path feeds identical ``[1,1,hidden]`` shapes,
+    a strict passthrough) and matches at **fp tolerance** for ``B>1`` (the ~1e-7 fp32 ``[B,...]@W``
+    reorder, with NO padded-SDPA softmax reorder — tighter than the GQA half, greedy-token-stable).
+    Gated in ``parity/qwen35_batched_loopkill_test.py`` (§GDN).
+
+    Memory: the committed ``conv_out[s:s+1]`` / ``rec_out[s:s+1]`` are MLX slices that share the batched
+    output buffer (MLX slices are views — confirmed: holding one row retains the whole ``[B,...]``
+    parent). This does NOT blow up the snapshot ring: its depth is bounded (``snapshot_depth``) and
+    continuous-batching streams commit in lockstep, so at any step at most ``snapshot_depth`` recent
+    batched buffers are referenced (== the per-stream path's total snapshot footprint), and a buffer
+    ages out of every active stream's ring within ``snapshot_depth`` steps. An active stream is never
+    paused mid-decode, so rings stay time-aligned and no released stream's rows pin a stale buffer.
+    """
+    b = len(lcs)
+    conv_rows: list[mx.array] = []
+    rec_rows: list[mx.array] = []
+    for lc in lcs:
+        if lc.conv_state is None:
+            # fresh stream: seed zero conv window + zero recurrent state so the O(1) recurrence
+            # engages from absolute offset 0 (identical to _gdn_step_through_cache's per-stream seed).
+            conv_rows.append(mx.zeros((1, m.k - 1, m.conv_dim), dtype=h_norm.dtype))
+            rec_rows.append(mx.zeros((1, m.hv, m.dk, m.dv), dtype=mx.float32))
+        else:
+            conv_rows.append(lc.conv_state)
+            rec_rows.append(lc.recurrent_state)
+    conv = mx.concatenate(conv_rows, axis=0) if b > 1 else conv_rows[0]    # [B,K-1,conv_dim]
+    rec = mx.concatenate(rec_rows, axis=0) if b > 1 else rec_rows[0]       # [B,Hv,Dk,Dv]
+    y, rec_out, conv_out = m(h_norm, state=rec, conv_state=conv)           # ONE batched recurrence
+    for s, lc in enumerate(lcs):
+        lc.commit(conv_out[s:s + 1], rec_out[s:s + 1])                     # per-stream offset + snapshot
+    return y
+
+
 def batched_decode_step(
     layers: Sequence,
     embed_w: mx.array,
@@ -114,12 +171,13 @@ def batched_decode_step(
     feeding the same token through :class:`quanta.qwen35.runtime.Qwen35ResidentModel` at the same
     offset against the same cache.
 
-    ``loopkill`` (#153, M1 — :data:`QWEN35_BATCHED_LOOPKILL_DEFAULT`): when True the full-attention
-    (GQA) layers run ONE batched attention across all ``B`` streams via
-    :meth:`quanta.qwen35.attention.Qwen35Attention.decode_step_batched` (batched projections +
-    per-stream RoPE + shared fused SDPA) instead of the per-stream mixer loop — greedy-token-equivalent
-    to the loop (gated in ``parity/qwen35_batched_loopkill_test.py``). The GDN (linear-attn) layers stay
-    per-stream until M2. Off ⇒ the proven per-stream path (rule 4).
+    ``loopkill`` (#153 — :data:`QWEN35_BATCHED_LOOPKILL_DEFAULT`): when True EVERY layer runs ONE
+    batched mixer across all ``B`` streams instead of the per-stream loop — full-attention (GQA) layers
+    via :meth:`quanta.qwen35.attention.Qwen35Attention.decode_step_batched` (batched projections +
+    per-stream RoPE + shared fused SDPA, M1, greedy-token-equivalent) and linear-attention (Gated
+    DeltaNet) layers via :func:`_gdn_step_batched` (gather state + ONE recurrence + scatter, M2; B=1
+    bit-exact, B>1 fp-tolerance). Gated in ``parity/qwen35_batched_loopkill_test.py``. Off ⇒ the proven
+    per-stream path (rule 4).
 
     Drives both the resident runtime (post-artifact-load) AND the model-free parity test (via the
     tiny :class:`quanta.qwen35.model.Qwen35Model` set up with random weights), without duplicating
@@ -142,24 +200,34 @@ def batched_decode_step(
     h_b = embed_w[ids_b][:, None].astype(mx.bfloat16)                               # [B,1,hidden]
     hs: list[mx.array] = [h_b[i:i + 1] for i in range(b)]                           # B × [1,1,hidden]
 
-    # --- per layer: mixer (per-stream OR batched GQA loop-kill), then ONE batched MoE call --------
+    # --- per layer: mixer (per-stream loop OR batched loop-kill: GQA + GDN), then ONE batched MoE ----
     for layer_i, blk in enumerate(layers):
-        if loopkill and not blk.is_linear:
-            # GQA loop-kill (#153 M1): ONE batched attention across all B streams. Batched input-norm
-            # (RMSNorm is row-wise → per-row identical to the per-stream norm), then the batched GQA
-            # decode (batched q/k/v/o proj + per-stream RoPE + shared fused SDPA), then the batched
-            # residual — greedy-equivalent to the per-stream loop (rule 4 flag).
+        if loopkill:
+            # #153 loop-kill: ONE batched mixer across all B streams (M1 GQA + M2 GDN), reading each
+            # mixer weight ONCE for all B (the bandwidth win, mirroring the MoE expert-read amortization).
+            # Batched input-norm (RMSNorm is row-wise → per-row identical to the per-stream norm), then
+            # the type-specific batched mixer, then the batched residual — equivalent to the per-stream
+            # loop (rule-4 flag; gated in parity/qwen35_batched_loopkill_test.py). GDN is bit-exact at
+            # B=1 / fp-tolerance at B>1 (projection-GEMM batch-M reorder; no cross-row op); GQA is
+            # greedy-exact (it also reorders the padded SDPA).
             x_stacked = mx.concatenate(hs, axis=0) if b > 1 else hs[0]                # [B,1,hidden]
             h_norm = blk.input_layernorm(x_stacked)
-            kv_for_layer = [stream_caches[s][layer_i] for s in range(b)]
-            seq_hints = [stream_caches[s].yarn_seq(offsets[s] + 1, cfg) for s in range(b)]
-            y = blk.mixer.decode_step_batched(h_norm, kv_for_layer=kv_for_layer,
-                                              offsets=list(offsets), seq_hints=seq_hints)  # [B,1,hidden]
+            if blk.is_linear:
+                # M2: batched Gated-DeltaNet recurrence — gather the B streams' (conv,recurrent) state,
+                # ONE recurrence, scatter+commit back per-stream (offset + snapshot ring preserved).
+                lcs = [stream_caches[s][layer_i] for s in range(b)]
+                y = _gdn_step_batched(blk.mixer, lcs, h_norm)                         # [B,1,hidden]
+            else:
+                # M1: batched GQA — batched q/k/v/o proj + per-stream RoPE + shared fused padded SDPA.
+                kv_for_layer = [stream_caches[s][layer_i] for s in range(b)]
+                seq_hints = [stream_caches[s].yarn_seq(offsets[s] + 1, cfg) for s in range(b)]
+                y = blk.mixer.decode_step_batched(h_norm, kv_for_layer=kv_for_layer,
+                                                  offsets=list(offsets), seq_hints=seq_hints)  # [B,1,hidden]
             stacked = x_stacked + y                                                   # [B,1,hidden]
         else:
-            # 1) per-stream mixer step (bounded IO loop over the small batch — rule 3 allows IO loops;
-            # the GDN / GQA work inside each call is fully vectorized over heads/dims). GDN always takes
-            # this path until M2; GQA takes it when the loop-kill flag is off.
+            # 1) per-stream mixer step (proven path; rule-4 default). Bounded IO loop over the small
+            # batch (rule 3 allows IO loops); the GDN / GQA work inside each call is fully vectorized
+            # over heads/dims. Hit only when the loop-kill flag is off (then BOTH mixer types loop).
             after_mixer: list[mx.array] = []
             for s in range(b):
                 lc = stream_caches[s][layer_i]
