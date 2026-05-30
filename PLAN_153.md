@@ -6,7 +6,157 @@
 > paged stepper `_PagedKVArena`, bit-exact model-free); M2 (compressed stepper) next. Multi-model
 > loop-kill (user's order nemotron→internlm2→qwen3.6): Nemotron DONE + default GRADUATED ON
 > (real-model bench +18%@B48); InternLM2.5 DONE + default GRADUATED ON (real-model bench **3.20×@B32**,
-> scoped flag); **Qwen3.6 is the LAST + NEXT ask** (unpaged+hybrid, big multi-milestone).**
+> scoped flag); **Qwen3.6: M1+M2 loop-kill BUILT (flag off); the real-model bench BLOCKED graduation —
+> a bf16-drift bug (dequantized dense-bf16 mixer projections reorder across batch-M). CURRENT ASK =
+> option B (packed-projection runtime via `nn.QuantizedLinear`, batch-M bit-exact) + re-bench/graduate
+> at B=32. See "Qwen3.6 — option B" below.**
+
+---
+
+## Qwen3.6 — option B: packed-projection runtime (CURRENT ASK, B=32)
+
+**Status.** M1 (`ee305dc`) + M2 (`17c14dd`) built the hybrid loop-kill behind
+`QWEN35_BATCHED_LOOPKILL_DEFAULT=False` (batched GQA + batched Gated-DeltaNet mixer steps replacing the
+per-stream loop). The real-model bench `parity/qwen35_batched_bench.py` was meant to graduate it but
+**caught a real bug**: the loop-kill is NOT greedy-exact at B>1 on the 40-layer int4-g64 bake. The user
+chose **option B** (build the packed runtime so batched projections are bit-exact) and **re-pinned the
+operating point to B=32**.
+
+### The finding (bench on `Qwen3.6-35B-A3B-quanta_int4g64`, 40 layers = 30 GDN + 10 GQA)
+
+| B | loop tok/s | loopkill tok/s | ratio | greedy |
+|---|---|---|---|---|
+| 1 | 25.1 | 25.6 | 1.02× | **bit-exact** ✅ |
+| 4 | 57.5 | 62.8 | 1.09× | **DIVERGES** ❌ (stream 1 step 0: loop=2901 vs loopkill=2222) |
+
+- |Δlogit| probe (B=4, step 0): worst **1.30** ≫ LOGIT_TOL 5e-3 ⇒ **real bug, not a near-tie**.
+- per-layer post-mixer |Δ|: 0 at layer 0, then **geometric compounding from layer 1** (1.2e-4 → 7.8e-3 by
+  layer 8), data-dependent across BOTH mixer types — there is no single buggy layer.
+
+### Root cause — the bf16-drift trap (`feedback_batched_rope_bf16`)
+
+`runtime.py:_load_block` **dequantizes** the mixer projections to dense-bf16 `nn.Linear` (lines 76/89).
+The loop-kill batches them (`[B,1,h] @ W.T`), and **a dense-bf16 GEMM reorders its accumulation across
+batch-M** — different M selects a different kernel tiling, and bf16 accumulation is non-associative.
+Micro-test, decisive:
+
+| matmul | batched-vs-per-stream max\|Δ\| |
+|---|---|
+| dense **bf16** | **1.0** |
+| dense fp32 | 4.4e-4 |
+| **`mx.quantized_matmul` int8/int4 g64** | **0.0** (bit-exact) |
+| `mx.gather_mm` per-row matvec (MoE) | **0.0** (bit-exact) |
+
+**Why the MoE is exempt:** `qwen35_moe`/`_routed_sparse` dispatch via `mx.gather_mm` as per-(token,slot)
+**matvecs** (each gathered row is `[out,h]@[h,1]`, M=1) → no batch-M GEMM tiling → batch-invariant. The
+`gdn_step` recurrence (fp32 elementwise + `mx.sum` over fixed axes) and RoPE (correctly per-stream-looped)
+are exempt too. **Only the dense-bf16 projection GEMM drifts.** **Why the cohort didn't hit this:**
+InternLM2.5's prod path is the PACKED `_PackedModel` whose `_qmm = mx.quantized_matmul(transpose=True)`
+keeps projections quantized → batch-M bit-exact → greedy-exact (3.20×@B32). Qwen dequantizes → drifts.
+
+### The fix — packed-projection runtime (`nn.QuantizedLinear`, rule 1)
+
+`mx.quantized_matmul` is batch-M **bit-exact**, so making the mixer projections quantized closes the drift
+**with zero change to the mixer forward code or the loop-kill steppers**. The artifact already exposes
+everything: `art.raw(key)` → `.weight_packed`; `art.get(base+".weight_scale"/".weight_bias")` → siblings;
+`manifest[base]["bits"/"group_size"]` → codec (rule 6 — read it from the manifest, fail loud on
+non-uniform/missing, never a hardcoded width).
+
+**Approach:** add `packed: bool` to `Qwen35ResidentModel` (thread through `Qwen35BatchedResidentModel`).
+When `packed=True`, `_load_block` builds each mixer projection as a bias-free `nn.QuantizedLinear`
+populated from the packed triplets — NOT `mx.dequantize`. `nn.QuantizedLinear.__call__` dispatches to
+`mx.quantized_matmul`, so `self.q_proj(x)` / `self.in_proj_qkv(x)` etc. are UNCHANGED, and BOTH the
+per-stream loop AND the batched loop-kill become batch-M bit-exact. `packed=False` keeps the dequantized
+`nn.Linear` path as the parity reference. MoE / norms / conv / `A_log` / `dt_bias` are untouched.
+
+Projections to convert (all `bias=False`, all `affine_packed` in the artifact):
+- GDN: `in_proj_qkv`, `in_proj_a`, `in_proj_b`, `in_proj_z`, `out_proj`.
+- GQA: `q_proj`, `k_proj`, `v_proj`, `o_proj`.
+
+(Fallback if `nn.QuantizedLinear`'s ctor/layout fights the artifact triplets: mirror InternLM2.5 exactly —
+store the triplets and call a local `_qmm = mx.quantized_matmul(x, packed, scale, bias, transpose=True,
+group_size, bits)`. Identical numerics; rule 1 prefers `nn.QuantizedLinear`.)
+
+**Two coupled graduations (rule 4):** (1) `packed` False→True after the packed-vs-bf16 forward parity gate
+(greedy-exact + teacher-forced ppl) is green; (2) `QWEN35_BATCHED_LOOPKILL_DEFAULT` False→True after the
+B=32 re-bench is greedy-exact + a win. **Loop-kill REQUIRES packed** (only bit-exact when projections are
+quantized) — assert/enforce `loopkill ⇒ packed`.
+
+### Milestones (model-free M0–M3; M4 = deferred solo-GPU bench)
+
+- **M0 — model-free batch-M parity proof.** New gate (or extend `parity/qwen35_batched_loopkill_test.py`):
+  on the tiny config, `mx.quantize` random projection weights (int4 g64), build `nn.QuantizedLinear` from
+  the codes, assert its `[B,1,h]` output is **bit-exact per-row vs B=1** for B∈{1,4,32}, and that the
+  dequantized `nn.Linear` is NOT (documents the bug). Locks the mechanism before touching the runtime.
+- **M1 — packed GDN mixer** (30/40 layers, the bigger lever). Loader builds GDN projections as
+  `nn.QuantizedLinear` under `packed`. Gate: packed GDN batched decode == packed GDN per-stream loop
+  **bit-exact** at B=1 AND B>1 (GDN has no SDPA/softmax reorder — fully bit-exact once projections are
+  quantized); packed vs dequant single-stream greedy-exact.
+- **M2 — packed GQA mixer** (10/40 layers). Same for q/k/v/o. Gate: packed GQA batched == packed per-stream
+  loop **greedy-exact** at B>1 (the padded-SDPA reorder stays argmax-stable ULP), bit-exact at B=1; packed
+  vs dequant single-stream greedy-exact.
+- **M3 — wire packed into the runtimes + parity-gate the packed forward.** Thread `packed` through
+  `Qwen35ResidentModel` → `Qwen35BatchedResidentModel`. Gate: `qwen35_forward_test` packed-vs-bf16 forward
+  greedy-exact (+ teacher-forced ppl on real prose per methodology, if run); full model-free regression
+  (`qwen35_batched_test`, `qwen35_batched_loopkill_test`). Graduate `packed=True` default.
+- **M4 — re-bench at B=32 + graduate loop-kill (DEFERRED, solo GPU).**
+  `uv run python -m parity.qwen35_batched_bench 32` on the real int4-g64 bake with `packed=True`: loop vs
+  loopkill MUST be greedy-exact (now that projections are quantized) AND a win at B=32. If green → flip
+  `QWEN35_BATCHED_LOOPKILL_DEFAULT=True`, set the serving operating point to B=32 (orchestrator pin in
+  `shim/omlx`), update parity default-ON pins. RUN SOLO (OOM-reboot hazard; one model at a time).
+
+### File anchors
+- `src/quanta/qwen35/runtime.py` — `_load_block` (64; lines 76/89 = the dequant assignments to swap),
+  `_LINEAR_PROJS`/`_FULL_PROJS` (51-52), `Qwen35ResidentModel.__init__` (120; add `packed`).
+- `src/quanta/qwen35/artifact.py` — `raw` (124), `get` (63), `manifest` (59); `linear_attn`/`full_attn`
+  (151/161 are `read`=dequant — add packed-triplet accessors or read raw+siblings in the loader).
+- `src/quanta/qwen35/attention.py` — `Qwen35Attention.__init__` (190; the `nn.Linear` projs), `_project`
+  (208), `decode_step_batched` (256; UNCHANGED — calls `self._project`).
+- `src/quanta/qwen35/gated_deltanet.py` — `GatedDeltaNet.__init__` (215; the `nn.Linear` projs), `__call__`
+  (245; UNCHANGED).
+- `src/quanta/qwen35/batched_runtime.py` — `Qwen35BatchedResidentModel.__init__` (284; thread `packed`),
+  `_gdn_step_batched` (101)/`decode_step_batched` callers (UNCHANGED), flag (66).
+- `src/quanta/internlm2/runtime.py` — `_PackedModel` (212), `_qmm` (149), `_load_quant_triplet` (92): the
+  EXACT pattern to mirror.
+
+### Gates
+```bash
+uv run --with numpy python -m parity.qwen35_batched_loopkill_test   # M0–M2 (model-free)
+uv run --with numpy python -m parity.qwen35_batched_test            # regression
+uv run --with numpy python -m parity.qwen35_forward_test            # M3 packed-vs-bf16 forward
+uv run python -m parity.qwen35_batched_bench 32                     # M4 (solo GPU; loop==loopkill + win@B32)
+# before each commit: pytest tests/ -q · ruff check src tests · compileall · uv lock --check · git diff --check
+```
+
+### Kick-off prompt for the next agent
+```
+quanta #153 — Qwen3.6 option B: build the packed-projection runtime so batched-decode mixer projections
+are bit-exact, then graduate the hybrid loop-kill at B=32.
+
+Read first, in order: CLAUDE.md (rules + model facts); MEMORY.md + memory/project_paged_batched_153.md
+(cross-session memory); PLAN_153.md → the "Qwen3.6 — option B" section (full design, milestones M0–M4,
+file anchors, gates); then src/quanta/internlm2/runtime.py (_PackedModel / _qmm — the pattern to mirror).
+
+Context: Qwen #153 M1+M2 built the hybrid loop-kill behind QWEN35_BATCHED_LOOPKILL_DEFAULT (default off).
+The real-model bench (parity/qwen35_batched_bench.py) caught that it is NOT greedy-exact at B>1: the
+dequantized dense-bf16 mixer projections reorder their accumulation across batch-M (|Δlogit|≈1.3, compounds
+over depth). Fix = keep projections quantized via nn.QuantizedLinear (mx.quantized_matmul is batch-M
+bit-exact). The MoE (gather_mm matvecs) and gdn_step (fp32 elementwise) are already batch-invariant — do
+NOT touch them. Loop-kill requires packed; enforce loopkill ⇒ packed.
+
+Do M0 first: the model-free batch-M parity proof (quantize random weights; prove nn.QuantizedLinear is
+bit-exact across B while dequantized nn.Linear is not). Then M1 (packed GDN), M2 (packed GQA), M3 (wire +
+parity-gate the packed forward + graduate the packed default), M4 (solo-GPU re-bench at B=32 + graduate
+the loop-kill). Operating point is B=32.
+
+Cadence (STANDING — do not violate): single linear thread, NO subagents/workflows. Implement → gate green
+→ commit each milestone (named files only, never `git add -A`; trailer
+`Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>`; no push; no hook skip; commits land
+on main) → STOP for the user to compact before the next milestone. RUN ONLY ONE MODEL AT A TIME (M4 only;
+OOM-reboot hazard). Never delete ~/models/Kimi-K2.6. No mlx-lm/torch on the runtime hot path.
+
+Start with M0.
+```
 
 ---
 
@@ -98,10 +248,13 @@ Nemotron's `_fused_attn_layer` inlines the equivalent core). (Started BEFORE DSV
   per-stream `loop` REGRESSES B=32→48 (104→102) while `loopkill` holds flat (~332→322), so the win does
   not fade with B. The bench doubles as the real-model gate for the QUANTIZED int8-g64 k/v
   `write_batched`/`gather_batched` at `head_dim=128` (§C used bf16). Active 9.5 / peak 10.3 GiB @ B=48.
-- **Qwen3.5/3.6** (`qwen35`) — **LAST, big.** UNPAGED (`shim/omlx._make_batched_session` forces it
-  off paged) + hybrid (GDN recurrent + GQA) + NO fused attn yet (loops the whole mixer per stream) +
-  serves at B=4. NOT a paged-primitive wire: needs its OWN unpaged GQA arena (#18-style) + batched GDN
-  state (like Nemotron's `BatchedMambaState`) + fused attn. Multi-milestone, small win.
+- **Qwen3.5/3.6** (`qwen35`) — **M1+M2 loop-kill BUILT (flag off); bench BLOCKED graduation (bf16-drift);
+  CURRENT ASK = option B.** UNPAGED (`shim/omlx` forces `paged_kv=False`) + hybrid (GDN + GQA), so NOT a
+  paged-primitive wire. M1 (`ee305dc`, batched GQA) + M2 (`17c14dd`, batched GDN) landed the loop-kill
+  behind `QWEN35_BATCHED_LOOPKILL_DEFAULT=False`; the real-model bench found it is NOT greedy-exact at B>1
+  (dequantized dense-bf16 projections reorder across batch-M, |Δlogit|≈1.3). Fix = packed-projection
+  runtime (`nn.QuantizedLinear`); operating point re-pinned **B=32**. Full design + milestones M0–M4 in
+  the **"Qwen3.6 — option B"** section above.
 - **DSV4** (single-stream latent, paged) — the core #153 path; M1 done, M2–M3 remain (deferred behind
   the multi-model order the user chose).
 
