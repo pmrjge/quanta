@@ -79,6 +79,20 @@ def _pad_seq(a: mx.array, l_max: int) -> mx.array:
     return mx.pad(a, [(0, 0), (0, pad), (0, 0)])
 
 
+def _sdpa_padded(q: mx.array, k: mx.array, v: mx.array, lengths: list[int], *,
+                 scale: float, n_rep: int) -> mx.array:
+    """Shared SDPA tail for both batched-decode entries: GQA-repeat ``k``/``v`` to ``q``'s head count,
+    build the per-stream pad mask (columns ``>= lengths[b]`` → ~zero softmax weight), ONE fused SDPA.
+    ``q`` ``[B, H, 1, D]``; ``k``/``v`` ``[B, n_kv, L_max, D]`` (already padded to ``L_max``). Single-sourcing
+    this guarantees the list and pre-padded callers are numerically identical (same op on same tensors)."""
+    l_max = int(k.shape[2])
+    if n_rep > 1:                                          # GQA: kv head -> its query group
+        k = mx.repeat(k, n_rep, axis=1)                    # [B, H, L_max, D]
+        v = mx.repeat(v, n_rep, axis=1)
+    mask = decode_pad_mask(lengths, l_max, q.dtype)        # [B, 1, 1, L_max]
+    return mx.fast.scaled_dot_product_attention(q, k, v, scale=scale, mask=mask)
+
+
 def batched_decode_attention(
     q_list: list[mx.array],
     k_list: list[mx.array],
@@ -127,9 +141,43 @@ def batched_decode_attention(
     q = mx.stack(q_list, axis=0)                           # [B, H, 1, D]
     k = mx.stack([_pad_seq(kk, l_max) for kk in k_list], axis=0)   # [B, n_kv, L_max, D]
     v = mx.stack([_pad_seq(vv, l_max) for vv in v_list], axis=0)
-    if n_rep > 1:                                          # GQA: kv head -> its query group
-        k = mx.repeat(k, n_rep, axis=1)                    # [B, H, L_max, D]
-        v = mx.repeat(v, n_rep, axis=1)
+    return _sdpa_padded(q, k, v, lengths, scale=scale, n_rep=n_rep)  # GQA repeat + pad mask + ONE SDPA
 
-    mask = decode_pad_mask(lengths, l_max, q.dtype)        # [B, 1, 1, L_max]
-    return mx.fast.scaled_dot_product_attention(q, k, v, scale=scale, mask=mask)
+
+def batched_decode_attention_padded(
+    q: mx.array,
+    k: mx.array,
+    v: mx.array,
+    lengths: list[int],
+    *,
+    scale: float,
+    n_rep: int = 1,
+) -> mx.array:
+    """Loop-kill sibling of :func:`batched_decode_attention` for callers that ALREADY hold the ``B``
+    streams' keys/values as ONE padded ``[B, n_kv, L_max, D]`` tensor — e.g. a paged
+    ``gather_batched`` (the #153-class KV loop-kill): skip the per-stream list / pad / stack and go
+    straight to the mask + fused SDPA.
+
+    Args:
+      q: ``[B, H, 1, D]`` — the B streams' single decode queries (RoPE already applied).
+      k, v: ``[B, n_kv, L_max, D]`` — keys/values padded to ``L_max`` (RoPE already applied to keys).
+        Columns ``j >= lengths[b]`` are masked to ~zero softmax weight, so their content (stale gather
+        tail OR zero) is irrelevant — exactly as the per-stream path's zero pad is.
+      lengths[b]: stream ``b``'s valid key count (``<= L_max``).
+      scale, n_rep: as :func:`batched_decode_attention`.
+
+    BIT-identical to :func:`batched_decode_attention` fed the same streams (both end in the shared
+    :func:`_sdpa_padded` — same ``L_max``, GQA repeat, pad mask and SDPA), and equal per row to a
+    single-stream SDPA over ``lengths[b]`` keys up to the padded-SDPA reduction-order ULPs
+    ([[feedback-batched-rope-bf16]])."""
+    b = int(q.shape[0])
+    if len(lengths) != b or int(k.shape[0]) != b or int(v.shape[0]) != b:
+        raise ValueError(
+            f"batched_decode_attention_padded: B mismatch q={b} k={int(k.shape[0])} "
+            f"v={int(v.shape[0])} lengths={len(lengths)}")     # rule 6
+    if tuple(k.shape) != tuple(v.shape):
+        raise ValueError(
+            f"batched_decode_attention_padded: k {tuple(k.shape)} != v {tuple(v.shape)}")
+    n_kv, l_max, d = int(k.shape[1]), int(k.shape[2]), int(k.shape[3])
+    _guard_padded_kv(b, n_kv, l_max, d, _itemsize(k))
+    return _sdpa_padded(q, k, v, lengths, scale=scale, n_rep=n_rep)

@@ -20,6 +20,12 @@ B. **native == fused** — ``batched_decode_step_native`` (form-2: persistent ``
    state *storage* differs) + a ``BatchedMambaState.scatter_to`` round-trip back to per-stream slots.
 C. **dispatch** — ``NemotronBatchedResidentModel.step_batch`` (fused default, via ``from_inner``) vs the
    retained ``batched_decode_step`` reference (one step, ragged offsets).
+D. **paged KV loop-kill** (#153-class) — ``_fused_attn_layer`` with ``PagedKVCacheView`` caches +
+   ``paged_batched=True`` (ONE ``write_batched`` + ONE ``gather_batched`` over the shared manager, the
+   paged sibling of the #18 arena) == ``paged_batched=False`` (the per-stream paged ``.update()`` loop),
+   **bit-exact** (``max|Δ|=0``) across ragged streams + steps with block-boundary crossings — both end in
+   the same padded SDPA, only the KV store write/read differs (M0 proved batched scatter/gather ==
+   per-stream). OFF by default behind ``NemotronBatchedResidentModel._paged_kv_batched`` (rule 4).
 
 Arbiter: **greedy-token agreement** (the decode that ships); logits match to bf16 ULPs (padded-SDPA
 tiling reorder) — argmax-stable, the [[feedback-batched-rope-bf16]] equivalence class.
@@ -32,13 +38,16 @@ from __future__ import annotations
 import mlx.core as mx
 
 from parity.nemotron_batched_test import _randomize, _tiny_cfg
+from quanta.cache_quant import BITS
 from quanta.nemotron.batched_runtime import (
     NemotronBatchedResidentModel,
+    _fused_attn_layer,
     batched_decode_step,
     batched_decode_step_fused,
     make_stream_state,
 )
 from quanta.nemotron.model import NemotronModel
+from quanta.paged import PagedKVCacheManager
 
 STEPS = 6
 LOGIT_TOL = 5e-3  # bf16 padded-SDPA tiling reorder; the hard gate is greedy-token agreement
@@ -183,6 +192,59 @@ def _core_native(b: int, lengths: list[int]) -> tuple[float, bool]:
     return worst, match
 
 
+def _core_paged_loopkill(b: int, pre_len: list[int], steps: int) -> float:
+    """D (#153-class paged KV loop-kill): ``_fused_attn_layer`` with paged ``PagedKVCacheView`` caches +
+    ``paged_batched=True`` (ONE ``write_batched`` + ONE ``gather_batched``) == ``paged_batched=False`` (the
+    per-stream paged ``.update()`` loop), **BIT-exact** across ``B`` ragged streams + ``steps`` decode
+    steps. Two managers seeded identically with a raw k/v prefix isolate the KV materialization — same
+    attention block, same q/k/v projection + RoPE, same padded SDPA; only the store write/read path
+    differs. Block size 4 with ragged prefill makes decode cross block boundaries (interleaved block
+    ids). Returns the worst ``|Δ|`` over the attention block's output hidden."""
+    mx.random.seed(0)
+    cfg = _tiny_cfg()
+    model = NemotronModel(cfg)
+    _randomize(model)
+    attn_global = next(i for i, k in enumerate(cfg.layers_block_type) if k == "attention")
+    blk = model.layers[attn_global]
+    att = blk.mixer
+    n_kv, hd = att.nkv, att.hd
+
+    # bf16 KV: the loop-kill wiring (write_batched/gather_batched vs per-stream) is codec-agnostic, and
+    # the QUANTIZED k/v batched==per-stream round-trip is already gated in parity/dsv4_paged_batched_test
+    # (M0 _run_kv_pair). bf16 keeps this gate head_dim-agnostic (the tiny cfg's head_dim need not be a
+    # multiple of a quant group_size). The reference path uses the SAME bf16 manager, so it's apples-to-
+    # apples — only the store write/read path differs.
+    def _mk() -> PagedKVCacheManager:
+        return PagedKVCacheManager(num_layers=1, block_size=4, max_blocks=256, group_size=128,
+                                   bits=BITS, quantized=False, model_name="nemo153", single_stream=False)
+
+    ref_mgr, bat_mgr = _mk(), _mk()
+    ref_seqs, bat_seqs = [], []
+    for s in range(b):                                # identical raw k/v prefix written to BOTH managers
+        k_pre = mx.random.normal((1, n_kv, pre_len[s], hd)).astype(mx.bfloat16)
+        v_pre = mx.random.normal((1, n_kv, pre_len[s], hd)).astype(mx.bfloat16)
+        for mgr, seqs in ((ref_mgr, ref_seqs), (bat_mgr, bat_seqs)):
+            seq = mgr.new_sequence()
+            mgr.advance(seq, list(range(pre_len[s])))
+            mgr.write(seq, 0, k_pre, v_pre)
+            seqs.append(seq)
+    ref_views = [ref_mgr.view(ref_seqs[s], 0) for s in range(b)]    # per-stream paged loop reference
+    bat_views = [bat_mgr.view(bat_seqs[s], 0) for s in range(b)]    # batched loop-kill
+
+    worst = 0.0
+    for t in range(steps):
+        for s in range(b):                            # open the decode position on BOTH managers
+            ref_mgr.advance(ref_seqs[s], [1000 + t])
+            bat_mgr.advance(bat_seqs[s], [1000 + t])
+        h = mx.random.normal((b, 1, cfg.hidden_size)).astype(mx.bfloat16)
+        offs = [pre_len[s] + t for s in range(b)]
+        ref = _fused_attn_layer(blk, h, offs, ref_views, paged_batched=False)   # per-stream .update() loop
+        bat = _fused_attn_layer(blk, h, offs, bat_views, paged_batched=True)    # ONE scatter + ONE gather
+        mx.eval(ref, bat)
+        worst = max(worst, float(mx.max(mx.abs(ref - bat)).item()))
+    return worst
+
+
 def run() -> None:
     print("A. batched_decode_step_fused == batched_decode_step (looped), ragged offsets:")
     w1, m1 = _core(1, [11])
@@ -208,8 +270,18 @@ def run() -> None:
 
     print("C. runtime dispatch: step_batch(fused default) == batched_decode_step:")
     _dispatch()
+
+    print("D. paged KV loop-kill (#153): _fused_attn_layer paged_batched=True (ONE write_batched + ONE "
+          "gather_batched) == per-stream paged .update() loop:")
+    for tag, (b, lens) in (("B=1", (1, [6])), ("ragged B=3", (3, [9, 4, 11]))):
+        w = _core_paged_loopkill(b, lens, steps=STEPS)
+        ok = w == 0.0
+        print(f"  [{'OK' if ok else 'XX'}] {tag:>10} blk=4 steps={STEPS}: max|Δ|={w:.2e} "
+              f"(paged-batched == per-stream paged loop, bit-exact)")
+        assert ok, f"paged loop-kill {tag} != per-stream paged loop: max|Δ|={w:.2e}"
+
     print("PASS — Nemotron batched Mamba (form-1 concat / form-2 persistent) + fused attention are "
-          "per-stream-equivalent (Mamba bit-exact, attention greedy-exact)")
+          "per-stream-equivalent (Mamba bit-exact, attention greedy-exact); paged KV loop-kill bit-exact")
 
 
 if __name__ == "__main__":

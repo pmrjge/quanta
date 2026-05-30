@@ -51,6 +51,7 @@ from quanta.nemotron.attention import KVCache
 from quanta.nemotron.config import NemotronHConfig
 from quanta.nemotron.model import NemotronBlock
 from quanta.nemotron.runtime import NemotronResidentModel
+from quanta.paged import PagedKVCacheView
 
 
 def make_stream_state(cfg: NemotronHConfig) -> tuple[list, list, list]:
@@ -196,17 +197,28 @@ def _read_attn_offsets(layers: list[NemotronBlock], caches_per_stream: list[list
     return []
 
 
-def _fused_attn_layer(blk: NemotronBlock, h: mx.array, offsets: list[int], kv_for_layer: list
-                      ) -> mx.array:
+def _fused_attn_layer(blk: NemotronBlock, h: mx.array, offsets: list[int], kv_for_layer: list,
+                      *, paged_batched: bool = False) -> mx.array:
     """One GQA attention layer **fused across the B streams** (Approach-1), shared by the per-step
     (form-1) and persistent-state (form-2) decode paths so the attention numerics are single-sourced:
     batched q/k/v projections + per-stream RoPE at each stream's own offset (constant ``theta``) + the
-    bounded per-stream KV-cache update (IO, not compute) + ONE padded+masked SDPA across all streams.
+    KV-cache update + ONE padded+masked SDPA across all streams.
 
-    ``h``: ``[B, 1, hidden]`` block input; ``kv_for_layer[s]``: stream ``s``'s ``KVCache`` for THIS
-    layer. Returns the post-residual ``[B, 1, hidden]`` (``x + o_proj(attn(norm(x)))``)."""
+    ``h``: ``[B, 1, hidden]`` block input; ``kv_for_layer[s]``: stream ``s``'s ``KVCache`` (unpaged) or
+    :class:`~quanta.paged.PagedKVCacheView` (paged) for THIS layer. Returns the post-residual
+    ``[B, 1, hidden]`` (``x + o_proj(attn(norm(x)))``).
+
+    ``paged_batched`` (#153-class KV loop-kill): when the caches are paged views, replace the B-stream
+    per-stream ``.update()`` loop with ONE batched block-table scatter (``write_batched``) + ONE gather
+    (``gather_batched``) over the shared manager — the paged sibling of the #18 arena. Bit-identical to
+    the loop (M0 proved batched scatter/gather == per-stream; the SDPA is the same padded call via the
+    shared :func:`~quanta.modeling.batched_attention._sdpa_padded`). A discrete ``KVCache`` or the flag
+    off keeps the proven per-stream loop (rule 4)."""
     from quanta.internlm2.attention import batched_rope_fast  # generic per-stream mx.fast.rope (model-free)
-    from quanta.modeling.batched_attention import batched_decode_attention
+    from quanta.modeling.batched_attention import (
+        batched_decode_attention,
+        batched_decode_attention_padded,
+    )
 
     att = blk.mixer
     b = int(h.shape[0])
@@ -217,13 +229,22 @@ def _fused_attn_layer(blk: NemotronBlock, h: mx.array, offsets: list[int], kv_fo
     bases = [att.theta] * b                                        # constant base (no dynamic NTK)
     q = batched_rope_fast(q, offsets, bases)
     k = batched_rope_fast(k, offsets, bases)
-    qs, ks, vs = [], [], []
-    for s in range(b):                                             # bounded per-stream KV update (IO)
-        kf, vf = kv_for_layer[s].update(k[s:s + 1], v[s:s + 1])    # [1, nkv, L_s, hd]
-        qs.append(q[s])                                            # [nh, 1, hd]
-        ks.append(kf)
-        vs.append(vf)
-    out = batched_decode_attention(qs, ks, vs, scale=att.scale, n_rep=att.rep)      # [B,nh,1,hd]
+    if paged_batched and b and isinstance(kv_for_layer[0], PagedKVCacheView):
+        mgr = kv_for_layer[0]._m                                   # shared manager (same for all streams)
+        layer = kv_for_layer[0]._layer                            # this attention layer's manager index
+        seqs = [view._seq for view in kv_for_layer]               # each stream's SeqHandle
+        mgr.write_batched(seqs, layer, k, v)                       # ONE scatter write (kills the loop)
+        kf, vf = mgr.gather_batched(seqs, layer)                   # ONE gather -> [B, nkv, L_max, hd]
+        lengths = [s.n_written[layer] for s in seqs]               # per-stream valid key counts
+        out = batched_decode_attention_padded(q, kf, vf, lengths, scale=att.scale, n_rep=att.rep)
+    else:
+        qs, ks, vs = [], [], []
+        for s in range(b):                                         # bounded per-stream KV update (IO)
+            kf, vf = kv_for_layer[s].update(k[s:s + 1], v[s:s + 1])  # [1, nkv, L_s, hd]
+            qs.append(q[s])                                        # [nh, 1, hd]
+            ks.append(kf)
+            vs.append(vf)
+        out = batched_decode_attention(qs, ks, vs, scale=att.scale, n_rep=att.rep)   # [B,nh,1,hd]
     out = mx.transpose(out, (0, 2, 1, 3)).reshape(b, 1, att.nh * att.hd)
     return h + att.o_proj(out)                                     # block residual: x + mixer(norm(x))
 
@@ -247,6 +268,8 @@ def batched_decode_step_fused(
     norm_eps: float,
     stream_token_ids: list[mx.array],
     stream_caches: list[tuple[list, list, list]],
+    *,
+    paged_batched: bool = False,
 ) -> list[mx.array]:
     """One batched decode step with the GQA attention **fused across streams** (Approach-1).
 
@@ -293,7 +316,8 @@ def batched_decode_step_fused(
                 stream_caches[s][1][i] = ssm_cat[s:s + 1]
                 stream_caches[s][2][i] = conv_cat[s:s + 1]
         elif blk.kind == "attention":                                  # FUSED across streams
-            h = _fused_attn_layer(blk, h, offsets, [stream_caches[s][0][i] for s in range(b)])
+            h = _fused_attn_layer(blk, h, offsets, [stream_caches[s][0][i] for s in range(b)],
+                                  paged_batched=paged_batched)
         else:                                                          # moe: stacked single call (batched)
             h, _, _ = blk(h, cache=None, ssm_state=None, conv_state=None, use_fast=True)
 
@@ -359,6 +383,8 @@ def batched_decode_step_native(
     norm_eps: float,
     stream_token_ids: list[mx.array],
     state: BatchedMambaState,
+    *,
+    paged_batched: bool = False,
 ) -> list[mx.array]:
     """One batched decode step on a **persistent** :class:`BatchedMambaState` (form-2): the Mamba
     recurrence reads/writes the already-batched ``[B,...]`` ssm/conv **in place** (no per-step concat —
@@ -388,7 +414,8 @@ def batched_decode_step_native(
             h, state.ssm[i], state.conv[i] = blk(h, cache=None, ssm_state=state.ssm[i],
                                                  conv_state=state.conv[i], use_fast=True)
         elif blk.kind == "attention":
-            h = _fused_attn_layer(blk, h, offsets, [state.kv[s][i] for s in range(b)])
+            h = _fused_attn_layer(blk, h, offsets, [state.kv[s][i] for s in range(b)],
+                                  paged_batched=paged_batched)
         else:                                                          # moe: stacked single call
             h, _, _ = blk(h, cache=None, ssm_state=None, conv_state=None, use_fast=True)
 
@@ -429,6 +456,13 @@ class NemotronBatchedResidentModel:
         self._attn_globals = [i for i, k in enumerate(kinds) if k == "attention"]
         self._attn_map = {g: idx for idx, g in enumerate(self._attn_globals)}
         self._fused = True  # default to the fused batched-attention decode path (Approach-1); see step_batch
+        # #153-class loop-kill for the PAGED attention KV: when serving paged views, replace the
+        # per-stream .update() loop in _fused_attn_layer with ONE write_batched + ONE gather_batched.
+        # OFF by default (rule 4 — the proven per-stream loop stays default until parity-green end to
+        # end). Read per-build from the module flag so an M3-style source flip / per-session set engages
+        # it. (Nemotron's lever is the batched Mamba state; this trims the few attention layers' KV loop.)
+        from quanta.paged import PAGED_KV_BATCHED_DEFAULT
+        self._paged_kv_batched = bool(PAGED_KV_BATCHED_DEFAULT)
 
     @classmethod
     def from_inner(cls, inner: Any, *, max_batch: int = 32) -> "NemotronBatchedResidentModel":
@@ -444,6 +478,8 @@ class NemotronBatchedResidentModel:
         self._attn_globals = [i for i, k in enumerate(kinds) if k == "attention"]
         self._attn_map = {g: idx for idx, g in enumerate(self._attn_globals)}
         self._fused = True
+        from quanta.paged import PAGED_KV_BATCHED_DEFAULT       # #153-class paged KV loop-kill (see __init__)
+        self._paged_kv_batched = bool(PAGED_KV_BATCHED_DEFAULT)
         return self
 
     # --- shared-weight surface (mirrors NemotronResidentModel) -----------------
@@ -633,7 +669,11 @@ class NemotronBatchedResidentModel:
         if b > self.max_batch:
             raise ValueError(f"B={b} exceeds max_batch={self.max_batch}")
         single = bool(b) and all(int(t.shape[0]) == 1 for t in stream_token_ids)
-        step = batched_decode_step_fused if (self._fused and single) else batched_decode_step
+        fused = self._fused and single
+        step = batched_decode_step_fused if fused else batched_decode_step
+        # paged_batched only applies to the fused stepper (the per-stream batched_decode_step has no
+        # _fused_attn_layer to loop-kill); pass it only there.
+        extra = {"paged_batched": self._paged_kv_batched} if fused else {}
         return step(
             layers=self.layers,
             embed_w=self.embed_w,
@@ -642,6 +682,7 @@ class NemotronBatchedResidentModel:
             norm_eps=self.cfg.norm_eps,
             stream_token_ids=stream_token_ids,
             stream_caches=stream_caches,
+            **extra,
         )
 
     # --- form-2 persistent batched-state path (fully-vectorized Mamba) ----------
@@ -679,6 +720,7 @@ class NemotronBatchedResidentModel:
         return batched_decode_step_native(
             layers=self.layers, embed_w=self.embed_w, norm_f=self.norm_f, lm_head_w=self.lm_head_w,
             norm_eps=self.cfg.norm_eps, stream_token_ids=stream_token_ids, state=state,
+            paged_batched=self._paged_kv_batched,
         )
 
     # --- shared-offset batched step for tree-spec batched verify ----------------
