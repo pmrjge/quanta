@@ -21,10 +21,14 @@ without loading a model:
   4. **no best-B without a batched runtime** — every prefix in ``BEST_BATCH`` is one that
      ``_make_batched_session`` actually dispatches to a batched session (so we never advertise a knee
      for a model that cannot batch).
+  5. **hard batch cap** — Nemotron's knee is a CEILING, not just a default: ``_resolve_capacity`` clamps
+     an explicit ``batch_size > 32`` DOWN to 32 (decode regresses past it — warned, rule 6), while
+     DSV4 / Qwen3.5 HONOR an explicit over-knee B (``_hard_batch_cap`` is None — Qwen3.5's low-B is a
+     latency pin, never a cap). Nemotron's default + under-knee batch are unaffected.
 
-An explicit ``batch_size`` bypasses all of this (it is the ``kwargs.pop("batch_size", default)``
-default arg — only evaluated when the key is absent), so benches/tests still pin B; that path is
-already exercised by every ``*_batched_*`` test that passes ``batch_size``.
+An explicit ``batch_size`` otherwise bypasses the default (benches/tests still pin B) — EXCEPT it is
+clamped down to a model's hard ceiling where one exists (Nemotron's 32, item 5). Resolution now lives in
+``_resolve_capacity``; the explicit-B path is exercised here and by every ``*_batched_*`` test.
 
     uv run python -m parity.omlx_best_batch_test
 """
@@ -33,6 +37,7 @@ from __future__ import annotations
 
 import json
 import tempfile
+import warnings
 from pathlib import Path
 
 from quanta.shim.omlx import (
@@ -107,6 +112,34 @@ def _run_engine_default_capacity() -> bool:
     return ok
 
 
+def _run_hard_batch_cap() -> bool:
+    """Nemotron's knee is a HARD ceiling: ``_resolve_capacity`` clamps an explicit ``batch_size`` DOWN to
+    32 (decode regresses past it). Other batched models' BEST_BATCH is a soft default — an explicit
+    over-the-knee batch_size is HONORED (DSV4 64, Qwen3.5 32), only prompt-clamped. ``_hard_batch_cap``
+    is None for them; Nemotron's default + under-knee batch are unaffected."""
+    eng_nemo = QuantaOmlxEngine(_fake_artifact("nemotron_h", nested=False))
+    eng_dsv4 = QuantaOmlxEngine(_fake_artifact("deepseek_v4", nested=False))
+    eng_qwen = QuantaOmlxEngine(_fake_artifact("qwen3_5_moe_text", nested=True))
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")             # the nemotron 48→32 clamp warns by design (rule 6)
+        checks = {
+            "nemotron _hard_batch_cap==32": eng_nemo._hard_batch_cap() == 32,
+            "nemotron explicit 48 → 32 (HARD cap)": eng_nemo._resolve_capacity(100, 48) == 32,
+            "nemotron explicit 16 → 16 (under knee, honored)": eng_nemo._resolve_capacity(100, 16) == 16,
+            "nemotron default(None) → 32": eng_nemo._resolve_capacity(100, None) == 32,
+            "nemotron cap clamps to prompts (48→32→4)": eng_nemo._resolve_capacity(4, 48) == 4,
+            "dsv4 _hard_batch_cap is None": eng_dsv4._hard_batch_cap() is None,
+            "dsv4 explicit 64 → 64 (NOT capped)": eng_dsv4._resolve_capacity(100, 64) == 64,
+            "qwen3_5 _hard_batch_cap is None (latency pin)": eng_qwen._hard_batch_cap() is None,
+            "qwen3_5 explicit 32 → 32 (NOT capped)": eng_qwen._resolve_capacity(100, 32) == 32,
+        }
+    ok = all(checks.values())
+    bad = [k for k, v in checks.items() if not v]
+    print(f"  [{'OK' if ok else 'FAIL'}] hard batch cap: " +
+          ("nemotron clamps >32→32; dsv4/qwen3_5 honor explicit B" if ok else f"WRONG: {bad}"))
+    return ok
+
+
 def _run_no_orphan_knee() -> bool:
     """Every BEST_BATCH prefix is a model ``_make_batched_session`` dispatches to a batched session —
     we never declare a knee for a model that cannot batch. (DSV4/Nemotron/InternLM2.5/Qwen3.5 are the
@@ -124,6 +157,7 @@ def run() -> None:
     ok &= _run_resolver()
     ok &= _run_knee_values()
     ok &= _run_engine_default_capacity()
+    ok &= _run_hard_batch_cap()
     ok &= _run_no_orphan_knee()
     print("PASS" if ok else "FAIL")
     assert ok

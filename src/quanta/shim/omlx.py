@@ -41,6 +41,7 @@ that mirror the same kwargs surface:
 from __future__ import annotations
 
 import json
+import warnings
 from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -1300,10 +1301,7 @@ class QuantaOmlxEngine(_OmlxBaseEngine):
         if per_request and len(per_request) != len(prompts):
             raise OmlxShimError(
                 f"per_request length {len(per_request)} != len(prompts) {len(prompts)}")
-        capacity = int(kwargs.pop("batch_size", self._default_capacity(len(prompts))))
-        if capacity < 1:
-            raise OmlxShimError(f"batched_stream_generate: batch_size must be >= 1 (got {capacity})")
-        capacity = min(capacity, len(prompts))
+        capacity = self._resolve_capacity(len(prompts), kwargs.pop("batch_size", None))
         session = self._make_batched_session(capacity=capacity)
         capacity = session.capacity  # the session may clamp to its own static batch_size
         # per-stream config (sampler / eos / stop / max_new / seed / detok)
@@ -1510,6 +1508,39 @@ class QuantaOmlxEngine(_OmlxBaseEngine):
         throughput knee (:data:`BEST_BATCH`) if known, else :data:`DEFAULT_BATCH_CAPACITY` — never more
         than the prompts on hand. An explicit ``batch_size`` bypasses this (benches/tests pin B)."""
         return min(n_prompts, _best_batch_for(self.model_type) or DEFAULT_BATCH_CAPACITY)
+
+    def _hard_batch_cap(self) -> int | None:
+        """The HARD batch ceiling for this model class, or ``None``. A model whose :data:`BEST_BATCH`
+        entry is a *measured throughput knee that decode regresses past* (not a soft latency default) is
+        clamped DOWN to it even when the caller passes an explicit ``batch_size`` — serving can never be
+        pushed past the operating point. Currently **Nemotron** (decode REGRESSES past B=32 — worker #20;
+        the #153 loop-kill flattens the curve but B=48 is still ≈ no gain at +16 GiB KV —
+        ``parity/nemotron_paged_batched_bench.py``). DSV4/InternLM2 knees are also ceilings but left
+        uncapped until asked; Qwen3.5's low-B is a latency pin ("pin an explicit batch_size to sweep"),
+        NEVER a cap (rule 6: only clamp where the knee is a true ceiling, never a soft default)."""
+        mt = self.model_type or ""
+        return _best_batch_for(mt) if mt.startswith("nemotron") else None
+
+    def _resolve_capacity(self, n_prompts: int, requested: int | None) -> int:
+        """Final concurrent-decode-slot count for a ``batched_stream_generate`` call. ``requested`` is the
+        caller's explicit ``batch_size`` (``None`` ⇒ this model's measured default via
+        :meth:`_default_capacity`). An explicit batch_size over this model's HARD ceiling
+        (:meth:`_hard_batch_cap`) is clamped DOWN to it — warned, never silent (rule 6: the caller asked
+        for more slots than will help). Always clamped to the prompts on hand; ``< 1`` fails loud."""
+        if requested is None:
+            cap = self._default_capacity(n_prompts)
+        else:
+            cap = int(requested)
+            hard = self._hard_batch_cap()
+            if hard is not None and cap > hard:
+                warnings.warn(
+                    f"{self.model_type} batch_size={cap} exceeds its measured throughput knee {hard}; "
+                    f"clamping to {hard} (decode does not scale past it — pin a smaller batch_size to "
+                    f"silence this).", stacklevel=3)
+                cap = hard
+        if cap < 1:
+            raise OmlxShimError(f"batched_stream_generate: batch_size must be >= 1 (got {cap})")
+        return min(cap, n_prompts)
 
     def _make_batched_session(self, *, capacity: int) -> _BatchedSession:
         """Build the engine's batched decode session for this artifact's model class (``model_type``).
