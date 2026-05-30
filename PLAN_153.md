@@ -38,22 +38,29 @@ manager methods (the `rows` lease-indices collapse to "this batch's seqs").
   private (rule 6). In steady serving decode the tail is always private (COW only fires at
   prefill), so the scatter never touches a shared block.
 
-### Multi-model scope (the standing ask: "same optimization for nemotron, qwen, small model")
-The M0 primitive lives on the shared `PagedKVCacheManager`, so it serves **every paged
-keeper at the storage layer in one shot**:
-- **Nemotron** (k/v, paged) — applies; but its throughput lever is the Mamba recurrent
-  state (`BatchedMambaState`, already batched), not the few attention layers' KV loop, so
-  expect a *small* win. Wire for consistency.
-- **DSV4** (single-stream latent, paged) — the active path; M1–M3 here.
-- **InternLM2.5** (k/v, paged — the assumed "small model") — applies fully; M5-style win.
-- **Qwen3.5/3.6** — **UNPAGED** (`shim/omlx._make_batched_session` forces it off the paged
-  path; `paged/__init__.py` docstring). The M0 primitive does NOT touch it. "Same
-  optimization for Qwen" is a **separate task**: first establish whether its discrete
-  batched decode even has a per-stream KV loop to kill (vs an already-rectangular batched
-  KV cache); if it does, it needs a #18-arena-style fix in *its* runtime, not the paged one.
-
-Remaining per-model wiring after #153 (DSV4) lands: a small follow-on per model that points
-its batched decode at `write_*_batched`/`gather_*_batched` (k/v keepers) and gates it.
+### Multi-model scope (user directive: apply the loop-kill to **nemotron → internlm2 → qwen3.6, IN
+THAT ORDER**; one milestone per commit, STOP to compact between)
+The M0 primitive lives on the shared `PagedKVCacheManager`, so it serves **every paged keeper at the
+storage layer in one shot**. Per-model the loop to kill is the per-stream KV `.update()` inside each
+runtime's FUSED batched attention. **Shared k/v entry: `quanta.modeling.batched_attention` now has
+`_sdpa_padded` (factored SDPA tail) + `batched_decode_attention_padded`** — consumes a pre-padded
+`[B,n_kv,L_max,D]` (a paged `gather_batched`), the k/v sibling of DSV4's `_PagedKVArena`. (Started
+BEFORE DSV4 M2/M3 — the user chose the multi-model order.)
+- **Nemotron** (k/v, paged) — **✅ DONE `833c8a4`.** `_fused_attn_layer` already fuses attn; killed
+  its per-stream `KVCache.update()` loop → ONE `write_batched` + ONE `gather_batched` +
+  `batched_decode_attention_padded` when caches are `PagedKVCacheView`s + `paged_batched` on (flag
+  `NemotronBatchedResidentModel._paged_kv_batched` ← `PAGED_KV_BATCHED_DEFAULT`, OFF, threaded through
+  `batched_decode_step_fused`/`_native`). Gate `nemotron_batched_attention_test.py` §D BIT-exact. Win
+  MARGINAL (Mamba `BatchedMambaState` is the lever) but consistent.
+- **InternLM2.5** (k/v, paged — "small model") — **NEXT.** Pure dense GQA; fused attn EXISTS
+  (`decode_batched` on the inner runtime). Find its per-stream KV `.update()` loop, reuse
+  `batched_decode_attention_padded` (same wire as Nemotron). REAL win (B=32, KV-bound decode).
+- **Qwen3.5/3.6** (`qwen35`) — **LAST, big.** UNPAGED (`shim/omlx._make_batched_session` forces it
+  off paged) + hybrid (GDN recurrent + GQA) + NO fused attn yet (loops the whole mixer per stream) +
+  serves at B=4. NOT a paged-primitive wire: needs its OWN unpaged GQA arena (#18-style) + batched GDN
+  state (like Nemotron's `BatchedMambaState`) + fused attn. Multi-milestone, small win.
+- **DSV4** (single-stream latent, paged) — the core #153 path; M1 done, M2–M3 remain (deferred behind
+  the multi-model order the user chose).
 
 ---
 
