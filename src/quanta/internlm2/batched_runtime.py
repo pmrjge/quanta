@@ -71,11 +71,13 @@ class InternLM2BatchedResidentModel:
         self._inner = InternLM2ResidentModel(art_dir, n_layers=n_layers)
         self._fused = True  # default to the batched-attention decode path (Approach-1); see step_batch
         # #153 paged KV loop-kill: when serving paged views, decode_batched swaps the per-stream KV
-        # .update() loop for ONE write_batched + ONE gather_batched. Reads the SHARED flag (default OFF,
-        # rule 4); InternLM2.5 graduates on its own real-model bench like Nemotron did (which carved out a
-        # scoped flag once proven). Until then the proven per-stream paged loop stays the default.
-        from quanta.paged import PAGED_KV_BATCHED_DEFAULT
-        self._paged_kv_batched = bool(PAGED_KV_BATCHED_DEFAULT)
+        # .update() loop for ONE write_batched + ONE gather_batched. GRADUATED to ON via an
+        # InternLM2.5-scoped flag — parity/internlm2_paged_batched_bench.py is greedy-exact vs the
+        # per-stream paged loop on the real int8-g64 bake AND measures 3.20x decode tok/s at B=32 (every
+        # one of the 32 DENSE layers' KV loop is killed, vs Nemotron's 8). Scoped (NOT the shared
+        # PAGED_KV_BATCHED_DEFAULT) so DSV4 stays OFF until its own M3 (rule 4: still one flag to revert).
+        from quanta.paged import INTERNLM2_PAGED_KV_BATCHED_DEFAULT
+        self._paged_kv_batched = bool(INTERNLM2_PAGED_KV_BATCHED_DEFAULT)
 
     @classmethod
     def from_inner(cls, inner: Any, *, max_batch: int = 32) -> "InternLM2BatchedResidentModel":
@@ -88,8 +90,8 @@ class InternLM2BatchedResidentModel:
         self.max_batch = int(max_batch)
         self._inner = inner
         self._fused = True
-        from quanta.paged import PAGED_KV_BATCHED_DEFAULT   # #153 paged KV loop-kill (see __init__)
-        self._paged_kv_batched = bool(PAGED_KV_BATCHED_DEFAULT)
+        from quanta.paged import INTERNLM2_PAGED_KV_BATCHED_DEFAULT   # #153 loop-kill, scoped (see __init__)
+        self._paged_kv_batched = bool(INTERNLM2_PAGED_KV_BATCHED_DEFAULT)
         return self
 
     # --- shared-weight surface -------------------------------------------------

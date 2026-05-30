@@ -28,12 +28,13 @@ PAGED_KV_DEFAULT = True
 
 # #153: batched-paged KV decode — ONE block-table scatter + ONE gather across all B lock-step streams
 # (the paged sibling of the #18 arena loop-kill), serving the paged keepers (Nemotron, DSV4,
-# InternLM2.5). Default OFF until the steppers are wired + parity-green (rule 4). The storage primitives
-# (``PagedKVCacheManager.write_*_batched`` / ``gather_*_batched``) already exist and are gated
-# model-free in ``parity/dsv4_paged_batched_test.py`` (M0); the runtime/session reads this flag to pick
-# the batched scatter/gather over the per-stream loop once dispatched (#153 M3 flips it for DSV4 +
-# InternLM2.5). Nemotron has GRADUATED to its own ON default below — keep this shared flag OFF so
-# flipping Nemotron does not preempt the DSV4 M3 regression.
+# InternLM2.5). This SHARED flag now governs DSV4 ONLY and stays OFF until the DSV4 steppers are wired +
+# parity-green (rule 4): #153 M3 flips it for DSV4. The storage primitives
+# (``PagedKVCacheManager.write_*_batched`` / ``gather_*_batched``) already exist and are gated model-free
+# in ``parity/dsv4_paged_batched_test.py`` (M0); a runtime/session reads its own flag to pick the batched
+# scatter/gather over the per-stream loop once dispatched. Nemotron AND InternLM2.5 have GRADUATED to
+# their own ON defaults below — keep this shared flag OFF so flipping them does not preempt the DSV4 M3
+# regression.
 PAGED_KV_BATCHED_DEFAULT = False
 
 # Nemotron-scoped #153 default: GRADUATED to ON. The loop-kill is parity-proven model-free (bit-exact,
@@ -42,14 +43,27 @@ PAGED_KV_BATCHED_DEFAULT = False
 # the prod operating point; ``parity/nemotron_paged_batched_bench.py``). The per-stream loop stops scaling
 # past B=32 (122 tok/s @48 < 126 @32) while the loop-kill holds, so the win grows with B (rule 4 satisfied:
 # parity proven + a real win ⇒ default ON, still a single flag to revert). Scoped to Nemotron because its
-# attention KV is only the 8 ``*`` layers (the Mamba recurrent state is already batched); DSV4/InternLM2.5
-# read the shared ``PAGED_KV_BATCHED_DEFAULT`` and stay OFF until their own milestones graduate.
+# attention KV is only the 8 ``*`` layers (the Mamba recurrent state is already batched); DSV4 reads the
+# shared ``PAGED_KV_BATCHED_DEFAULT`` and stays OFF until its own milestones graduate (InternLM2.5 has its
+# own scoped ON default below).
 NEMOTRON_PAGED_KV_BATCHED_DEFAULT = True
+
+# InternLM2.5-scoped #153 default: GRADUATED to ON. The loop-kill is parity-proven model-free (bit-exact,
+# ``parity/internlm2_batched_attention_test.py`` §C) AND on the real int8-g64 7B-Chat-1M bake —
+# greedy-exact vs the per-stream paged loop at B∈{1,32,48} with a measured **3.20x decode tok/s at B=32**
+# (the prod operating point; 3.16x @ B=48; ``parity/internlm2_paged_batched_bench.py``). The win is far
+# bigger than Nemotron's because InternLM2.5 is DENSE — ALL 32 layers are attention, so EVERY layer's
+# per-stream KV ``.update()`` loop is killed (Nemotron trims only its 8 ``*`` attention layers). The
+# per-stream loop stops scaling past B=32 (102 tok/s @48 < 104 @32) while the loop-kill holds flat at
+# ~322–332 tok/s, so the win does not fade with B (rule 4 satisfied). Scoped like Nemotron's so DSV4 (the
+# shared flag) is untouched until its own M3.
+INTERNLM2_PAGED_KV_BATCHED_DEFAULT = True
 
 __all__ = [
     "PAGED_KV_DEFAULT",
     "PAGED_KV_BATCHED_DEFAULT",
     "NEMOTRON_PAGED_KV_BATCHED_DEFAULT",
+    "INTERNLM2_PAGED_KV_BATCHED_DEFAULT",
     "BlockAllocator",
     "CacheBlock",
     "compute_block_hash",

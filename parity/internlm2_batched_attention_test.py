@@ -14,8 +14,9 @@ C. **paged KV loop-kill** (#153) — the full ``decode_batched`` with paged ``Pa
    :func:`~quanta.modeling.batched_attention.batched_decode_attention_kv`) == ``paged_batched=False`` (the
    per-stream paged ``.update()`` loop), **BIT-exact** (``max|Δ|=0``) across ragged streams + steps with
    block-boundary crossings — only the KV store write/read differs (M0 proved batched scatter/gather ==
-   per-stream). Default OFF behind ``InternLM2BatchedResidentModel._paged_kv_batched`` (rule 4 — graduates
-   on its own real-model bench, like Nemotron); ``run()`` pins the default-OFF.
+   per-stream). GRADUATED to default ON behind ``InternLM2BatchedResidentModel._paged_kv_batched`` (an
+   InternLM2.5-scoped flag) after the real-model bench (``parity/internlm2_paged_batched_bench.py``: 3.20x
+   decode tok/s @ B=32, greedy-exact); ``run()`` pins the default-ON.
 
 The arbiter is **greedy-token agreement** (the decode that actually ships): every stream must emit the
 identical next-token sequence as the loop. Logits match to fp ULPs (batched explicit RoPE + padded-SDPA
@@ -267,14 +268,16 @@ def run() -> None:
               f"(paged-batched == per-stream paged loop, bit-exact)")
         assert ok, f"paged loop-kill {tag} != per-stream paged loop: max|Δ|={w:.2e}"
 
-    # rule 4: the loop-kill stays OFF by default until InternLM2.5's own real-model bench graduates it
-    # (Nemotron's bench graduated its scoped flag; InternLM2.5 reads the shared PAGED_KV_BATCHED_DEFAULT).
+    # GRADUATED to ON (rule 4 satisfied): parity/internlm2_paged_batched_bench.py is greedy-exact vs the
+    # per-stream paged loop on the real int8-g64 bake AND measures 3.20x decode tok/s at B=32 (EVERY one of
+    # the 32 dense layers' KV loop killed). Default-ON via the InternLM2.5-scoped flag — DSV4 still reads
+    # the shared PAGED_KV_BATCHED_DEFAULT (OFF) until its own M3.
     mx.random.seed(0)
     _bat = InternLM2BatchedResidentModel.from_inner(_FakeInner(_bf16_model(_tiny_cfg()), _tiny_cfg()),
                                                     max_batch=2)
-    assert _bat._paged_kv_batched is False, ("InternLM2.5 paged KV loop-kill must default OFF (rule 4) "
-                                             "until its own real-model bench graduates it")
-    print("  [OK] default-built runtime keeps the per-stream paged loop (_paged_kv_batched=False, rule 4)")
+    assert _bat._paged_kv_batched is True, ("InternLM2.5 paged KV loop-kill has GRADUATED to default ON "
+                                            "(scoped flag) after its real-model bench")
+    print("  [OK] default-built runtime uses the #153 paged loop-kill (_paged_kv_batched=True, graduated)")
 
     print("PASS — InternLM2.5 batched-decode attention is per-stream-equivalent (greedy-exact); "
           "paged KV loop-kill bit-exact")

@@ -461,8 +461,9 @@ class NemotronBatchedResidentModel:
         # GRADUATED to ON (rule 4: parity-proven model-free §D bit-exact + real-model greedy-exact, and a
         # measured +18% decode tok/s @ B=48 — parity/nemotron_paged_batched_bench.py). Nemotron-scoped flag
         # (its attention KV is only the 8 ``*`` layers; the Mamba state is already batched) so it does not
-        # preempt DSV4/InternLM2.5, which read the shared PAGED_KV_BATCHED_DEFAULT (still OFF). Read per
-        # build so a source revert / per-session set still toggles it.
+        # preempt DSV4, which reads the shared PAGED_KV_BATCHED_DEFAULT (still OFF) until its own M3
+        # (InternLM2.5 has likewise graduated to its own scoped ON flag). Read per build so a source revert /
+        # per-session set still toggles it.
         from quanta.paged import NEMOTRON_PAGED_KV_BATCHED_DEFAULT
         self._paged_kv_batched = bool(NEMOTRON_PAGED_KV_BATCHED_DEFAULT)
 
