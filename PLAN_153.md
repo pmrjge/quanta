@@ -46,12 +46,27 @@ runtime's FUSED batched attention. **Shared k/v entry: `quanta.modeling.batched_
 `_sdpa_padded` (factored SDPA tail) + `batched_decode_attention_padded`** — consumes a pre-padded
 `[B,n_kv,L_max,D]` (a paged `gather_batched`), the k/v sibling of DSV4's `_PagedKVArena`. (Started
 BEFORE DSV4 M2/M3 — the user chose the multi-model order.)
-- **Nemotron** (k/v, paged) — **✅ DONE `833c8a4`.** `_fused_attn_layer` already fuses attn; killed
-  its per-stream `KVCache.update()` loop → ONE `write_batched` + ONE `gather_batched` +
-  `batched_decode_attention_padded` when caches are `PagedKVCacheView`s + `paged_batched` on (flag
-  `NemotronBatchedResidentModel._paged_kv_batched` ← `PAGED_KV_BATCHED_DEFAULT`, OFF, threaded through
-  `batched_decode_step_fused`/`_native`). Gate `nemotron_batched_attention_test.py` §D BIT-exact. Win
-  MARGINAL (Mamba `BatchedMambaState` is the lever) but consistent.
+- **Nemotron** (k/v, paged) — **✅ DONE `833c8a4`, default GRADUATED ON (this commit).**
+  `_fused_attn_layer` already fuses attn; killed its per-stream `KVCache.update()` loop → ONE
+  `write_batched` + ONE `gather_batched` + `batched_decode_attention_padded` when caches are
+  `PagedKVCacheView`s + `paged_batched` on, threaded through `batched_decode_step_fused`/`_native`.
+  Gate `nemotron_batched_attention_test.py` §D BIT-exact (model-free). **Graduated to ON** via a
+  **Nemotron-scoped** flag `NEMOTRON_PAGED_KV_BATCHED_DEFAULT=True` (the shared `PAGED_KV_BATCHED_DEFAULT`
+  stays OFF so DSV4/InternLM2.5 are untouched + DSV4 M3 not preempted) after the real-model bench
+  `parity/nemotron_paged_batched_bench.py` (int4-g64 120B-A12B, prod paged + form-2 session, distinct
+  prompts) proved greedy-exact + a real win:
+
+  | B | loop tok/s | loopkill tok/s | loopkill/loop | greedy |
+  |---|---|---|---|---|
+  | 1 | 27.8 | 27.5 | 0.99× | bit-exact |
+  | 32 | 126.3 | 145.8 | **1.15×** | greedy-exact |
+  | 48 | 122.3 | 144.5 | **1.18×** | greedy-exact |
+
+  Better than the prior "marginal" expectation: the per-stream `loop` REGRESSES B=32→48 (126→122 —
+  Python-loop overhead doesn't scale) while `loopkill` holds (146→144), so the win GROWS with B. The
+  bench doubles as the real-model correctness gate for the quantized k/v `write_batched`/`gather_batched`
+  at `head_dim=128` (the §D gate used bf16 to stay head_dim-agnostic). `run()` §D + the bench pin the
+  default-ON.
 - **InternLM2.5** (k/v, paged — "small model") — **NEXT.** Pure dense GQA; fused attn EXISTS
   (`decode_batched` on the inner runtime). Find its per-stream KV `.update()` loop, reuse
   `batched_decode_attention_padded` (same wire as Nemotron). REAL win (B=32, KV-bound decode).

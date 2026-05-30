@@ -458,11 +458,13 @@ class NemotronBatchedResidentModel:
         self._fused = True  # default to the fused batched-attention decode path (Approach-1); see step_batch
         # #153-class loop-kill for the PAGED attention KV: when serving paged views, replace the
         # per-stream .update() loop in _fused_attn_layer with ONE write_batched + ONE gather_batched.
-        # OFF by default (rule 4 — the proven per-stream loop stays default until parity-green end to
-        # end). Read per-build from the module flag so an M3-style source flip / per-session set engages
-        # it. (Nemotron's lever is the batched Mamba state; this trims the few attention layers' KV loop.)
-        from quanta.paged import PAGED_KV_BATCHED_DEFAULT
-        self._paged_kv_batched = bool(PAGED_KV_BATCHED_DEFAULT)
+        # GRADUATED to ON (rule 4: parity-proven model-free §D bit-exact + real-model greedy-exact, and a
+        # measured +18% decode tok/s @ B=48 — parity/nemotron_paged_batched_bench.py). Nemotron-scoped flag
+        # (its attention KV is only the 8 ``*`` layers; the Mamba state is already batched) so it does not
+        # preempt DSV4/InternLM2.5, which read the shared PAGED_KV_BATCHED_DEFAULT (still OFF). Read per
+        # build so a source revert / per-session set still toggles it.
+        from quanta.paged import NEMOTRON_PAGED_KV_BATCHED_DEFAULT
+        self._paged_kv_batched = bool(NEMOTRON_PAGED_KV_BATCHED_DEFAULT)
 
     @classmethod
     def from_inner(cls, inner: Any, *, max_batch: int = 32) -> "NemotronBatchedResidentModel":
@@ -478,8 +480,8 @@ class NemotronBatchedResidentModel:
         self._attn_globals = [i for i, k in enumerate(kinds) if k == "attention"]
         self._attn_map = {g: idx for idx, g in enumerate(self._attn_globals)}
         self._fused = True
-        from quanta.paged import PAGED_KV_BATCHED_DEFAULT       # #153-class paged KV loop-kill (see __init__)
-        self._paged_kv_batched = bool(PAGED_KV_BATCHED_DEFAULT)
+        from quanta.paged import NEMOTRON_PAGED_KV_BATCHED_DEFAULT  # graduated ON, Nemotron-scoped (see __init__)
+        self._paged_kv_batched = bool(NEMOTRON_PAGED_KV_BATCHED_DEFAULT)
         return self
 
     # --- shared-weight surface (mirrors NemotronResidentModel) -----------------

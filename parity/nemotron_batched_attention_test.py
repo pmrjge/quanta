@@ -25,7 +25,9 @@ D. **paged KV loop-kill** (#153-class) — ``_fused_attn_layer`` with ``PagedKVC
    paged sibling of the #18 arena) == ``paged_batched=False`` (the per-stream paged ``.update()`` loop),
    **bit-exact** (``max|Δ|=0``) across ragged streams + steps with block-boundary crossings — both end in
    the same padded SDPA, only the KV store write/read differs (M0 proved batched scatter/gather ==
-   per-stream). OFF by default behind ``NemotronBatchedResidentModel._paged_kv_batched`` (rule 4).
+   per-stream). GRADUATED to ON behind ``NemotronBatchedResidentModel._paged_kv_batched`` (←
+   ``NEMOTRON_PAGED_KV_BATCHED_DEFAULT``) — parity-proven here + real-model greedy-exact & +18% @ B=48
+   (``parity/nemotron_paged_batched_bench.py``); ``run()`` pins the default-ON (rule 4: a single revert flag).
 
 Arbiter: **greedy-token agreement** (the decode that ships); logits match to bf16 ULPs (padded-SDPA
 tiling reorder) — argmax-stable, the [[feedback-batched-rope-bf16]] equivalence class.
@@ -279,6 +281,17 @@ def run() -> None:
         print(f"  [{'OK' if ok else 'XX'}] {tag:>10} blk=4 steps={STEPS}: max|Δ|={w:.2e} "
               f"(paged-batched == per-stream paged loop, bit-exact)")
         assert ok, f"paged loop-kill {tag} != per-stream paged loop: max|Δ|={w:.2e}"
+
+    # The loop-kill has GRADUATED to ON for Nemotron (real-model greedy-exact + +18% @ B=48,
+    # parity/nemotron_paged_batched_bench.py): a default-built runtime must engage it (rule 4 — proven,
+    # behind a single revert flag). Pin it so a flag revert that forgets this gate fails loud.
+    mx.random.seed(0)
+    _m = NemotronModel(_tiny_cfg())
+    _randomize(_m)
+    _rt = NemotronBatchedResidentModel.from_inner(_FakeInner(_m), max_batch=2)
+    assert _rt._paged_kv_batched is True, ("NEMOTRON_PAGED_KV_BATCHED_DEFAULT must default the paged KV "
+                                           "loop-kill ON (graduated #153) — got _paged_kv_batched=False")
+    print("  [OK] default-built runtime engages the paged KV loop-kill (_paged_kv_batched=True, graduated)")
 
     print("PASS — Nemotron batched Mamba (form-1 concat / form-2 persistent) + fused attention are "
           "per-stream-equivalent (Mamba bit-exact, attention greedy-exact); paged KV loop-kill bit-exact")
