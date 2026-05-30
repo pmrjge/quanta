@@ -279,6 +279,23 @@ throughput at B=32** (108.5 vs 79.0 tok/s) with identical fused attention. Memor
 184/191 GiB active/peak, under the 220 GiB wired limit. To extend to B=48/64 later:
 `uv run --with tokenizers python -u -m parity.dsv4_batched_bench 48,64` (solo GPU).
 
+**B=48 within-noise validation** (`parity/dsv4_b48_noise.py`, the #18 follow-on). The strict
+greedy-exact bench trips ONE token at B=48 — `batched` flips vs `looped` at step 22
+(`looped=97 batched=106`) while **arena matches `looped` exactly** — because the pad+mask batched
+SDPA reduces the fp32 softmax in a different ORDER than the per-stream loop (the documented B≥2
+greedy-exact caveat; fp add is non-associative, so a token whose top-2 gap sits below that few-ULP
+delta can flip). That flip is a tie, not an error — greedy-exactness is the wrong arbiter. The
+follow-on gate drives the same prose **teacher-forced** through B=48 streams and compares
+per-position distributions (arena vs the per-stream-loop reference): **top-1 agreement 98.83%
+(27/2304 flips); every flip a rank-2/3 tie at ≤ 2.07:1 sampling odds (≤3:1 ⇒
+sampling-indistinguishable); teacher-forced ppl Δ +4.7e-4; mean KL(ref‖arena) 1.75e-3; 0 flips on
+the low-entropy repeat probe** (flips concentrate where the model is uncertain). So B=48 arena is
+**e2e-equivalent to the per-stream loop within fp noise** — a strictly stronger claim than
+greedy-exactness, and the real bar behind the B=48 default. Throughput at B=48 (same solo run):
+looped 8.3 / batched 93.1 / **arena 134.1 tok/s** ⇒ `arena/bat` **1.44×**, `arena/loop` **16.17×**,
+183/192 GiB active/peak. The bench verdict was corrected (rule 6) to fail ONLY on an arena
+divergence — a `batched`-only high-B tie is expected, not an arena bug.
+
 ---
 
 ## Gate commands

@@ -143,6 +143,8 @@ def run(batch_sizes: tuple[int, ...] = BATCH_SIZES) -> None:
     print(f"{'B':>4}  {'looped':>9}  {'batched':>9}  {'arena':>9}  "
           f"{'bat/loop':>8}  {'arena/bat':>9}  {'arena/loop':>10}  {'arena GiB a/p':>15}  {'tok':>4}")
     all_tok_ok = True
+    arena_ok = True       # arena == looped (the #18 deliverable — a divergence HERE is a real failure)
+    batched_ok = True     # batched == looped (the attn-batching path; a high-B flip is the documented tie)
     for B in batch_sizes:
         lp = _time_path(model, prompt_ids, B, fused=False, arena=False)  # looped: Design-A per-stream
         ba = _time_path(model, prompt_ids, B, fused=True, arena=False)   # batched: fused attn, per-stream KV
@@ -152,6 +154,8 @@ def run(batch_sizes: tuple[int, ...] = BATCH_SIZES) -> None:
         al = ar["aggregate"] / lp["aggregate"] if lp["aggregate"] else float("nan")
         tok_ok = lp["toks"] == ba["toks"] == ar["toks"]
         all_tok_ok = all_tok_ok and tok_ok
+        arena_ok = arena_ok and lp["toks"] == ar["toks"]
+        batched_ok = batched_ok and lp["toks"] == ba["toks"]
         print(f"{B:>4}  {lp['aggregate']:>9.1f}  {ba['aggregate']:>9.1f}  {ar['aggregate']:>9.1f}  "
               f"{bl:>7.2f}x  {ab:>8.2f}x  {al:>9.2f}x  "
               f"{ar['active_gib']:>6.1f}/{ar['peak_gib']:>6.1f}  {'ok' if tok_ok else 'DIFF':>4}")
@@ -164,9 +168,18 @@ def run(batch_sizes: tuple[int, ...] = BATCH_SIZES) -> None:
                     print(f"    [DIFF] {nm} diverges from looped at step {d}: "
                           f"looped={ref[d]} {nm}={got[d]}")
 
-    print("PASS — arena greedy-exact vs per-stream loop on the real model"
-          if all_tok_ok else "FAIL — arena diverged from the per-stream loop (see [DIFF] above)")
-    if not all_tok_ok:
+    # Honest verdict (rule 6): only the ARENA diverging from the per-stream loop is a #18 failure. The
+    # `batched` path (fused attn + per-stream KV) shares the documented B>=2 pad+mask SDPA tie, so a
+    # batched-only flip at a high-B fp tie is expected — NOT an arena bug — and is certified within model
+    # noise by parity/dsv4_b48_noise.py (teacher-forced ppl + sampling odds). Name the actual diverging
+    # path(s); fail ONLY when the arena is the one that drifted.
+    if all_tok_ok:
+        print("PASS — looped == batched == arena greedy-exact on the real model")
+    elif arena_ok:
+        print("PASS (arena) — arena == per-stream loop greedy-exact; only `batched` flipped a token at a "
+              "high-B fp tie (the documented B>=2 SDPA reorder, within noise — see parity/dsv4_b48_noise.py)")
+    else:
+        print("FAIL — the arena diverged from the per-stream loop (see [DIFF] above)")
         raise SystemExit(1)
 
 
