@@ -265,16 +265,20 @@ class _PackedModel:
         head = self.embed if self.cfg.tie_word_embeddings else self.lm_head
         return x @ head.T
 
-    def decode_batched(self, stream_tokens: list, caches: list, offsets: list[int]) -> mx.array:
+    def decode_batched(self, stream_tokens: list, caches: list, offsets: list[int], *,
+                       paged_batched: bool = False) -> mx.array:
         """One batched decode step across ``B`` streams over packed weights (Approach-1 attention).
 
         The packed analogue of :meth:`InternLM2Model.decode_batched`: ``stream_tokens[b]`` is stream
         ``b``'s new token, ``caches[b]`` its per-layer cache list, ``offsets[b]`` the abs position. All
         ``_qmm`` projections / FFN / output head batch over ``B``; the only per-stream work is the
-        bounded KV-cache update feeding one fused :func:`batched_decode_attention`. Returns
-        ``[B, 1, vocab]`` — the batched equivalent of looping :meth:`__call__` per stream.
+        bounded KV-cache update feeding one fused SDPA via
+        :func:`~quanta.modeling.batched_attention.batched_decode_attention_kv`. Returns ``[B, 1, vocab]``
+        — the batched equivalent of looping :meth:`__call__` per stream. ``paged_batched`` (#153
+        loop-kill): with paged views, that helper swaps the per-stream ``.update()`` loop for ONE
+        ``write_batched`` + ONE ``gather_batched`` (bit-exact; rule-4 flag).
         """
-        from quanta.modeling.batched_attention import batched_decode_attention
+        from quanta.modeling.batched_attention import batched_decode_attention_kv
 
         from quanta.internlm2.attention import batched_rope_fast
         from quanta.internlm2.model import _stack_decode_tokens
@@ -295,13 +299,9 @@ class _PackedModel:
             v = mx.transpose(v.reshape(b, 1, cfg.num_key_value_heads, cfg.head_dim), (0, 2, 1, 3))
             q = batched_rope_fast(q, offsets, bases)
             k = batched_rope_fast(k, offsets, bases)
-            qs, ks, vs = [], [], []
-            for s in range(b):                                          # bounded stream loop (cache I/O)
-                kf, vf = clists[s][i].update(k[s:s + 1], v[s:s + 1])     # [1, nkv, L_s, D]
-                qs.append(q[s])
-                ks.append(kf)
-                vs.append(vf)
-            out = batched_decode_attention(qs, ks, vs, scale=cfg.attn_scale, n_rep=cfg.n_rep)
+            out = batched_decode_attention_kv(q, k, v, [clists[s][i] for s in range(b)],
+                                              scale=cfg.attn_scale, n_rep=cfg.n_rep,
+                                              paged_batched=paged_batched)
             out = mx.transpose(out, (0, 2, 1, 3)).reshape(b, 1, cfg.q_dim)
             x = x + _qmm(out, layer.o_packed, layer.o_scale, layer.o_wbias, layer.attn_bits, layer.attn_gs)
             n = _rmsnorm(x, layer.ffn_norm, cfg.norm_eps)
@@ -416,7 +416,8 @@ class InternLM2ResidentModel:
         return self._model(token_ids, caches=cache_list, use_fast=True,
                             abs_pos_start=abs_pos_start, last_only=last_only)
 
-    def decode_batched(self, stream_tokens: list, caches: list, offsets: list[int]) -> mx.array:
+    def decode_batched(self, stream_tokens: list, caches: list, offsets: list[int], *,
+                       paged_batched: bool = False) -> mx.array:
         """Batched single-step decode across ``B`` streams → ``[B, 1, vocab]`` (Approach-1 attention).
 
         Delegates to the active inner forward's ``decode_batched`` (``_PackedModel`` in prod, the bf16
@@ -424,5 +425,6 @@ class InternLM2ResidentModel:
         stream ``b``'s new token, ``caches[b]`` its per-layer cache list (or an
         :class:`~quanta.internlm2.decode.InternLM2Cache`), ``offsets[b]`` the abs position. The batched
         equivalent of calling :meth:`__call__` once per stream — the win is one fused SDPA + one batched
-        matmul per layer instead of ``B`` looped ones."""
-        return self._model.decode_batched(stream_tokens, caches, offsets)
+        matmul per layer instead of ``B`` looped ones. ``paged_batched`` (#153 loop-kill) is threaded to
+        the inner ``decode_batched`` (ONE ``write_batched`` + ONE ``gather_batched`` when caches are paged)."""
+        return self._model.decode_batched(stream_tokens, caches, offsets, paged_batched=paged_batched)

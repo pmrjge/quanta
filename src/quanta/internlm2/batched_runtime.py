@@ -70,6 +70,12 @@ class InternLM2BatchedResidentModel:
         self.max_batch = int(max_batch)
         self._inner = InternLM2ResidentModel(art_dir, n_layers=n_layers)
         self._fused = True  # default to the batched-attention decode path (Approach-1); see step_batch
+        # #153 paged KV loop-kill: when serving paged views, decode_batched swaps the per-stream KV
+        # .update() loop for ONE write_batched + ONE gather_batched. Reads the SHARED flag (default OFF,
+        # rule 4); InternLM2.5 graduates on its own real-model bench like Nemotron did (which carved out a
+        # scoped flag once proven). Until then the proven per-stream paged loop stays the default.
+        from quanta.paged import PAGED_KV_BATCHED_DEFAULT
+        self._paged_kv_batched = bool(PAGED_KV_BATCHED_DEFAULT)
 
     @classmethod
     def from_inner(cls, inner: Any, *, max_batch: int = 32) -> "InternLM2BatchedResidentModel":
@@ -82,6 +88,8 @@ class InternLM2BatchedResidentModel:
         self.max_batch = int(max_batch)
         self._inner = inner
         self._fused = True
+        from quanta.paged import PAGED_KV_BATCHED_DEFAULT   # #153 paged KV loop-kill (see __init__)
+        self._paged_kv_batched = bool(PAGED_KV_BATCHED_DEFAULT)
         return self
 
     # --- shared-weight surface -------------------------------------------------
@@ -139,7 +147,8 @@ class InternLM2BatchedResidentModel:
 
         single = all(int(t.reshape(-1).shape[0]) == 1 for t in stream_token_ids)
         if self._fused and single and hasattr(self._inner, "decode_batched"):
-            logits = self._inner.decode_batched(stream_token_ids, stream_caches, offsets)  # [B,1,vocab]
+            logits = self._inner.decode_batched(stream_token_ids, stream_caches, offsets,
+                                                paged_batched=self._paged_kv_batched)  # [B,1,vocab]
             return [logits[s:s + 1] for s in range(b)]
         return self._step_batch_looped(stream_token_ids, stream_caches, offsets)
 

@@ -9,6 +9,13 @@ RoPE) and decoded for several steps:
 A. **core** — ``decode_batched`` vs looping single-stream ``__call__`` per stream, bf16 + int8-g32 KV.
 B. **runtime dispatch** — ``InternLM2BatchedResidentModel.step_batch`` (fused default) vs the retained
    ``_step_batch_looped`` reference, through the real batched runtime.
+C. **paged KV loop-kill** (#153) — the full ``decode_batched`` with paged ``PagedKVCacheView`` caches +
+   ``paged_batched=True`` (per layer: ONE ``write_batched`` + ONE ``gather_batched`` via the shared
+   :func:`~quanta.modeling.batched_attention.batched_decode_attention_kv`) == ``paged_batched=False`` (the
+   per-stream paged ``.update()`` loop), **BIT-exact** (``max|Δ|=0``) across ragged streams + steps with
+   block-boundary crossings — only the KV store write/read differs (M0 proved batched scatter/gather ==
+   per-stream). Default OFF behind ``InternLM2BatchedResidentModel._paged_kv_batched`` (rule 4 — graduates
+   on its own real-model bench, like Nemotron); ``run()`` pins the default-OFF.
 
 The arbiter is **greedy-token agreement** (the decode that actually ships): every stream must emit the
 identical next-token sequence as the loop. Logits match to fp ULPs (batched explicit RoPE + padded-SDPA
@@ -23,11 +30,13 @@ from typing import Any
 
 import mlx.core as mx
 
+from quanta.cache_quant import BITS
 from quanta.internlm2.attention import KVCache
 from quanta.internlm2.batched_runtime import InternLM2BatchedResidentModel
 from quanta.internlm2.config import InternLM2Config
 from quanta.internlm2.decode import InternLM2Cache
 from quanta.internlm2.model import InternLM2Model
+from quanta.paged import PagedKVCacheManager
 
 STEPS = 6
 LOGIT_TOL = 5e-3  # bf16: RoPE + padded-SDPA tiling reorder; the hard gate is greedy-token agreement
@@ -148,8 +157,9 @@ class _FakeInner:
         ids = token_ids if token_ids.ndim == 2 else token_ids[None]
         return self._m(ids, caches=clist, use_fast=True, abs_pos_start=pos, last_only=last_only)
 
-    def decode_batched(self, stream_tokens: list, caches: list, offsets: list[int]) -> mx.array:
-        return self._m.decode_batched(stream_tokens, caches, offsets)
+    def decode_batched(self, stream_tokens: list, caches: list, offsets: list[int], *,
+                       paged_batched: bool = False) -> mx.array:
+        return self._m.decode_batched(stream_tokens, caches, offsets, paged_batched=paged_batched)
 
 
 def _dispatch() -> None:
@@ -192,13 +202,82 @@ def _dispatch() -> None:
     assert worst < LOGIT_TOL, f"runtime fused != looped: |Δlogit|={worst:.2e}"
 
 
+def _core_paged_loopkill(b: int, pre_len: list[int], steps: int) -> float:
+    """C (#153 loop-kill): the FULL ``decode_batched`` with paged ``PagedKVCacheView`` caches +
+    ``paged_batched=True`` (per layer: ONE ``write_batched`` + ONE ``gather_batched``) == ``paged_batched=False``
+    (the per-stream paged ``.update()`` loop), **BIT-exact** over ``B`` ragged streams + ``steps`` steps.
+    Two managers seeded identically with a raw per-layer k/v prefix isolate the KV store path — same model,
+    same tokens, same projections/RoPE/SDPA; only the write/read differs. bf16 KV keeps it head_dim-agnostic
+    (the quantized round-trip is gated in ``parity/dsv4_paged_batched_test`` M0); block size 4 with ragged
+    prefill makes decode cross block boundaries. Returns the worst ``|Δ|`` over the ``[B,1,vocab]`` logits."""
+    mx.random.seed(0)
+    cfg = _tiny_cfg()
+    model = _bf16_model(cfg)
+    n_kv, hd, n_layers = cfg.num_key_value_heads, cfg.head_dim, cfg.num_hidden_layers
+
+    def _mk() -> PagedKVCacheManager:
+        return PagedKVCacheManager(num_layers=n_layers, block_size=4, max_blocks=256, group_size=128,
+                                   bits=BITS, quantized=False, model_name="ilm2-153")
+
+    ref_mgr, bat_mgr = _mk(), _mk()
+    ref_seqs, bat_seqs = [], []
+    for s in range(b):                                   # identical raw per-layer k/v prefix into BOTH
+        rseq, bseq = ref_mgr.new_sequence(), bat_mgr.new_sequence()
+        ref_mgr.advance(rseq, list(range(pre_len[s])))
+        bat_mgr.advance(bseq, list(range(pre_len[s])))
+        for i in range(n_layers):
+            k_pre = mx.random.normal((1, n_kv, pre_len[s], hd)).astype(mx.bfloat16)
+            v_pre = mx.random.normal((1, n_kv, pre_len[s], hd)).astype(mx.bfloat16)
+            ref_mgr.write(rseq, i, k_pre, v_pre)
+            bat_mgr.write(bseq, i, k_pre, v_pre)
+        ref_seqs.append(rseq)
+        bat_seqs.append(bseq)
+    ref_caches = [[ref_mgr.view(ref_seqs[s], i) for i in range(n_layers)] for s in range(b)]
+    bat_caches = [[bat_mgr.view(bat_seqs[s], i) for i in range(n_layers)] for s in range(b)]
+
+    worst = 0.0
+    cur = [1 for _ in range(b)]                          # deterministic start token (identical to both)
+    for t in range(steps):
+        for s in range(b):                               # open the decode position on BOTH managers
+            ref_mgr.advance(ref_seqs[s], [cur[s]])
+            bat_mgr.advance(bat_seqs[s], [cur[s]])
+        offs = [pre_len[s] + t for s in range(b)]
+        toks = [mx.array([cur[s]]) for s in range(b)]
+        ref = model.decode_batched(toks, ref_caches, offs, paged_batched=False)   # per-stream paged loop
+        bat = model.decode_batched(toks, bat_caches, offs, paged_batched=True)    # ONE scatter + ONE gather
+        mx.eval(ref, bat)
+        worst = max(worst, float(mx.max(mx.abs(ref - bat)).item()))
+        cur = [int(mx.argmax(ref[s, -1]).item()) for s in range(b)]   # feed argmax(ref) (== bat) next
+    return worst
+
+
 def run() -> None:
     print("A. decode_batched == per-stream __call__ loop (ragged offsets, multi-step):")
     _core(quantized=False, bits=8)
     _core(quantized=True, bits=8)
     print("B. runtime dispatch: step_batch(fused default) == _step_batch_looped:")
     _dispatch()
-    print("PASS — InternLM2.5 batched-decode attention is per-stream-equivalent (greedy-exact)")
+
+    print("C. paged KV loop-kill (#153): decode_batched paged_batched=True (per layer ONE write_batched + "
+          "ONE gather_batched) == per-stream paged .update() loop:")
+    for tag, (b, lens) in (("B=1", (1, [6])), ("ragged B=3", (3, [9, 4, 11]))):
+        w = _core_paged_loopkill(b, lens, steps=STEPS)
+        ok = w == 0.0
+        print(f"  [{'OK' if ok else 'XX'}] {tag:>10} blk=4 steps={STEPS}: max|Δ|={w:.2e} "
+              f"(paged-batched == per-stream paged loop, bit-exact)")
+        assert ok, f"paged loop-kill {tag} != per-stream paged loop: max|Δ|={w:.2e}"
+
+    # rule 4: the loop-kill stays OFF by default until InternLM2.5's own real-model bench graduates it
+    # (Nemotron's bench graduated its scoped flag; InternLM2.5 reads the shared PAGED_KV_BATCHED_DEFAULT).
+    mx.random.seed(0)
+    _bat = InternLM2BatchedResidentModel.from_inner(_FakeInner(_bf16_model(_tiny_cfg()), _tiny_cfg()),
+                                                    max_batch=2)
+    assert _bat._paged_kv_batched is False, ("InternLM2.5 paged KV loop-kill must default OFF (rule 4) "
+                                             "until its own real-model bench graduates it")
+    print("  [OK] default-built runtime keeps the per-stream paged loop (_paged_kv_batched=False, rule 4)")
+
+    print("PASS — InternLM2.5 batched-decode attention is per-stream-equivalent (greedy-exact); "
+          "paged KV loop-kill bit-exact")
 
 
 if __name__ == "__main__":

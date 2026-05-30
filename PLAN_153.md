@@ -2,9 +2,11 @@
 
 > Durable, repo-tracked handover for the NEXT task. Read `CLAUDE.md` first (permanent
 > rules + model facts), then `PLAN.md` (#18, the batched KV arena — DONE M0–M5; the
-> machinery #153 reuses), then this. **Status: M0–M1 DONE — storage primitives + the dense
-> stepper on the paged arena (`_PagedKVArena`), gated bit-exact model-free; M2 (compressed
-> stepper) next.**
+> machinery #153 reuses), then this. **Status: DSV4 core M0–M1 DONE (storage primitives + dense
+> paged stepper `_PagedKVArena`, bit-exact model-free); M2 (compressed stepper) next. Multi-model
+> loop-kill (user's order nemotron→internlm2→qwen3.6): Nemotron DONE + default GRADUATED ON
+> (real-model bench +18%@B48); InternLM2.5 DONE (wire via shared `batched_decode_attention_kv`,
+> default OFF — its own bench/graduate is the next ask); Qwen3.6 LAST (unpaged+hybrid, big).**
 
 ---
 
@@ -42,10 +44,13 @@ manager methods (the `rows` lease-indices collapse to "this batch's seqs").
 THAT ORDER**; one milestone per commit, STOP to compact between)
 The M0 primitive lives on the shared `PagedKVCacheManager`, so it serves **every paged keeper at the
 storage layer in one shot**. Per-model the loop to kill is the per-stream KV `.update()` inside each
-runtime's FUSED batched attention. **Shared k/v entry: `quanta.modeling.batched_attention` now has
-`_sdpa_padded` (factored SDPA tail) + `batched_decode_attention_padded`** — consumes a pre-padded
-`[B,n_kv,L_max,D]` (a paged `gather_batched`), the k/v sibling of DSV4's `_PagedKVArena`. (Started
-BEFORE DSV4 M2/M3 — the user chose the multi-model order.)
+runtime's FUSED batched attention. **Shared k/v entries in `quanta.modeling.batched_attention`:**
+`_sdpa_padded` (factored SDPA tail) + `batched_decode_attention_padded` (consumes a pre-padded
+`[B,n_kv,L_max,D]` from a paged `gather_batched`, the k/v sibling of DSV4's `_PagedKVArena`) +
+**`batched_decode_attention_kv`** (the single-sourced #153 KV-step: given projected+RoPE'd q/k/v + the
+per-stream layer caches, either the per-stream `.update()` loop OR — `paged_batched` + paged views — ONE
+`write_batched` + ONE `gather_batched` + the padded SDPA; InternLM2.5's two `decode_batched` call it,
+Nemotron's `_fused_attn_layer` inlines the equivalent core). (Started BEFORE DSV4 M2/M3 — user's order.)
 - **Nemotron** (k/v, paged) — **✅ DONE `833c8a4`, default GRADUATED ON (this commit).**
   `_fused_attn_layer` already fuses attn; killed its per-stream `KVCache.update()` loop → ONE
   `write_batched` + ONE `gather_batched` + `batched_decode_attention_padded` when caches are
@@ -67,9 +72,17 @@ BEFORE DSV4 M2/M3 — the user chose the multi-model order.)
   bench doubles as the real-model correctness gate for the quantized k/v `write_batched`/`gather_batched`
   at `head_dim=128` (the §D gate used bf16 to stay head_dim-agnostic). `run()` §D + the bench pin the
   default-ON.
-- **InternLM2.5** (k/v, paged — "small model") — **NEXT.** Pure dense GQA; fused attn EXISTS
-  (`decode_batched` on the inner runtime). Find its per-stream KV `.update()` loop, reuse
-  `batched_decode_attention_padded` (same wire as Nemotron). REAL win (B=32, KV-bound decode).
+- **InternLM2.5** (k/v, paged — "small model") — **✅ DONE (wire, this commit).** Pure dense GQA, 32
+  layers, no recurrent state. Killed the per-stream KV `.update()` loop in BOTH `decode_batched` paths —
+  bf16 `InternLM2Model` (`internlm2/model.py`) AND packed `_PackedModel` (`internlm2/runtime.py`) — by
+  routing their identical KV-update+SDPA tail through the new shared `batched_decode_attention_kv`.
+  `paged_batched` threaded: wrapper `InternLM2BatchedResidentModel._paged_kv_batched` ← **shared**
+  `PAGED_KV_BATCHED_DEFAULT` (OFF, rule 4) → `step_batch` → `InternLM2ResidentModel.decode_batched`
+  (delegator) → inner. Gate `internlm2_batched_attention_test.py` §C BIT-exact (`max|Δ|=0`, full
+  `decode_batched` paged loop-kill == per-stream paged loop, B=1 + ragged B=3 boundary-crossing, bf16
+  head_dim-agnostic) + pins default-OFF. **Default stays OFF** (unlike Nemotron) — graduates on its OWN
+  real-model bench (the `internlm2_5-7b-chat-1m-quanta_int8g64` bake, BEST_BATCH=32, KV-bound ⇒ expected
+  a BIGGER win than Nemotron since EVERY layer is attention, not just 8). That bench is the next ask.
 - **Qwen3.5/3.6** (`qwen35`) — **LAST, big.** UNPAGED (`shim/omlx._make_batched_session` forces it
   off paged) + hybrid (GDN recurrent + GQA) + NO fused attn yet (loops the whole mixer per stream) +
   serves at B=4. NOT a paged-primitive wire: needs its OWN unpaged GQA arena (#18-style) + batched GDN

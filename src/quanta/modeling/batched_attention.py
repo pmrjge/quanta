@@ -181,3 +181,50 @@ def batched_decode_attention_padded(
     n_kv, l_max, d = int(k.shape[1]), int(k.shape[2]), int(k.shape[3])
     _guard_padded_kv(b, n_kv, l_max, d, _itemsize(k))
     return _sdpa_padded(q, k, v, lengths, scale=scale, n_rep=n_rep)
+
+
+def batched_decode_attention_kv(
+    q: mx.array,
+    k: mx.array,
+    v: mx.array,
+    kv_for_layer: list,
+    *,
+    scale: float,
+    n_rep: int = 1,
+    paged_batched: bool = False,
+) -> mx.array:
+    """KV-store update + fused SDPA across ``B`` streams for ONE attention layer of a batched decode step
+    — the shared #153 KV-step that both InternLM2.5 ``decode_batched`` paths call (Nemotron's
+    ``_fused_attn_layer`` inlines the equivalent core).
+
+    Args:
+      q: ``[B, nh, 1, D]`` — the B streams' decode queries (projected + RoPE applied).
+      k, v: ``[B, n_kv, 1, D]`` — the new keys/values for this step (projected; RoPE applied to ``k``).
+      kv_for_layer[s]: stream ``s``'s cache for THIS layer — a :class:`~quanta.paged.PagedKVCacheView`
+        (paged) or a discrete ``KVCache`` (unpaged), both exposing ``update(k, v) -> (k_all, v_all)``.
+      scale, n_rep: softmax scale + GQA repeat (``nh // n_kv``).
+      paged_batched (#153 loop-kill): when ``True`` AND the caches are paged views, replace the bounded
+        per-stream ``.update()`` loop with ONE ``write_batched`` scatter + ONE ``gather_batched`` over the
+        shared manager, then the padded SDPA — bit-identical to the loop (M0 proved batched scatter/gather
+        == per-stream; both end in the same SDPA via :func:`batched_decode_attention_padded` /
+        :func:`batched_decode_attention`). A discrete cache or the flag off keeps the proven loop (rule 4).
+
+    Returns ``[B, nh, 1, D]`` — the per-stream attention output, ready for the o-projection."""
+    b = int(q.shape[0])
+    if paged_batched and b:
+        from quanta.paged import PagedKVCacheView  # lazy: keep this module import-light (pure MLX)
+        if isinstance(kv_for_layer[0], PagedKVCacheView):
+            mgr = kv_for_layer[0]._m                               # shared manager (same for all streams)
+            layer = kv_for_layer[0]._layer                         # this layer's manager index
+            seqs = [view._seq for view in kv_for_layer]            # each stream's SeqHandle
+            mgr.write_batched(seqs, layer, k, v)                   # ONE scatter write (kills the loop)
+            kf, vf = mgr.gather_batched(seqs, layer)               # ONE gather -> [B, n_kv, L_max, D]
+            lengths = [s.n_written[layer] for s in seqs]           # per-stream valid key counts
+            return batched_decode_attention_padded(q, kf, vf, lengths, scale=scale, n_rep=n_rep)
+    qs, ks, vs = [], [], []
+    for s in range(b):                                             # bounded per-stream KV update (IO)
+        kf, vf = kv_for_layer[s].update(k[s:s + 1], v[s:s + 1])    # [1, n_kv, L_s, D]
+        qs.append(q[s])
+        ks.append(kf)
+        vs.append(vf)
+    return batched_decode_attention(qs, ks, vs, scale=scale, n_rep=n_rep)

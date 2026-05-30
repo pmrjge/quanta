@@ -142,17 +142,21 @@ class InternLM2Model(nn.Module):
             return x @ self.tok_embeddings.weight.T
         return self.output(x)
 
-    def decode_batched(self, stream_tokens: list, caches: list, offsets: list[int]) -> mx.array:
+    def decode_batched(self, stream_tokens: list, caches: list, offsets: list[int], *,
+                       paged_batched: bool = False) -> mx.array:
         """One batched decode step across ``B`` streams (Approach-1 vectorized attention).
 
         Replaces the per-stream ``step_batch`` loop: ``stream_tokens[b]`` is stream ``b``'s single new
         token (``int`` / ``[1]`` / ``[1,1]``), ``caches[b]`` its per-layer ``[KVCache]*n_layers`` list,
         ``offsets[b]`` the new token's absolute position. Projections, FFN and the output head batch
         over ``B`` trivially (per-token ops); the only per-stream work is the **bounded** KV-cache
-        update (bookkeeping, not compute) feeding one fused :func:`batched_decode_attention`. Returns
-        ``[B, 1, vocab]`` — equal to looping :meth:`__call__` per stream up to RoPE/SDPA tiling ULPs.
+        update (bookkeeping, not compute) feeding one fused SDPA via
+        :func:`~quanta.modeling.batched_attention.batched_decode_attention_kv`. Returns ``[B, 1, vocab]``
+        — equal to looping :meth:`__call__` per stream up to RoPE/SDPA tiling ULPs. ``paged_batched``
+        (#153 loop-kill): when the caches are paged views, that helper replaces the per-stream
+        ``.update()`` loop with ONE ``write_batched`` + ONE ``gather_batched`` (bit-exact; rule-4 flag).
         """
-        from quanta.modeling.batched_attention import batched_decode_attention
+        from quanta.modeling.batched_attention import batched_decode_attention_kv
 
         from quanta.internlm2.attention import batched_rope_fast
 
@@ -170,13 +174,9 @@ class InternLM2Model(nn.Module):
             v = mx.transpose(att.wv(n).reshape(b, 1, att.nkv, att.hd), (0, 2, 1, 3))
             q = batched_rope_fast(q, offsets, bases)
             k = batched_rope_fast(k, offsets, bases)
-            qs, ks, vs = [], [], []
-            for s in range(b):                                       # bounded stream loop (cache I/O)
-                kf, vf = clists[s][i].update(k[s:s + 1], v[s:s + 1])  # [1, nkv, L_s, D]
-                qs.append(q[s])
-                ks.append(kf)
-                vs.append(vf)
-            out = batched_decode_attention(qs, ks, vs, scale=att.scale, n_rep=att.rep)  # [B,H,1,D]
+            out = batched_decode_attention_kv(q, k, v, [clists[s][i] for s in range(b)],
+                                              scale=att.scale, n_rep=att.rep,
+                                              paged_batched=paged_batched)               # [B,H,1,D]
             out = mx.transpose(out, (0, 2, 1, 3)).reshape(b, 1, att.nh * att.hd)
             x = x + att.wo(out)
             x = x + layer.feed_forward(layer.ffn_norm(x))
