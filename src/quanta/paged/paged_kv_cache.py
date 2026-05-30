@@ -342,6 +342,106 @@ class PagedKVCacheManager:
                     alloc.register_full(blk, hashes[bi], self.block_size)
                     self._stats.prefix_miss_blocks += 1
 
+    # --- batched write path (#153) -------------------------------------------
+    # Paged decode of ``B`` lock-step streams otherwise pays a per-stream Python loop: each stream
+    # quantizes its one new token + slice-assigns it into its own tail block (:meth:`write`/
+    # :meth:`write_one`), then a separate per-stream :meth:`gather` re-materializes every stream. #153
+    # replaces that with ONE quantize + ONE fancy-index scatter across all ``B`` streams (the paged
+    # sibling of the #18 ``_KVArena.append_batched``, but the physical target is each stream's block
+    # table instead of a contiguous arena row). Affine int-bits over the last axis (head_dim) is
+    # row-independent, so the batched quantize equals ``B`` separate quantizes row-for-row -> contents
+    # are BIT-IDENTICAL to the per-stream path. Block resolution (alloc a fresh private tail block on a
+    # boundary cross; COW-clone a shared partial tail first) stays bounded per-stream accounting OUTSIDE
+    # the scatter (rule 3); in steady serving decode the tail is always private (COW only fires at
+    # prefill), so the scatter never touches a shared block — and we assert it (rule 6). Generic over
+    # the component dict, so the SAME primitive serves DSV4's single-stream latent AND the k/v keepers
+    # (Nemotron / InternLM2.5). Gated model-free in ``parity/dsv4_paged_batched_test.py`` (M0);
+    # dispatched behind ``PAGED_KV_BATCHED_DEFAULT`` at the call site once the steppers are wired (M3).
+    def write_one_batched(self, seqs: list[SeqHandle], layer: int, kv: mx.array) -> None:
+        """Batched single-stream append (DSV4 latent): ``kv`` is ``[B, 1, head_dim]`` for the
+        ``B == len(seqs)`` lock-step streams, each appending ONE token at its own write cursor. ONE
+        quantize + ONE scatter; equivalent to :meth:`write_one` on each stream. ``single_stream=True``
+        only (rule 6)."""
+        if not self.single_stream:
+            raise RuntimeError("write_one_batched requires a single_stream=True manager; use write_batched")
+        if int(kv.shape[0]) != len(seqs):
+            raise ValueError(f"write_one_batched: {len(seqs)} seqs but kv batch {kv.shape[0]}")
+        if int(kv.shape[1]) != 1:
+            raise ValueError(f"write_one_batched expects one token per stream (T==1, got {kv.shape[1]})")
+        if self.quantized:
+            q, s, b = quantize_last_axis(kv, self.group_size, self.bits)            # [B, 1, *]
+            encoded = {"kv_q": q[:, 0], "kv_s": s[:, 0], "kv_b": b[:, 0]}            # [B, *]
+        else:
+            encoded = {"kv": kv[:, 0]}                                              # [B, head_dim]
+        self._write_encoded_batched(seqs, layer, encoded)
+
+    def write_batched(self, seqs: list[SeqHandle], layer: int, k: mx.array, v: mx.array) -> None:
+        """Batched k/v append (standard attention — Nemotron / InternLM2.5): ``k``/``v`` are
+        ``[B, n_kv, 1, head_dim]`` for the ``B == len(seqs)`` lock-step streams. ONE quantize + ONE
+        scatter; equivalent to :meth:`write` on each stream. ``single_stream=False`` only (rule 6)."""
+        if self.single_stream:
+            raise RuntimeError("write_batched is the k/v adapter; this manager is single_stream — use write_one_batched")
+        if int(k.shape[0]) != len(seqs) or tuple(k.shape) != tuple(v.shape):
+            raise ValueError(f"write_batched: {len(seqs)} seqs, k {tuple(k.shape)}, v {tuple(v.shape)}")
+        if int(k.shape[2]) != 1:
+            raise ValueError(f"write_batched expects one token per stream (T==1, got {k.shape[2]})")
+        if self.quantized:
+            kq, ks, kb = quantize_last_axis(k, self.group_size, self.bits)          # [B, n_kv, 1, *]
+            vq, vs, vb = quantize_last_axis(v, self.group_size, self.bits)
+            encoded = {"k_q": kq[:, :, 0], "k_s": ks[:, :, 0], "k_b": kb[:, :, 0],
+                       "v_q": vq[:, :, 0], "v_s": vs[:, :, 0], "v_b": vb[:, :, 0]}   # [B, n_kv, *]
+        else:
+            encoded = {"k": k[:, :, 0], "v": v[:, :, 0]}                            # [B, n_kv, head_dim]
+        self._write_encoded_batched(seqs, layer, encoded)
+
+    def _write_encoded_batched(self, seqs: list[SeqHandle], layer: int,
+                               encoded: dict[str, mx.array]) -> None:
+        """Scatter ONE pre-encoded token per stream (component dict ``{name: [B, *per_tok]}``) into
+        ``layer``'s blocks at each stream's write cursor — the batched sibling of :meth:`_write_encoded`.
+        Resolves each stream's target block (alloc fresh on a boundary cross; COW-clone a shared partial
+        tail first) as bounded per-stream accounting, asserts every resolved block is private (rule 6:
+        never scatter into a shared block), then lands all ``B`` records with ONE fancy-index assign per
+        component. The only tensor op is the scatter; there is no per-token / per-hidden Python loop."""
+        b = len(seqs)
+        if b == 0:
+            return
+        alloc = self._allocs[layer]
+        pools = self._ensure_pools(layer, encoded, ())
+        block_ids: list[int] = []
+        intras: list[int] = []
+        for seq in seqs:                          # bounded accounting (<= max_batch), no tensor compute
+            pos = seq.n_written[layer]
+            if pos >= seq.length:
+                raise ValueError(
+                    f"paged batched write layer {layer}: stream cursor {pos} >= advanced length "
+                    f"{seq.length} (call advance() to open the position first)")
+            bi = pos // self.block_size
+            intra = pos % self.block_size
+            block_table = seq.block_tables[layer]
+            if bi == len(block_table):
+                blk = alloc.alloc()
+                block_table.append(blk)
+            elif bi < len(block_table):
+                blk = block_table[bi]
+                if blk.is_shared():               # forked shared tail -> COW before mutating
+                    blk = self._cow(layer, block_table, bi)
+            else:
+                raise RuntimeError(f"paged batched write: block gap at index {bi} "
+                                   f"(have {len(block_table)})")
+            if blk.is_shared():                   # post-COW the write block must be private (rule 6)
+                raise RuntimeError(f"paged batched write: target block {blk.block_id} still shared")
+            block_ids.append(blk.block_id)
+            intras.append(intra)
+            blk.token_count = max(blk.token_count, intra + 1)
+        rows_arr = mx.array(block_ids, dtype=mx.int32)
+        cols_arr = mx.array(intras, dtype=mx.int32)
+        for name, arr in encoded.items():
+            pool = pools[name]
+            idx = (rows_arr, cols_arr) + (slice(None),) * (pool.ndim - 2)
+            pool[idx] = arr
+        for seq in seqs:                          # advance cursors only after the data has landed
+            seq.n_written[layer] += 1
+
     # --- read path -----------------------------------------------------------
     def gather(self, seq: SeqHandle, layer: int) -> tuple[mx.array, mx.array]:
         """Materialize the ``[1, n_kv, n_written, head_dim]`` bf16 k,v stream for SDPA — one vectorized
@@ -388,6 +488,59 @@ class PagedKVCacheManager:
             return dequantize_last_axis(gathered["kv_q"], gathered["kv_s"], gathered["kv_b"],
                                         self.group_size, dtype=mx.bfloat16, bits=self.bits)
         return gathered["kv"].astype(mx.bfloat16)
+
+    # --- batched read path (#153) --------------------------------------------
+    def _gather_encoded_batched(self, seqs: list[SeqHandle], layer: int) -> tuple[dict[str, mx.array], int]:
+        """Gather the ``B`` streams' written extents into padded ``[B, L_max, *per_tok]`` component
+        arrays with ONE ``mx.take`` per component over a padded block-id matrix — the batched sibling of
+        :meth:`gather`/:meth:`gather_one`'s per-stream ``mx.take`` + ``_pad_stack``. ``L_max =
+        max(n_written[layer])``; each stream's block ids are tail-padded to the longest stream's block
+        count with block 0, whose gathered rows land at positions ``>= n_written`` for that stream and so
+        are never read as valid (the SDPA window/pad mask sends them to ``-inf`` — the #18 argument)."""
+        pools = self._pools[layer]
+        ns = [seq.n_written[layer] for seq in seqs]
+        l_max = max(ns) if ns else 0
+        if pools is None or l_max == 0:
+            raise RuntimeError(f"paged batched gather layer {layer}: nothing written")        # rule 6
+        bid_lists = [[blk.block_id for blk in seq.block_tables[layer]] for seq in seqs]
+        max_nb = max(len(bl) for bl in bid_lists)
+        bids = [bl + [0] * (max_nb - len(bl)) for bl in bid_lists]    # tail-pad (real blocks first)
+        bids_arr = mx.array(bids, dtype=mx.uint32).reshape(-1)        # [B * max_nb]
+        b = len(seqs)
+        gathered: dict[str, mx.array] = {}
+        for name, pool in pools.items():
+            g = mx.take(pool, bids_arr, axis=0)                       # [B*max_nb, block_size, *per_tok]
+            g = g.reshape(b, max_nb * self.block_size, *pool.shape[2:])  # [B, max_nb*block_size, ...]
+            gathered[name] = g[:, :l_max]                             # [B, L_max, *per_tok]
+        return gathered, l_max
+
+    def gather_one_batched(self, seqs: list[SeqHandle], layer: int) -> mx.array:
+        """Materialize the ``[B, L_max, head_dim]`` bf16 latent stream for all ``B`` streams (the
+        single-stream sibling of :meth:`gather_one`) — ONE gather + ONE batched dequant, replacing the
+        per-stream ``gather_one`` loop + ``_pad_stack``. ``single_stream=True`` only (rule 6)."""
+        if not self.single_stream:
+            raise RuntimeError("gather_one_batched needs a single_stream=True manager; use gather_batched")
+        g, _ = self._gather_encoded_batched(seqs, layer)
+        if self.quantized:
+            return dequantize_last_axis(g["kv_q"], g["kv_s"], g["kv_b"], self.group_size,
+                                        dtype=mx.bfloat16, bits=self.bits)
+        return g["kv"].astype(mx.bfloat16)
+
+    def gather_batched(self, seqs: list[SeqHandle], layer: int) -> tuple[mx.array, mx.array]:
+        """Materialize the ``[B, n_kv, L_max, head_dim]`` bf16 k,v streams for all ``B`` streams (the
+        k/v sibling of :meth:`gather`) — ONE gather + ONE batched dequant for each of k/v, replacing the
+        per-stream ``gather`` loop + pad/stack. ``single_stream=False`` only (rule 6)."""
+        if self.single_stream:
+            raise RuntimeError("gather_batched is the k/v adapter; this manager is single_stream — use gather_one_batched")
+        g, _ = self._gather_encoded_batched(seqs, layer)              # components [B, L_max, n_kv, *]
+        if self.quantized:
+            k = dequantize_last_axis(g["k_q"], g["k_s"], g["k_b"], self.group_size,
+                                     dtype=mx.bfloat16, bits=self.bits)
+            v = dequantize_last_axis(g["v_q"], g["v_s"], g["v_b"], self.group_size,
+                                     dtype=mx.bfloat16, bits=self.bits)
+        else:
+            k, v = g["k"].astype(mx.bfloat16), g["v"].astype(mx.bfloat16)
+        return k.transpose(0, 2, 1, 3), v.transpose(0, 2, 1, 3)       # [B, n_kv, L_max, head_dim]
 
     def truncate(self, seq: SeqHandle, length: int) -> None:
         """Roll the whole sequence back to ``length`` tokens (drop trailing blocks). Block-granular;

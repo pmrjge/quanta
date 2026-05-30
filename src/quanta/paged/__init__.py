@@ -26,8 +26,17 @@ from quanta.paged.recurrent_cache import RecurrentCacheStats, RecurrentPrefixCac
 
 PAGED_KV_DEFAULT = True
 
+# #153: batched-paged KV decode — ONE block-table scatter + ONE gather across all B lock-step streams
+# (the paged sibling of the #18 arena loop-kill), serving the paged keepers (Nemotron, DSV4,
+# InternLM2.5). Default OFF until the steppers are wired + parity-green (rule 4). The storage primitives
+# (``PagedKVCacheManager.write_*_batched`` / ``gather_*_batched``) already exist and are gated
+# model-free in ``parity/dsv4_paged_batched_test.py`` (M0); the runtime/session reads this flag to pick
+# the batched scatter/gather over the per-stream loop once dispatched (#153 M3).
+PAGED_KV_BATCHED_DEFAULT = False
+
 __all__ = [
     "PAGED_KV_DEFAULT",
+    "PAGED_KV_BATCHED_DEFAULT",
     "BlockAllocator",
     "CacheBlock",
     "compute_block_hash",
