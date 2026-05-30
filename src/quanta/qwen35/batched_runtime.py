@@ -49,6 +49,17 @@ from quanta.qwen35.config import Qwen35Config
 from quanta.qwen35.decode import Qwen35Cache, _GDNLayerState
 from quanta.qwen35.gated_deltanet import GatedDeltaNet
 
+# --- #153 GQA loop-kill default (Qwen3.5-scoped; UNPAGED — not the shared paged flag) -------------
+# When ON, the serving decode step (:func:`batched_decode_step`) replaces the per-stream GQA mixer loop
+# on full-attention layers with ONE batched attention across all B streams (batched q/k/v/o projections
+# + per-stream RoPE kernel loop + the shared ``batched_decode_attention_kv`` fused padded SDPA) — the
+# #18-style loop-kill brought to the Qwen prod path, but UNPAGED (Qwen serving forces ``paged_kv=False``)
+# so it cannot reuse the shared ``PAGED_KV_BATCHED_DEFAULT``. Defaults OFF (rule 4: naive per-stream path
+# until parity-proven); M1 lands it behind this flag, M3 flips it ON after the real-model B-sweep. Gated
+# greedy-exact vs the per-stream loop in ``parity/qwen35_batched_loopkill_test.py``. The GDN (linear-attn)
+# half of the hybrid stays per-stream until M2; ``batch_step`` (tree-spec verify) is untouched.
+QWEN35_BATCHED_LOOPKILL_DEFAULT = False
+
 
 def _gdn_step_through_cache(blk, lc: _GDNLayerState, x_t: mx.array) -> mx.array:
     """One linear-layer decode step for ONE stream through its recurrent layer-state.
@@ -91,6 +102,8 @@ def batched_decode_step(
     stream_token_ids: Sequence[int],
     stream_caches: Sequence[Qwen35Cache],
     offsets: Sequence[int],
+    *,
+    loopkill: bool = QWEN35_BATCHED_LOOPKILL_DEFAULT,
 ) -> list[mx.array]:
     """One batched decode step over ``B = len(stream_token_ids)`` streams. Returns per-stream
     logits ``[1,1,vocab]``.
@@ -100,6 +113,13 @@ def batched_decode_step(
     sub-block runs ONCE on the stacked ``[B,1,hidden]``. Per-stream output is bit-identical to
     feeding the same token through :class:`quanta.qwen35.runtime.Qwen35ResidentModel` at the same
     offset against the same cache.
+
+    ``loopkill`` (#153, M1 — :data:`QWEN35_BATCHED_LOOPKILL_DEFAULT`): when True the full-attention
+    (GQA) layers run ONE batched attention across all ``B`` streams via
+    :meth:`quanta.qwen35.attention.Qwen35Attention.decode_step_batched` (batched projections +
+    per-stream RoPE + shared fused SDPA) instead of the per-stream mixer loop — greedy-token-equivalent
+    to the loop (gated in ``parity/qwen35_batched_loopkill_test.py``). The GDN (linear-attn) layers stay
+    per-stream until M2. Off ⇒ the proven per-stream path (rule 4).
 
     Drives both the resident runtime (post-artifact-load) AND the model-free parity test (via the
     tiny :class:`quanta.qwen35.model.Qwen35Model` set up with random weights), without duplicating
@@ -122,24 +142,38 @@ def batched_decode_step(
     h_b = embed_w[ids_b][:, None].astype(mx.bfloat16)                               # [B,1,hidden]
     hs: list[mx.array] = [h_b[i:i + 1] for i in range(b)]                           # B × [1,1,hidden]
 
-    # --- per layer: per-stream mixer, then ONE batched MoE call ----------------------------
+    # --- per layer: mixer (per-stream OR batched GQA loop-kill), then ONE batched MoE call --------
     for layer_i, blk in enumerate(layers):
-        # 1) per-stream mixer step (bounded IO loop over the small batch — rule 3 allows IO loops;
-        # the GDN / GQA work inside each call is fully vectorized over heads/dims).
-        after_mixer: list[mx.array] = []
-        for s in range(b):
-            lc = stream_caches[s][layer_i]
-            # YaRN factor resolved per stream so it matches the single-stream runtime at the same
-            # absolute position; >native requires a pinned factor (rule 6 — see Qwen35Cache.yarn_seq).
-            seq_hint_s = stream_caches[s].yarn_seq(offsets[s] + 1, cfg)
-            if blk.is_linear:
-                out_s = _gdn_step_through_cache(blk, lc, hs[s])
-            else:
-                out_s = _gqa_step_through_cache(blk, lc, hs[s], seq_hint_s)
-            after_mixer.append(out_s)
+        if loopkill and not blk.is_linear:
+            # GQA loop-kill (#153 M1): ONE batched attention across all B streams. Batched input-norm
+            # (RMSNorm is row-wise → per-row identical to the per-stream norm), then the batched GQA
+            # decode (batched q/k/v/o proj + per-stream RoPE + shared fused SDPA), then the batched
+            # residual — greedy-equivalent to the per-stream loop (rule 4 flag).
+            x_stacked = mx.concatenate(hs, axis=0) if b > 1 else hs[0]                # [B,1,hidden]
+            h_norm = blk.input_layernorm(x_stacked)
+            kv_for_layer = [stream_caches[s][layer_i] for s in range(b)]
+            seq_hints = [stream_caches[s].yarn_seq(offsets[s] + 1, cfg) for s in range(b)]
+            y = blk.mixer.decode_step_batched(h_norm, kv_for_layer=kv_for_layer,
+                                              offsets=list(offsets), seq_hints=seq_hints)  # [B,1,hidden]
+            stacked = x_stacked + y                                                   # [B,1,hidden]
+        else:
+            # 1) per-stream mixer step (bounded IO loop over the small batch — rule 3 allows IO loops;
+            # the GDN / GQA work inside each call is fully vectorized over heads/dims). GDN always takes
+            # this path until M2; GQA takes it when the loop-kill flag is off.
+            after_mixer: list[mx.array] = []
+            for s in range(b):
+                lc = stream_caches[s][layer_i]
+                # YaRN factor resolved per stream so it matches the single-stream runtime at the same
+                # absolute position; >native requires a pinned factor (rule 6 — see Qwen35Cache.yarn_seq).
+                seq_hint_s = stream_caches[s].yarn_seq(offsets[s] + 1, cfg)
+                if blk.is_linear:
+                    out_s = _gdn_step_through_cache(blk, lc, hs[s])
+                else:
+                    out_s = _gqa_step_through_cache(blk, lc, hs[s], seq_hint_s)
+                after_mixer.append(out_s)
 
-        # 2) stack the B post-mixer residuals -> [B,1,hidden] for the MoE call
-        stacked = mx.concatenate(after_mixer, axis=0) if b > 1 else after_mixer[0]   # [B,1,hidden]
+            # 2) stack the B post-mixer residuals -> [B,1,hidden] for the MoE call
+            stacked = mx.concatenate(after_mixer, axis=0) if b > 1 else after_mixer[0]   # [B,1,hidden]
 
         # 3) ONE batched MoE sub-block over all B tokens — gather_qmm reads each touched
         # routed-expert weight tile once for all B rows that route to it; shared-expert once
@@ -197,6 +231,7 @@ class Qwen35BatchedResidentModel:
         self.layers = self._inner.layers
         self._kv_quantized = bool(kv_quantized)
         self._kv_group_size = int(kv_group_size)
+        self._loopkill = bool(QWEN35_BATCHED_LOOPKILL_DEFAULT)   # #153 M1 GQA loop-kill (rule-4 flag)
 
     @classmethod
     def from_inner(cls, layers, embed_w: mx.array, norm_w: mx.array, lm_head_w: mx.array,
@@ -219,6 +254,7 @@ class Qwen35BatchedResidentModel:
         self.layers = layers
         self._kv_quantized = bool(kv_quantized)
         self._kv_group_size = int(kv_group_size)
+        self._loopkill = bool(QWEN35_BATCHED_LOOPKILL_DEFAULT)   # #153 M1 GQA loop-kill (rule-4 flag)
         return self
 
     # --- per-stream cache factory ---------------------------------------------
@@ -256,7 +292,7 @@ class Qwen35BatchedResidentModel:
         # bit-identical to a step-by-step decode at offsets 0..len-1).
         for pos, tid in enumerate(ids):
             logits = batched_decode_step(self.layers, self.embed_w, self.norm_w, self.lm_head_w,
-                                         self.cfg, [int(tid)], [state], [pos])[0]
+                                         self.cfg, [int(tid)], [state], [pos], loopkill=False)[0]
             mx.eval(logits)
         return logits  # [1,1,vocab] at the last consumed position
 
@@ -286,7 +322,8 @@ class Qwen35BatchedResidentModel:
         for k in range(t_total):
             tid = int(ids[k].item())
             lg = batched_decode_step(self.layers, self.embed_w, self.norm_w, self.lm_head_w,
-                                     self.cfg, [tid], [caches], [offset + k])[0]    # [1,1,vocab]
+                                     self.cfg, [tid], [caches], [offset + k],
+                                     loopkill=False)[0]    # [1,1,vocab] (single-stream contract)
             per_t.append(lg)
         return per_t[0] if t_total == 1 else mx.concatenate(per_t, axis=1)           # [1,T,vocab]
 
@@ -304,12 +341,16 @@ class Qwen35BatchedResidentModel:
 
         Per-stream output is bit-identical to feeding the same token through the single-stream
         :class:`Qwen35ResidentModel` at the same offset against the same cache — gated in
-        ``parity/qwen35_batched_test.py``.
+        ``parity/qwen35_batched_test.py``. With the #153 GQA loop-kill enabled (``self._loopkill`` ←
+        :data:`QWEN35_BATCHED_LOOPKILL_DEFAULT`) the full-attention layers run ONE batched attention
+        across streams instead of the per-stream loop — greedy-token-equivalent (gated in
+        ``parity/qwen35_batched_loopkill_test.py``).
         """
         if len(stream_token_ids) > self.max_batch:
             raise ValueError(f"batch {len(stream_token_ids)} exceeds max_batch {self.max_batch}")
         return batched_decode_step(self.layers, self.embed_w, self.norm_w, self.lm_head_w,
-                                   self.cfg, stream_token_ids, stream_caches, offsets)
+                                   self.cfg, stream_token_ids, stream_caches, offsets,
+                                   loopkill=self._loopkill)
 
     # --- shared-offset batched step for tree-spec batched verify ---------------
     def batch_step(

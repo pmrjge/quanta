@@ -252,3 +252,66 @@ class Qwen35Attention(nn.Module):
             out = out * gate.astype(out.dtype)                 # fused per-head output gate
         out = out.reshape(b, t, self.nh * self.hd)
         return self.o_proj(out)
+
+    def decode_step_batched(self, x, *, kv_for_layer, offsets, seq_hints) -> mx.array:
+        """One batched ``B``-stream single-token decode through ``B`` *ragged* per-stream KV caches —
+        the #153 loop-kill for the serving decode path (the GQA half of the Qwen3.5 hybrid).
+
+        ``x`` ``[B, 1, hidden]`` are the ``B`` streams' post-input-norm residuals (stacked).
+        ``kv_for_layer[s]`` is stream ``s``'s :class:`KVCache` for THIS layer (mutated in place by the
+        shared helper); ``offsets[s]`` is stream ``s``'s absolute decode position (== its cache offset
+        before the step); ``seq_hints[s]`` is its resolved dynamic-YaRN seq-len (from
+        :meth:`quanta.qwen35.decode.Qwen35Cache.yarn_seq`). Returns the o-projected attention output
+        ``[B, 1, hidden]`` (the per-head output gate already applied) — the same residual ``y`` the
+        per-stream :meth:`__call__` (``use_fast=True``) returns for each stream.
+
+        Batches the four big projections (q/k/v/o) across the ``B`` streams so each projection weight
+        is read ONCE for all ``B`` (the memory-bandwidth win, mirroring the MoE expert-read
+        amortization), then:
+
+        * **per-stream RoPE** — looped, NOT a batched reimpl: each stream rotates with its OWN absolute
+          offset AND its own YaRN ``inv_freq`` (the dynamic factor differs per stream once any stream
+          crosses the native window — :meth:`Qwen35Config.effective_yarn_factor`). Each call is the exact
+          :func:`_rope_fast` kernel the single-stream path runs, so it is bit-identical per row (a
+          hand-rolled batched RoPE drifts at bf16 on real values and compounds across layers — see the
+          ``feedback_batched_rope_bf16`` memory). The loop is a bounded IO loop over the small batch
+          (rule 3), and RoPE is cheap vs the projections / SDPA / MoE.
+        * **one fused KV-update + SDPA** via the shared
+          :func:`quanta.modeling.batched_attention.batched_decode_attention_kv` (unpaged discrete caches
+          ⇒ the bounded per-stream ``.update()`` then ONE padded SDPA) — the same #153 primitive
+          InternLM2.5 / Nemotron use.
+
+        Row ``s`` of the result equals :meth:`__call__` on stream ``s`` (at its own offset/seq_hint,
+        ``use_fast=True``) against its own cache, up to the padded-SDPA reduction-order ULPs — the
+        greedy-token-stable equivalence the project accepts for batched/tiled paths. Gated in
+        ``parity/qwen35_batched_loopkill_test.py``.
+        """
+        from quanta.modeling.batched_attention import batched_decode_attention_kv
+
+        b, t, _ = x.shape
+        if t != 1:
+            raise ValueError(f"decode_step_batched is a single-token step; got T={t} (rule 6)")
+        if not len(kv_for_layer) == len(offsets) == len(seq_hints) == b:
+            raise ValueError(
+                f"decode_step_batched: B mismatch x={b} kv={len(kv_for_layer)} "
+                f"offsets={len(offsets)} seq_hints={len(seq_hints)}")
+        q, k, v, gate = self._project(x)            # q [B,nh,1,hd]; k/v [B,n_kv,1,hd]; gate [B,1,nh,hd]|None
+        # per-stream RoPE: loop the exact mx.fast.rope kernel — offset AND YaRN inv_freq differ per
+        # stream (bf16-drift trap: never a batched reimpl). Bit-identical per row to __call__.
+        q_rows, k_rows = [], []
+        for s in range(b):
+            inv_freq_s = yarn_inv_freq(self.cfg, int(seq_hints[s]))
+            off_s = int(offsets[s])
+            q_rows.append(_rope_fast(q[s:s + 1], inv_freq_s, self.rd, off_s))
+            k_rows.append(_rope_fast(k[s:s + 1], inv_freq_s, self.rd, off_s))
+        q = mx.concatenate(q_rows, axis=0) if b > 1 else q_rows[0]      # [B,nh,1,hd]
+        k = mx.concatenate(k_rows, axis=0) if b > 1 else k_rows[0]      # [B,n_kv,1,hd]
+        # one fused KV-update (bounded per-stream .update() on the discrete unpaged caches) + ONE padded
+        # SDPA across all B streams (GQA repeat inside the shared helper).
+        out = batched_decode_attention_kv(q, k, v, list(kv_for_layer),
+                                          scale=self.scale, n_rep=self.rep, paged_batched=False)  # [B,nh,1,hd]
+        out = mx.transpose(out, (0, 2, 1, 3))                          # [B,1,nh,hd]
+        if gate is not None:
+            out = out * gate.astype(out.dtype)                         # fused per-head output gate
+        out = out.reshape(b, t, self.nh * self.hd)
+        return self.o_proj(out)
