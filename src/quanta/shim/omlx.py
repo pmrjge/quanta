@@ -76,7 +76,10 @@ BEST_BATCH: tuple[tuple[str, int], ...] = (
     ("deepseek_v4", 48),  # DSV4 worker (#19): agg ~92.8 tok/s @48, ~11.5x over the per-stream loop; B=64
     #                       OOMs the looped path's ~490 GiB lazy graph and agg has flattened by 48.
     ("nemotron", 32),     # Nemotron worker (#20): agg peaks 136.6 tok/s @32 (2.46x); REGRESSES at 48
-    #                       (131.4 tok/s) though memory is fine (108 GiB) — the knee is below 48.
+    #                       (131.4 tok/s) though memory is fine (108 GiB) — the knee is below 48. The
+    #                       #153 paged KV loop-kill (default since 7f49bd9) REAFFIRMS 32: decode-only
+    #                       loopkill ~146 tok/s @32 ≈ ~144 @48 (the loop-kill flattened the >32 decay) but
+    #                       32 uses ~16 GiB less KV (99.7 vs 115.5, parity/nemotron_paged_batched_bench.py).
     ("internlm2", 32),    # InternLM2.5 worker (#21): agg peaks 243.1 tok/s @32 (4.49x over the loop);
     #                       REGRESSES to 213.6 @48 then plateaus ~210-221 through 128 — KV-light but the
     #                       knee is still 32 (per-stream decay outpaces B past 32; memory flat ~9 GiB).
