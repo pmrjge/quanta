@@ -25,6 +25,18 @@ same equivalence class the project accepts for tiled/batched paths — see ``fee
 and the InternLM2.5 batched-attention gate). ``|Δlogit|`` is reported as a soft diagnostic against
 :data:`LOGIT_TOL`.
 
+**§M0 — option-B foundational mechanism (model-free, run first).** Before any runtime is converted to
+packed weights, :func:`_test_m0_batchm_packed_vs_dense` locks the matmul mechanism the packed loop-kill
+rests on. The real-model bench found the dequant loop-kill is not greedy-exact at B>1 because the runtime
+DEQUANTIZES the mixer projections to dense bf16, and a dense-bf16 GEMM reorders its K-reduction across
+batch-M (bf16 sums are non-associative; ``feedback_batched_rope_bf16``). M0 found a sharper truth than the
+option-B plan assumed: ``mx.quantized_matmul`` is batch-M bit-exact ONLY for M<=~10 (a per-row gemv kernel)
+and SWITCHES to a tiled GEMM at B>=12 that reorders too (bf16 ~2.25/proj, *larger* than the dense bug) — so
+a *full-batch* packed loop-kill is NOT bit-exact at the B=32 operating point. The fix locked here (user
+decision): run the loop-kill projections in row-CHUNKS of <=8 (each an M<=8 ``quantized_matmul``, the
+bit-exact regime), which equals the per-stream M=1 loop BIT-FOR-BIT at any B. M1/M2 build this
+``_chunked_qmm`` into the packed steppers; M0 proves it model-free.
+
 Checks (whole-model B in {1} + a RAGGED B=3 with three distinct prompt lengths → ragged offsets, the
 real serving case; these exercise BOTH halves of the hybrid end-to-end — the tiny cfg has 2 GDN + 1 GQA
 layers — plus a focused §GDN bit-exact unit):
@@ -60,6 +72,7 @@ this gate is its parity prerequisite. The default stays OFF (rule 4) until M3 fl
 from __future__ import annotations
 
 import mlx.core as mx
+import mlx.nn as nn
 
 from parity.qwen35_batched_test import _build_random_model, _cfg, _maxdiff, _wrap_batched
 from quanta.qwen35.batched_runtime import (
@@ -71,6 +84,85 @@ from quanta.qwen35.batched_runtime import (
 from quanta.qwen35.decode import _GDNLayerState
 
 LOGIT_TOL = 5e-3  # bf16: per-stream RoPE (bit-exact) + padded-SDPA tiling reorder; HARD gate is greedy tokens
+
+
+# --- §M0: packed-projection batch-M parity (the option-B foundational mechanism, model-free) ----------
+# Decisive shape = the bench's root-cause micro-test ([B,1,4096]@[4096,12288]). M0 found a sharper truth
+# than the PLAN assumed: mx.quantized_matmul is batch-M BIT-EXACT only for M<=~10 (a per-row gemv kernel);
+# at M>=12 it switches to a tiled GEMM that REORDERS the K-reduction (bf16 ~2.25/proj, LARGER than the
+# dense-bf16 bug it was meant to fix). So a *full-batch* packed loop-kill is NOT bit-exact at the B=32
+# operating point. Fix (user decision): chunk the loop-kill projections into <=8-row slices — each an
+# M<=8 quantized_matmul, the bit-exact regime — so it equals the per-stream M=1 loop bit-for-bit at ANY B.
+_M0_IN, _M0_OUT = 4096, 12288
+_M0_GS, _M0_BITS = 64, 4
+_M0_CHUNK = 8                        # loop-kill sub-batch size; M1+ chunk the batched projections by this
+
+
+def _chunked_qmm(linear, x: mx.array, chunk: int) -> mx.array:
+    """Apply ``linear`` over the leading batch in row-chunks of ``<= chunk`` and concat: ``[B,1,in] ->
+    [B,1,out]``. Each chunk is an ``M<=chunk`` matmul — the bit-exact regime of ``mx.quantized_matmul``
+    (no K-reduction reorder) — so a chunked quantized projection equals the per-stream ``M=1`` loop
+    bit-for-bit at ANY ``B``. The primitive the packed loop-kill steppers (M1/M2) build on."""
+    b = int(x.shape[0])
+    if b <= chunk:
+        return linear(x)
+    return mx.concatenate([linear(x[i:i + chunk]) for i in range(0, b, chunk)], axis=0)
+
+
+def _batchm_diff(linear, in_dims: int, B: int, seed: int, *, chunk: int | None = None) -> float:
+    """Worst per-row ``|Δ|`` between ONE forward over a ``[B,1,in]`` batch (full-batch if ``chunk`` is
+    None, else chunked) and ``B`` separate per-stream ``[1,1,in]`` (``M=1``) forwards. Zero ⇔ the matmul
+    is batch-M invariant — it does not reorder its reduction relative to the per-stream loop."""
+    mx.random.seed(seed)
+    x = mx.random.normal((B, 1, in_dims)).astype(mx.bfloat16)
+    yb = linear(x) if chunk is None else _chunked_qmm(linear, x, chunk)
+    mx.eval(yb)
+    return max(_maxdiff(yb[s:s + 1], linear(x[s:s + 1])) for s in range(B))
+
+
+def _test_m0_batchm_packed_vs_dense() -> bool:
+    """§M0 (option-B foundational proof, model-free): locks the matmul mechanism the packed loop-kill
+    rests on BEFORE the runtime is touched (rule 4 / rule 6). Builds ``nn.QuantizedLinear`` from
+    ``mx.quantize`` codes (= the artifact's packed triplet) and a dense-bf16 ``nn.Linear`` from
+    ``mx.dequantize`` of the SAME codes, so the ONLY difference between paths is the matmul kernel:
+
+      * **dense-bf16 (the bug):** bit-exact only at ``B=1`` (why the bench's B=1 was greedy-exact);
+        reorders the K-reduction for ``B>1`` (the |Δlogit|≈1.3 the bench rejected).
+      * **quantized full-batch:** bit-exact only for ``M<=~10`` (a per-row gemv kernel); SWITCHES to a
+        tiled GEMM at ``B>=12`` that reorders too. So a full-batch packed loop-kill is NOT bit-exact at
+        the ``B=32`` operating point — the PLAN's premise was too strong.
+      * **quantized CHUNKED (the fix):** chunking the batch into ``<=8`` rows keeps every matmul in the
+        bit-exact ``M<=8`` regime, so it equals the per-stream ``M=1`` loop BIT-FOR-BIT at
+        ``B∈{1,4,8,32}``. This is the mechanism M1/M2 build into the steppers.
+
+    If a future MLX shifts the gemv→gemm threshold below 8, ``chunk_exact`` AND ``full_threshold`` both
+    fail loudly — the signal to drop ``_M0_CHUNK`` (the gate self-protects the chunking decision)."""
+    mx.random.seed(153)
+    w = mx.random.normal((_M0_OUT, _M0_IN)).astype(mx.bfloat16)                  # [out,in]; in % gs == 0
+    w_q, scales, biases = mx.quantize(w, group_size=_M0_GS, bits=_M0_BITS)
+
+    ql = nn.QuantizedLinear(_M0_IN, _M0_OUT, bias=False, group_size=_M0_GS, bits=_M0_BITS)
+    ql.weight, ql.scales, ql.biases = w_q, scales, biases                       # populate from codes (= triplets)
+
+    deq = nn.Linear(_M0_IN, _M0_OUT, bias=False)
+    deq.weight = mx.dequantize(w_q, scales, biases, group_size=_M0_GS, bits=_M0_BITS)  # SAME codes, dense bf16
+
+    bs = (1, 4, 8, 32)
+    qf = {B: _batchm_diff(ql, _M0_IN, B, 400 + B) for B in bs}                   # quantized, full batch
+    qc = {B: _batchm_diff(ql, _M0_IN, B, 400 + B, chunk=_M0_CHUNK) for B in bs}  # quantized, chunked <=8
+    df = {B: _batchm_diff(deq, _M0_IN, B, 400 + B) for B in bs}                  # dense bf16, full batch
+
+    chunk_exact = all(qc[B] == 0.0 for B in bs)            # THE FIX: chunked quantized bit-exact at every B
+    full_threshold = qf[8] == 0.0 and qf[32] > 0.0         # WHY: full-batch quantized exact <=8, reorders @32
+    dense_bug = df[1] == 0.0 and df[4] > 0.0 and df[32] > 0.0   # THE BUG: dense bf16 reorders for B>1
+    ok = chunk_exact and full_threshold and dense_bug
+    qcs = " ".join(f"B{B}={qc[B]:.2e}" for B in bs)
+    qfs = " ".join(f"B{B}={qf[B]:.2e}" for B in bs)
+    dfs = " ".join(f"B{B}={df[B]:.2e}" for B in bs)
+    print(f"  [{'OK' if ok else 'FAIL'}] §M0 batch-M: chunked-{_M0_CHUNK} quantized BIT-EXACT [{qcs}] "
+          f"(fix={chunk_exact}) | full-batch quantized [{qfs}] (reorders@>=12={full_threshold}) | "
+          f"dense-bf16 [{dfs}] (bug@B>1={dense_bug})")
+    return ok
 
 
 def _run(bm: Qwen35BatchedResidentModel, prompts: list[list[int]], n_decode: int,
@@ -236,6 +328,7 @@ def run() -> None:
     bm = _wrap_batched(model, max_batch=8)
     ok = True
     print("\n=== Qwen3.5 #153 hybrid loop-kill parity (loop-kill ON == per-stream loop; tiny, model-free) ===")
+    ok &= _test_m0_batchm_packed_vs_dense()
     ok &= _test_path_exercised(bm)
     ok &= _test_b1_loopkill(bm)
     ok &= _test_ragged_loopkill(bm)
