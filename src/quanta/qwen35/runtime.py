@@ -187,10 +187,16 @@ class Qwen35ResidentModel:
     Built one layer at a time (materialize, then release the artifact's shard handles) for bounded load
     residency. ``n_layers`` builds a prefix for validation. ``__call__`` matches the spec/decode/generate
     contract the sibling stacks use.
-    """
+
+    ``packed=True`` (default; #153 option B) holds each mixer projection as a packed
+    ``nn.QuantizedLinear`` (``mx.quantized_matmul``) — batch-M bit-exact and memory-lean (the int4/int8
+    codes, never a dequantized bf16 weight). It is the SAME quantized weights the ``packed=False`` path
+    dequantizes to bf16, so the two are greedy-exact (gated in ``parity/qwen35_forward_test.py``);
+    ``packed=False`` is kept as the bf16 parity reference / fallback. Packed is the prerequisite for the
+    chunked batched loop-kill (``Qwen35BatchedResidentModel``)."""
 
     def __init__(self, art_dir: str | Path, *, n_layers: int | None = None,
-                 packed: bool = False) -> None:
+                 packed: bool = True) -> None:
         self.art = Qwen35Artifact(art_dir)
         self.cfg = self.art.cfg
         self.packed = packed     # #153 option B: hold mixer projections packed (mx.quantized_matmul)

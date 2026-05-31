@@ -33,6 +33,7 @@ heavy invocation, NOT run here:
 from __future__ import annotations
 
 import mlx.core as mx
+import mlx.nn as nn
 
 from quanta.qwen35.attention import KVCache, Qwen35Attention
 from quanta.qwen35.config import Qwen35Config
@@ -266,6 +267,51 @@ def _model_parity(cfg: Qwen35Config) -> tuple[bool, bool, float, bool, float]:
         _rel(logits_dec, logits_pf)
 
 
+# --- packed (mx.quantized_matmul) == bf16-dequant forward (option-B M3) ------------------------
+_PACK_GS, _PACK_BITS = 32, 4   # tiny-cfg mixer projection in-dims are all 32 → one affine group at g32
+
+
+def _packed_forward_parity(cfg: Qwen35Config) -> tuple[bool, float]:
+    """M3 packed-vs-bf16 forward gate: the packed runtime (mixer projections held as
+    ``nn.QuantizedLinear`` → ``mx.quantized_matmul``) == the bf16 reference (the SAME codes
+    dequantized to a dense ``nn.Linear``), **GREEDY-EXACT**.
+
+    Mirrors ``Qwen35ResidentModel(packed=True)`` vs ``(packed=False)``, which dequantize the IDENTICAL
+    artifact codes — so the ONLY difference is the matmul kernel (fused-quantized vs
+    dequant-then-dense), an argmax-stable ULP, NOT a quantization change (both carry the same quant).
+    The real-model teacher-forced ppl is the deferred arbiter, but it cannot DISTINGUISH the two (same
+    quantized weights ⇒ same ppl), so greedy-exact here is the model-free graduation gate for
+    ``packed=True`` default. Builds two identical-seed models → identical weights → identical
+    ``mx.quantize`` codes; one runs them dequantized (bf16), the other packed."""
+    mx.random.seed(4)
+    model_bf16 = Qwen35Model(cfg)
+    _randomize_model(model_bf16)
+    mx.random.seed(4)
+    model_pk = Qwen35Model(cfg)
+    _randomize_model(model_pk)
+    for blk_b, blk_p in zip(model_bf16.layers, model_pk.layers, strict=True):
+        mb, mp = blk_b.mixer, blk_p.mixer
+        projs = (("in_proj_qkv", "in_proj_a", "in_proj_b", "in_proj_z", "out_proj")
+                 if isinstance(mb, GatedDeltaNet)
+                 else ("q_proj", "k_proj", "v_proj", "o_proj"))
+        for proj in projs:
+            lin_b = getattr(mb, proj)
+            wq, sc, bi = mx.quantize(lin_b.weight, group_size=_PACK_GS, bits=_PACK_BITS)
+            lin_b.weight = mx.dequantize(wq, sc, bi, group_size=_PACK_GS, bits=_PACK_BITS)   # bf16 path
+            lin_p = getattr(mp, proj)
+            ql = nn.QuantizedLinear(int(lin_p.weight.shape[1]), int(lin_p.weight.shape[0]),
+                                    bias=False, group_size=_PACK_GS, bits=_PACK_BITS)
+            ql.weight, ql.scales, ql.biases = wq, sc, bi                                      # packed path
+            setattr(mp, proj, ql)
+    length = 12   # M=12 crosses the gemv→GEMM threshold conceptually (tiny dims don't reorder, M0)
+    ids = mx.random.randint(0, cfg.vocab_size, (length,))
+    lg_bf16, _, _ = model_bf16(ids, use_fast=True, seq_hint=length)
+    lg_pk, _, _ = model_pk(ids, use_fast=True, seq_hint=length)
+    mx.eval(lg_bf16, lg_pk)
+    greedy = bool(mx.all(mx.argmax(lg_bf16, axis=-1) == mx.argmax(lg_pk, axis=-1)).item())
+    return greedy, _maxdiff(lg_bf16, lg_pk)
+
+
 def run() -> None:
     cfg = _tiny_cfg()
 
@@ -274,6 +320,7 @@ def run() -> None:
     attn_ok, attn_fn, attn_dec = _attn_parity(cfg)
     moe_ok, moe_d = _moe_parity(cfg)
     model_base_ok, model_naive_ok, model_naive_r, model_dec_ok, model_dec_r = _model_parity(cfg)
+    packed_ok, packed_d = _packed_forward_parity(cfg)
 
     print("\n=== Qwen3.5-397B-A17B forward parity (tiny, model-free) ===")
     print(f"GDN scan==chunk==decode (+state)     : {gdn_ok}  d_chunk={gdn_dc:.2e} d_step={gdn_ds:.2e}")
@@ -283,9 +330,11 @@ def run() -> None:
     print(f"model forward finite + shaped        : {model_base_ok}")
     print(f"model naive==optimized               : {model_naive_ok}  rel={model_naive_r:.2e}")
     print(f"model prefill==stepwise decode       : {model_dec_ok}  rel={model_dec_r:.2e}")
-    assert all([gdn_ok, gdn_mod_ok, attn_ok, moe_ok, model_base_ok, model_naive_ok, model_dec_ok])
+    print(f"packed==bf16 forward (greedy-exact)  : {packed_ok}  |Δlogit|={packed_d:.2e}")
+    assert all([gdn_ok, gdn_mod_ok, attn_ok, moe_ok, model_base_ok, model_naive_ok, model_dec_ok,
+                packed_ok])
     print("Qwen3.5 forward OK (GDN scan==chunk==decode; GQA fast==naive==decode; MoE sparse==dense;"
-          " assembled model finite + naive==opt + prefill==decode)")
+          " assembled model finite + naive==opt + prefill==decode; packed==bf16 greedy-exact)")
 
 
 if __name__ == "__main__":

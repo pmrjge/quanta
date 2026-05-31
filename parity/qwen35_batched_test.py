@@ -108,10 +108,15 @@ def _build_random_model(cfg: Qwen35Config, seed: int = 0) -> Qwen35Model:
     return model
 
 
-def _wrap_batched(model: Qwen35Model, *, max_batch: int = 8) -> Qwen35BatchedResidentModel:
+def _wrap_batched(model: Qwen35Model, *, max_batch: int = 8,
+                  packed: bool = False) -> Qwen35BatchedResidentModel:
     """Wrap a tiny model into the batched runtime contract WITHOUT loading any artifact (the
     test's whole point is to be model-free). Reuses ``from_inner`` so the batched step machinery
-    is exactly the production code path."""
+    is exactly the production code path.
+
+    ``packed`` declares whether ``model``'s mixer projections are held packed (``nn.QuantizedLinear``)
+    — it must be ``True`` to drive the #153 loop-kill (``loopkill ⇒ packed``). This per-stream
+    regression leaves it ``False`` (bf16 layers); the loopkill gate packs its layers and passes True."""
     return Qwen35BatchedResidentModel.from_inner(
         layers=model.layers,
         embed_w=model.embed_tokens.weight,
@@ -119,6 +124,7 @@ def _wrap_batched(model: Qwen35Model, *, max_batch: int = 8) -> Qwen35BatchedRes
         lm_head_w=model.lm_head.weight,
         cfg=model.cfg,
         max_batch=max_batch,
+        packed=packed,
     )
 
 

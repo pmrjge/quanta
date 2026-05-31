@@ -318,13 +318,13 @@ class Qwen35BatchedResidentModel:
 
     def __init__(self, art_dir: str | Path, *, max_batch: int = 32,
                  n_layers: int | None = None, kv_quantized: bool = True,
-                 kv_group_size: int = 64) -> None:
+                 kv_group_size: int = 64, packed: bool = True) -> None:
         if max_batch < 1:
             raise ValueError(f"max_batch must be >= 1, got {max_batch}")
         # late import: the real runtime touches the artifact loader; tests that bypass artifact load
         # construct the batched model via ``from_inner`` (see below) without hitting this path.
         from quanta.qwen35.runtime import Qwen35ResidentModel
-        self._inner = Qwen35ResidentModel(art_dir, n_layers=n_layers)
+        self._inner = Qwen35ResidentModel(art_dir, n_layers=n_layers, packed=packed)
         self.max_batch = int(max_batch)
         self.cfg: Qwen35Config = self._inner.cfg
         self.num_layers: int = self._inner.num_layers
@@ -334,18 +334,25 @@ class Qwen35BatchedResidentModel:
         self.layers = self._inner.layers
         self._kv_quantized = bool(kv_quantized)
         self._kv_group_size = int(kv_group_size)
-        self._loopkill = bool(QWEN35_BATCHED_LOOPKILL_DEFAULT)   # #153 M1 GQA loop-kill (rule-4 flag)
+        self.packed = bool(packed)        # #153 option B: mixer projections held packed (loop-kill ⇒ packed)
+        self._loopkill = bool(QWEN35_BATCHED_LOOPKILL_DEFAULT)   # #153 hybrid loop-kill (rule-4 flag)
+        self._check_loopkill_requires_packed()
 
     @classmethod
     def from_inner(cls, layers, embed_w: mx.array, norm_w: mx.array, lm_head_w: mx.array,
                    cfg: Qwen35Config, *, max_batch: int = 32, kv_quantized: bool = False,
-                   kv_group_size: int = 64) -> Qwen35BatchedResidentModel:
+                   kv_group_size: int = 64, packed: bool = False) -> Qwen35BatchedResidentModel:
         """Construct from pre-built layers / weights (bypasses artifact load).
 
         Lets the parity test drive ``step_batch`` against a tiny :class:`quanta.qwen35.model.Qwen35Model`
         without loading a real checkpoint — same step machinery, model-free. ``kv_quantized`` defaults
         to ``False`` so a tiny config (head_dim < kv_group_size) does not hit the int8 KV-quant grid
-        constraint; production callers (via the ``__init__`` path) get int8 KV by default."""
+        constraint; production callers (via the ``__init__`` path) get int8 KV by default.
+
+        ``packed`` declares whether the passed ``layers`` hold their mixer projections packed
+        (``nn.QuantizedLinear``) — it must be ``True`` to enable the loop-kill (``loopkill ⇒ packed``;
+        a dense-bf16 projection reorders across batch-M). The loopkill parity gate packs its tiny
+        layers and passes ``packed=True``; the per-stream regression leaves it ``False`` (bf16)."""
         self = cls.__new__(cls)
         self._inner = None
         self.max_batch = int(max_batch)
@@ -357,8 +364,27 @@ class Qwen35BatchedResidentModel:
         self.layers = layers
         self._kv_quantized = bool(kv_quantized)
         self._kv_group_size = int(kv_group_size)
-        self._loopkill = bool(QWEN35_BATCHED_LOOPKILL_DEFAULT)   # #153 M1 GQA loop-kill (rule-4 flag)
+        self.packed = bool(packed)        # #153 option B: do the passed layers hold packed projections?
+        self._loopkill = bool(QWEN35_BATCHED_LOOPKILL_DEFAULT)   # #153 hybrid loop-kill (rule-4 flag)
+        self._check_loopkill_requires_packed()
         return self
+
+    # --- loop-kill ⇒ packed enforcement (rule 4/6) ----------------------------
+    def _check_loopkill_requires_packed(self) -> None:
+        """Fail loud if the #153 loop-kill is enabled on a non-packed (dense-bf16) runtime.
+
+        The loop-kill batches the mixer projections across all ``B`` streams; a dense-bf16 GEMM
+        reorders its accumulation across batch-M (the real-model bench caught |Δlogit|≈1.3 — see
+        ``feedback_batched_rope_bf16`` + PLAN_153 'Qwen3.6 — option B'). Only the packed runtime
+        (``mx.quantized_matmul``, chunked ≤8) is batch-M bit-exact, so the loop-kill REQUIRES packed.
+        Checked at construction AND on every :meth:`step_batch` (so a runtime ``self._loopkill`` toggle
+        cannot bypass it — rule 6: refuse to silently emit batch-M-reordered logits)."""
+        if self._loopkill and not self.packed:
+            raise ValueError(
+                "#153 loop-kill requires the packed runtime (packed=True): dense-bf16 mixer "
+                "projections reorder their accumulation across batch-M. Construct the batched runtime "
+                "with packed=True, or disable the loop-kill (QWEN35_BATCHED_LOOPKILL_DEFAULT / "
+                "self._loopkill). See PLAN_153 'Qwen3.6 — option B'.")
 
     # --- per-stream cache factory ---------------------------------------------
     def make_caches(self) -> Qwen35Cache:
@@ -449,6 +475,7 @@ class Qwen35BatchedResidentModel:
         across streams instead of the per-stream loop — greedy-token-equivalent (gated in
         ``parity/qwen35_batched_loopkill_test.py``).
         """
+        self._check_loopkill_requires_packed()   # rule 6: a runtime _loopkill toggle cannot bypass it
         if len(stream_token_ids) > self.max_batch:
             raise ValueError(f"batch {len(stream_token_ids)} exceeds max_batch {self.max_batch}")
         return batched_decode_step(self.layers, self.embed_w, self.norm_w, self.lm_head_w,

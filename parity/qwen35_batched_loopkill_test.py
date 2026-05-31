@@ -37,9 +37,12 @@ decision): run the loop-kill projections in row-CHUNKS of <=8 (each an M<=8 ``qu
 bit-exact regime), which equals the per-stream M=1 loop BIT-FOR-BIT at any B. M1/M2 build this
 ``_chunked_qmm`` into the packed steppers; M0 proves it model-free.
 
-Checks (whole-model B in {1} + a RAGGED B=3 with three distinct prompt lengths → ragged offsets, the
-real serving case; these exercise BOTH halves of the hybrid end-to-end — the tiny cfg has 2 GDN + 1 GQA
-layers — plus a focused §GDN bit-exact unit):
+Since M3 the gate **packs** its tiny model (``loopkill ⇒ packed`` — a dense-bf16 projection reorders
+across batch-M; the runtime enforces it), so every whole-model check below runs the PRODUCTION packed
+config (``nn.QuantizedLinear`` mixers); §M1/§M2 additionally force multi-chunk splitting on isolated
+packed mixers. Checks (whole-model B in {1} + a RAGGED B=3 with three distinct prompt lengths → ragged
+offsets, the real serving case; these exercise BOTH halves of the hybrid end-to-end — the tiny cfg has
+2 GDN + 1 GQA layers — plus a focused §GDN bit-exact unit):
 
   1. **B=1 loop-kill == per-stream loop** — greedy-exact over a multi-step decode; ``|Δlogit|`` tiny
      (B=1 differs only by the GQA SDPA ``mask=zeros`` vs ``mask=None``; GDN is bit-exact).
@@ -220,6 +223,25 @@ def _test_path_exercised(bm: Qwen35BatchedResidentModel) -> bool:
     return ok
 
 
+def _test_loopkill_requires_packed() -> bool:
+    """rule 4/6 enforcement: the loop-kill MUST refuse to run on a non-packed (dense-bf16) runtime — its
+    batched mixer projections would reorder across batch-M (the real-model bench's |Δlogit|≈1.3 bug).
+    A bf16 model wrapped ``packed=False``, then toggled ``_loopkill=True``, must RAISE on
+    :meth:`step_batch` — the runtime toggle cannot bypass the guard (it is re-checked every step)."""
+    cfg = _cfg()
+    model = _build_random_model(cfg, seed=5)              # bf16 — deliberately NOT packed
+    bm = _wrap_batched(model, max_batch=4, packed=False)
+    bm._loopkill = True                                   # toggle the loop-kill on the non-packed runtime
+    raised = False
+    try:
+        bm.step_batch([3], [bm.make_caches()], [0])
+    except ValueError:
+        raised = True
+    print(f"  [{'OK' if raised else 'FAIL'}] loop-kill ⇒ packed enforced (step_batch raises on a "
+          f"non-packed runtime): {raised}")
+    return raised
+
+
 def _test_b1_loopkill(bm: Qwen35BatchedResidentModel) -> bool:
     """B=1: loop-kill ON == per-stream loop OFF (greedy-exact; |Δlogit| tiny — only the SDPA mask path
     differs at B=1)."""
@@ -265,22 +287,23 @@ def _test_off_matches_single(bm: Qwen35BatchedResidentModel) -> bool:
     return ok
 
 
-GDN_TOL = 1e-4  # B>1: the fp32 projection-GEMM batch-M-dependence ([B,1,h]@W tiles over M differently
-#                 than B separate [1,1,h]@W — measured ~1e-6, propagated through the fp32 recurrence to
-#                 ~1e-7 here). A real state-gather/scatter/seed bug is O(0.1+); this margin separates the
-#                 two by ~1000×. B=1 (no concat) is a strict passthrough → bit-exact, gated == 0 below.
+GDN_TOL = 1e-4  # loose ceiling: since M3 the shared model is PACKED, so the batched recurrence is
+#                 bit-exact vs per-stream at any B (M≤chunk gemv + fixed-axis fp32 recurrence — both
+#                 batch-invariant). A real state-gather/scatter/seed bug is O(0.1+); this margin clears
+#                 the bit-exact 0.0 with ~1000× headroom (the bound was the bf16-era ~1e-7 reorder).
 
 
 def _test_gdn_loopkill(bm: Qwen35BatchedResidentModel) -> bool:
-    """§GDN (M2): the batched Gated-DeltaNet recurrence (:func:`_gdn_step_batched`) == the per-stream
+    """§GDN: the batched Gated-DeltaNet recurrence (:func:`_gdn_step_batched`) == the per-stream
     :func:`_gdn_step_through_cache`, row-for-row — both the output residual AND the committed
     ``(conv,recurrent)`` state + offset. The GDN decode has no cross-row op (conv/recurrence/both gated
     RMSNorms act per row) and no positional term (position lives in the recurrent state), so the ONLY
-    batch-size sensitivity is the projection GEMM's accumulation order: **B=1 is bit-exact** (the
-    ``b==1`` path feeds identical ``[1,1,hidden]`` shapes — a strict passthrough), and **B>1 matches at
-    fp tolerance** (``GDN_TOL``, the ~1e-7 fp32 ``[B,...]@W`` reorder — far tighter than the GQA half,
-    which additionally reorders the SDPA softmax). Greedy-token-stable (the whole-model ragged check
-    above confirms greedy agreement); this isolates the M2 unit from GQA's noise to gate it precisely.
+    batch-size sensitivity is the projection matmul's accumulation order. Since M3 the shared ``bm`` is
+    PACKED (``loopkill ⇒ packed``), so this exercises the ``b≤chunk`` full-batch passthrough (default
+    chunk 8, B≤3 → one ``m()`` call) and is **bit-exact at B=1 AND B>1** (M≤chunk ``mx.quantized_matmul``
+    is bit-exact vs ``M=1`` — M0 — and the fp32 recurrence reduces over fixed axes). Complements §M1,
+    which forces multi-chunk splitting (chunk=2). Greedy-token-stable; isolates the GDN unit from the
+    GQA SDPA softmax noise to gate it precisely.
 
     Exercises a real linear-attention block over ``B`` streams seeded with DISTINCT recurrent states
     (different numbers of prior decode steps → different ``(conv,recurrent)``), INCLUDING a fresh stream
@@ -501,14 +524,28 @@ def _test_gqa_packed_chunked() -> bool:
     return ok
 
 
+def _pack_model(model) -> None:
+    """Pack EVERY block's mixer projections (GDN ``in_proj_*``/``out_proj`` + GQA ``q/k/v/o``) to
+    ``nn.QuantizedLinear`` — the model-free analogue of ``Qwen35ResidentModel(packed=True)`` for the
+    whole tiny model. The #153 loop-kill REQUIRES packed (``loopkill ⇒ packed``: a dense-bf16 projection
+    reorders across batch-M), so the whole-model loop-kill gate runs the PRODUCTION packed config."""
+    for blk in model.layers:
+        if blk.is_linear:
+            _pack_gdn_block(blk, _PACK_GS, _PACK_BITS)
+        else:
+            _pack_gqa_block(blk, _PACK_GS, _PACK_BITS)
+
+
 def run() -> None:
     cfg = _cfg()
     model = _build_random_model(cfg, seed=1)
-    bm = _wrap_batched(model, max_batch=8)
+    _pack_model(model)                                  # loop-kill ⇒ packed (run the production config)
+    bm = _wrap_batched(model, max_batch=8, packed=True)
     ok = True
     print("\n=== Qwen3.5 #153 hybrid loop-kill parity (loop-kill ON == per-stream loop; tiny, model-free) ===")
     ok &= _test_m0_batchm_packed_vs_dense()
     ok &= _test_path_exercised(bm)
+    ok &= _test_loopkill_requires_packed()
     ok &= _test_b1_loopkill(bm)
     ok &= _test_ragged_loopkill(bm)
     ok &= _test_off_matches_single(bm)

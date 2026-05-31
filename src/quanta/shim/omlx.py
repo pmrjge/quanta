@@ -1784,9 +1784,11 @@ class Qwen35BatchedEngine(QuantaOmlxEngine):
                 "qwen3_5 artifacts are supported by this engine.")
         Qwen35BatchedResidentModel, _ = _import_qwen35_batched()
         # the inner runtime is the single-stream resident model already loaded by start(); reuse its
-        # weights via from_inner so we never double-load the artifact.
+        # weights via from_inner so we never double-load the artifact. Inherit the inner's packed-ness
+        # (#153 option B: loop-kill ⇒ packed; the inner Qwen35ResidentModel exposes ``.packed``).
         self._batched_model = Qwen35BatchedResidentModel.from_inner(
-            rt.layers, rt.embed_w, rt.norm_w, rt.lm_head_w, rt.cfg, max_batch=self.max_batch)
+            rt.layers, rt.embed_w, rt.norm_w, rt.lm_head_w, rt.cfg, max_batch=self.max_batch,
+            packed=getattr(rt, "packed", False))
         return self._batched_model
 
     # --- batched generation ---------------------------------------------------
