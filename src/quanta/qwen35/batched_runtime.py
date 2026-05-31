@@ -65,6 +65,18 @@ from quanta.qwen35.gated_deltanet import GatedDeltaNet
 # also reorders the padded SDPA). ``batch_step`` (tree-spec verify) is untouched (per-replica rollback).
 QWEN35_BATCHED_LOOPKILL_DEFAULT = False
 
+# --- #153 option-B loop-kill chunk size (the batch-M bit-exact regime; UNPAGED Qwen3.5) ------------
+# The loop-kill batches the mixer projections across all B streams. Under the packed runtime those are
+# ``mx.quantized_matmul``, which M0 (``c503657``) found is batch-M BIT-EXACT only for M≤~10 (a per-row
+# gemv kernel); at M≥12 it switches to a tiled GEMM that REORDERS the K-reduction (bf16 ~2.25/proj).
+# So the batched mixer is applied in row-chunks of ≤ this, keeping every projection matmul in the
+# bit-exact regime — equalling the per-stream M=1 loop BIT-FOR-BIT at any B (every GDN op is per-row;
+# GQA chunks the projections, the fused SDPA still spans all B). Proven model-free in
+# ``parity/qwen35_batched_loopkill_test.py`` §M0; the runtime constant IS the M0-validated chunk
+# (cross-checked == ``_M0_CHUNK`` in §M1). 8 ≤ the threshold with the widest margin from the gemv→GEMM
+# switch; if a future MLX drops the threshold below 8, §M0 fails loudly (the signal to lower this).
+QWEN35_LOOPKILL_CHUNK = 8
+
 
 def _gdn_step_through_cache(blk, lc: _GDNLayerState, x_t: mx.array) -> mx.array:
     """One linear-layer decode step for ONE stream through its recurrent layer-state.
@@ -98,7 +110,8 @@ def _gqa_step_through_cache(blk, kv: KVCache, x_t: mx.array, seq_hint: int) -> m
     return x_t + y
 
 
-def _gdn_step_batched(m: GatedDeltaNet, lcs: Sequence[_GDNLayerState], h_norm: mx.array) -> mx.array:
+def _gdn_step_batched(m: GatedDeltaNet, lcs: Sequence[_GDNLayerState], h_norm: mx.array,
+                      *, chunk: int = QWEN35_LOOPKILL_CHUNK) -> mx.array:
     """Batched Gated-DeltaNet decode step across ``B`` streams — the #153 M2 loop-kill for the
     serving decode path (the linear-attention half of the Qwen3.5 hybrid). Returns the mixer output
     ``y`` ``[B,1,hidden]`` (the caller adds the residual ``x_stacked + y``).
@@ -107,20 +120,23 @@ def _gdn_step_batched(m: GatedDeltaNet, lcs: Sequence[_GDNLayerState], h_norm: m
     ``lcs[s]`` is stream ``s``'s :class:`_GDNLayerState` for THIS layer (mutated in place). Gathers
     each stream's recurrent ``(conv_state, recurrent_state)`` into a ``[B,...]`` batch (seeding zeros
     where a stream is fresh — bit-identical to :func:`_gdn_step_through_cache`'s per-stream seed),
-    runs ONE :meth:`GatedDeltaNet.__call__` decode recurrence over all ``B`` (so ``in_proj_qkv`` /
-    ``out_proj`` / the conv weights are read ONCE for all ``B`` — the memory-bandwidth win, mirroring
-    the MoE expert-read amortization), then scatters the new ``(conv_out, rec_out)`` back into each
-    stream's state via :meth:`_GDNLayerState.commit` (advancing its offset + snapshot ring exactly as
-    the per-stream path does).
+    runs the :meth:`GatedDeltaNet.__call__` decode recurrence over all ``B`` **in row-chunks of
+    ``≤chunk``** (so each packed ``in_proj_qkv`` / ``out_proj`` matmul stays in the batch-M bit-exact
+    ``mx.quantized_matmul`` regime — M0; the weights read ``⌈B/chunk⌉×``, vs ``B``× for the per-stream
+    loop, so the bandwidth win shrinks with the chunk but the path stays correct), then scatters the
+    new ``(conv_out, rec_out)`` back into each stream's state via :meth:`_GDNLayerState.commit`
+    (advancing its offset + snapshot ring exactly as the per-stream path does).
 
     Per-row equivalent to the per-stream loop: the depthwise-conv window, the gated-delta recurrence,
     and both gated RMSNorms have NO cross-row op, and GDN carries no positional term at all (position
     lives in the recurrent state), so ragged per-stream offsets are irrelevant to its math. The ONLY
-    batch-size sensitivity is the projection GEMM's accumulation order — so row ``s`` is **bit-exact** to
-    the standalone ``B=1`` call when ``B==1`` (the ``b==1`` path feeds identical ``[1,1,hidden]`` shapes,
-    a strict passthrough) and matches at **fp tolerance** for ``B>1`` (the ~1e-7 fp32 ``[B,...]@W``
-    reorder, with NO padded-SDPA softmax reorder — tighter than the GQA half, greedy-token-stable).
-    Gated in ``parity/qwen35_batched_loopkill_test.py`` (§GDN).
+    batch-size sensitivity is the projection matmul's accumulation order — and chunking ``≤chunk`` keeps
+    every ``mx.quantized_matmul`` in the M≤chunk gemv regime that is bit-exact vs the per-stream ``M=1``
+    call (M0), with the fp32 recurrence reducing over fixed axes (batch-invariant). So under the packed
+    runtime row ``s`` is **bit-exact** to the standalone single-stream call at **any ``B``** (the M1
+    gate proves it on a packed mixer); a dequantized (``packed=False``) mixer only drifts by the
+    ~1e-7 fp32 ``[B,…]@W`` reorder at larger dims, still greedy-token-stable. Gated in
+    ``parity/qwen35_batched_loopkill_test.py`` (§GDN bf16 machinery + §M1 packed+chunked).
 
     Memory: the committed ``conv_out[s:s+1]`` / ``rec_out[s:s+1]`` are MLX slices that share the batched
     output buffer (MLX slices are views — confirmed: holding one row retains the whole ``[B,...]``
@@ -144,7 +160,25 @@ def _gdn_step_batched(m: GatedDeltaNet, lcs: Sequence[_GDNLayerState], h_norm: m
             rec_rows.append(lc.recurrent_state)
     conv = mx.concatenate(conv_rows, axis=0) if b > 1 else conv_rows[0]    # [B,K-1,conv_dim]
     rec = mx.concatenate(rec_rows, axis=0) if b > 1 else rec_rows[0]       # [B,Hv,Dk,Dv]
-    y, rec_out, conv_out = m(h_norm, state=rec, conv_state=conv)           # ONE batched recurrence
+    # Apply the recurrence in ≤chunk row-slices so the packed in/out projections stay in the batch-M
+    # bit-exact regime (M0). Every GDN op is per-row (conv window / gated-delta recurrence / both
+    # gated RMSNorms — no cross-row op, no positional term), so chunked == full-batch == per-stream
+    # bit-for-bit; chunking only bounds the projection matmul's M. (b ≤ chunk → one call, no split.)
+    if b <= chunk:
+        y, rec_out, conv_out = m(h_norm, state=rec, conv_state=conv)
+    else:
+        ys: list[mx.array] = []
+        recs: list[mx.array] = []
+        convs: list[mx.array] = []
+        for lo in range(0, b, chunk):
+            hi = min(lo + chunk, b)
+            yc, rc, cc = m(h_norm[lo:hi], state=rec[lo:hi], conv_state=conv[lo:hi])
+            ys.append(yc)
+            recs.append(rc)
+            convs.append(cc)
+        y = mx.concatenate(ys, axis=0)
+        rec_out = mx.concatenate(recs, axis=0)
+        conv_out = mx.concatenate(convs, axis=0)
     for s, lc in enumerate(lcs):
         lc.commit(conv_out[s:s + 1], rec_out[s:s + 1])                     # per-stream offset + snapshot
     return y

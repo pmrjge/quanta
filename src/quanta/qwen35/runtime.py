@@ -38,6 +38,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import mlx.core as mx
+import mlx.nn as nn
 from mlx.utils import tree_flatten
 
 from quanta.qwen35.artifact import Qwen35Artifact
@@ -45,6 +46,7 @@ from quanta.qwen35.attention import Qwen35Attention
 from quanta.qwen35.config import Qwen35Config
 from quanta.qwen35.decode import Qwen35Cache
 from quanta.qwen35.gated_deltanet import GatedDeltaNet
+from quanta.qwen35.loader import LM_PREFIX
 from quanta.qwen35.model import Qwen35Block
 
 # --- artifact -> module weight wiring ----------------------------------------
@@ -61,8 +63,50 @@ def _one_plus(w: mx.array) -> mx.array:
     return w + 1.0
 
 
-def _load_block(art: Qwen35Artifact, cfg: Qwen35Config, i: int) -> Qwen35Block:
-    """Build one runnable :class:`Qwen35Block` for layer ``i`` from the dequantized artifact tensors."""
+def _load_quant_triplet(art: Qwen35Artifact, base: str
+                        ) -> tuple[mx.array, mx.array, mx.array, int, int]:
+    """A packed affine weight's three siblings (``.weight_packed`` / ``.weight_scale`` /
+    ``.weight_bias`` — verbatim, no dequant) plus its ``(bits, group_size)`` from the manifest.
+
+    The decode width travels with the artifact (rule-6 — the baked manifest is the single source of
+    truth, never a hardcoded width that could silently mis-decode a differently-baked artifact).
+    Mirrors :func:`quanta.internlm2.runtime._load_quant_triplet`. Fail loud if ``base`` is not an
+    ``affine_packed`` weight (a dense projection has no packed codes to hold)."""
+    meta = art.manifest.get(base)
+    if meta is None or meta.get("format") != "affine_packed":
+        raise ValueError(f"{base}: not an affine_packed weight (format="
+                         f"{None if meta is None else meta.get('format')!r}); cannot pack (rule-6)")
+    return (art.raw(base),
+            art.get(base + ".weight_scale"),
+            art.get(base + ".weight_bias"),
+            int(meta["bits"]), int(meta["group_size"]))
+
+
+def _packed_linear(art: Qwen35Artifact, base: str, ref: nn.Linear) -> nn.QuantizedLinear:
+    """Build a bias-free :class:`mlx.nn.QuantizedLinear` from the artifact's packed triplet at
+    ``base``, sized to the freshly-built ``ref`` ``nn.Linear`` it replaces (its ``[out, in]`` shape).
+
+    ``nn.QuantizedLinear.__call__`` dispatches to ``mx.quantized_matmul(transpose=True)`` (rule 1 /
+    rule 2), so swapping it in for the ``nn.Linear`` leaves the mixer forward (``self.in_proj_qkv(x)``
+    / ``self.q_proj(x)`` …) UNCHANGED while holding the weight PACKED — and the matmul is batch-M
+    bit-exact for the M=1 per-stream loop AND (chunked ≤8) for the batched loop-kill (#153 option B,
+    M0 ``c503657``: ``mx.quantized_matmul`` is a per-row gemv bit-exact only for M≤~10)."""
+    out_dims, in_dims = int(ref.weight.shape[0]), int(ref.weight.shape[1])
+    packed, scale, wbias, bits, gs = _load_quant_triplet(art, base)
+    ql = nn.QuantizedLinear(in_dims, out_dims, bias=False, group_size=gs, bits=bits)
+    ql.weight, ql.scales, ql.biases = packed, scale, wbias
+    return ql
+
+
+def _load_block(art: Qwen35Artifact, cfg: Qwen35Config, i: int, *, packed: bool = False) -> Qwen35Block:
+    """Build one runnable :class:`Qwen35Block` for layer ``i`` from the artifact tensors.
+
+    ``packed=False`` dequantizes the mixer projections to dense bf16 ``nn.Linear`` (the parity
+    reference / fallback). ``packed=True`` (#153 option B) holds each mixer projection as a packed
+    ``nn.QuantizedLinear`` (``mx.quantized_matmul``) instead — batch-M bit-exact, the prerequisite for
+    the chunked batched loop-kill (a dense-bf16 GEMM reorders its accumulation across batch-M; see
+    ``feedback_batched_rope_bf16`` + M0). MoE / norms / conv / ``A_log`` / ``dt_bias`` are identical
+    either way. **M1 converts the GDN (linear-attn) projections; the GQA half follows in M2.**"""
     blk = Qwen35Block(cfg, i)
     norms = art.block_norms(i)
     blk.input_layernorm.weight = _one_plus(norms["input_layernorm"])          # (1+w) convention
@@ -71,17 +115,35 @@ def _load_block(art: Qwen35Artifact, cfg: Qwen35Config, i: int) -> Qwen35Block:
     m = blk.mixer
     if cfg.is_linear_attention(i):
         assert isinstance(m, GatedDeltaNet)
-        la = art.linear_attn(i)
-        for proj in _LINEAR_PROJS:
-            getattr(m, proj).weight = la[f"{proj}.weight"]
-        m.conv_weight = la["conv1d.weight"]
-        # depthwise conv may ship as [C,1,K]; the mixer expects [C,K] (loader squeezes it)
-        if m.conv_weight.ndim == 3:
-            m.conv_weight = m.conv_weight.reshape(m.conv_weight.shape[0], m.conv_weight.shape[-1])
-        m.conv_bias = la.get("conv1d.bias", m.conv_bias)
-        m.A_log = la["A_log"]
-        m.dt_bias = la["dt_bias"]
-        m.norm = la["norm.weight"]
+        if packed:
+            # #153 option B (M1): the five GDN projections stay PACKED (nn.QuantizedLinear →
+            # mx.quantized_matmul), never dequantized — batch-M bit-exact. The dense control tensors
+            # (conv / A_log / dt_bias / per-head norm) read bf16 exactly as the dequant path does
+            # (read() casts dense→bf16; the mixer casts A_log/norm back to fp32 at use — same as
+            # linear_attn()). conv1d is a per-row windowed sum, not a batch-M GEMM, so bf16 is fine.
+            p = f"{LM_PREFIX}layers.{i}.linear_attn."
+            for proj in _LINEAR_PROJS:
+                setattr(m, proj, _packed_linear(art, p + proj, getattr(m, proj)))
+            m.conv_weight = art.read(p + "conv1d.weight")
+            if m.conv_weight.ndim == 3:  # [C,1,K] → [C,K]
+                m.conv_weight = m.conv_weight.reshape(m.conv_weight.shape[0], m.conv_weight.shape[-1])
+            if art.has(p + "conv1d.bias"):
+                m.conv_bias = art.read(p + "conv1d.bias")
+            m.A_log = art.read(p + "A_log")
+            m.dt_bias = art.read(p + "dt_bias")
+            m.norm = art.read(p + "norm.weight")
+        else:
+            la = art.linear_attn(i)
+            for proj in _LINEAR_PROJS:
+                getattr(m, proj).weight = la[f"{proj}.weight"]
+            m.conv_weight = la["conv1d.weight"]
+            # depthwise conv may ship as [C,1,K]; the mixer expects [C,K] (loader squeezes it)
+            if m.conv_weight.ndim == 3:
+                m.conv_weight = m.conv_weight.reshape(m.conv_weight.shape[0], m.conv_weight.shape[-1])
+            m.conv_bias = la.get("conv1d.bias", m.conv_bias)
+            m.A_log = la["A_log"]
+            m.dt_bias = la["dt_bias"]
+            m.norm = la["norm.weight"]
     else:
         assert isinstance(m, Qwen35Attention)
         fa = art.full_attn(i)
@@ -117,13 +179,15 @@ class Qwen35ResidentModel:
     contract the sibling stacks use.
     """
 
-    def __init__(self, art_dir: str | Path, *, n_layers: int | None = None) -> None:
+    def __init__(self, art_dir: str | Path, *, n_layers: int | None = None,
+                 packed: bool = False) -> None:
         self.art = Qwen35Artifact(art_dir)
         self.cfg = self.art.cfg
+        self.packed = packed     # #153 option B: hold mixer projections packed (mx.quantized_matmul)
         n = self.cfg.num_hidden_layers if n_layers is None else n_layers
         self.layers: list[Qwen35Block] = []
         for i in range(n):  # rule-8: materialize one layer's params, eval, then drop source shards
-            blk = _load_block(self.art, self.cfg, i)
+            blk = _load_block(self.art, self.cfg, i, packed=packed)
             mx.eval(_block_arrays(blk))
             self.layers.append(blk)
             self.art.release()

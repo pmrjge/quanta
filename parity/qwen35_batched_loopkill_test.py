@@ -77,11 +77,13 @@ import mlx.nn as nn
 from parity.qwen35_batched_test import _build_random_model, _cfg, _maxdiff, _wrap_batched
 from quanta.qwen35.batched_runtime import (
     QWEN35_BATCHED_LOOPKILL_DEFAULT,
+    QWEN35_LOOPKILL_CHUNK,
     Qwen35BatchedResidentModel,
     _gdn_step_batched,
     _gdn_step_through_cache,
 )
 from quanta.qwen35.decode import _GDNLayerState
+from quanta.qwen35.gated_deltanet import GatedDeltaNet
 
 LOGIT_TOL = 5e-3  # bf16: per-stream RoPE (bit-exact) + padded-SDPA tiling reorder; HARD gate is greedy tokens
 
@@ -322,6 +324,86 @@ def _test_gdn_loopkill(bm: Qwen35BatchedResidentModel) -> bool:
     return ok
 
 
+# --- §M1: packed + chunked GDN mixer (option-B M1) ------------------------------------------------
+_PACK_GS, _PACK_BITS = 32, 4   # tiny-cfg GDN proj in-dims are all 32 → one affine group at g32
+
+
+def _pack_gdn_block(blk, group_size: int, bits: int) -> None:
+    """Swap a GDN block's five ``nn.Linear`` projections for ``nn.QuantizedLinear`` built from
+    ``mx.quantize`` of the SAME weights — the model-free analogue of
+    ``runtime._load_block(packed=True)`` for the GDN half (``runtime._packed_linear`` does the same
+    from the artifact's packed triplet). Mutates the block in place; ``group_size`` must divide each
+    projection's in-dim."""
+    m = blk.mixer
+    assert isinstance(m, GatedDeltaNet)
+    for proj in ("in_proj_qkv", "in_proj_a", "in_proj_b", "in_proj_z", "out_proj"):
+        lin = getattr(m, proj)
+        out_dims, in_dims = int(lin.weight.shape[0]), int(lin.weight.shape[1])
+        wq, sc, bi = mx.quantize(lin.weight, group_size=group_size, bits=bits)
+        ql = nn.QuantizedLinear(in_dims, out_dims, bias=False, group_size=group_size, bits=bits)
+        ql.weight, ql.scales, ql.biases = wq, sc, bi
+        setattr(m, proj, ql)
+
+
+def _test_gdn_packed_chunked() -> bool:
+    """§M1: PACKED (``nn.QuantizedLinear``) GDN with the CHUNKED loop-kill == the packed GDN per-stream
+    loop, **BIT-EXACT at B=1 AND B>1** — the M1 deliverable.
+
+    The packed runtime (``_load_block(packed=True)``) holds the GDN projections as
+    ``mx.quantized_matmul`` (batch-M bit-exact, rule 1) and the batched stepper applies the recurrence
+    in ``≤chunk`` row-slices (so each projection matmul stays in the M0-proven bit-exact regime). Here
+    the chunk is forced to **2** so the ragged ``B=3`` spans TWO chunks — exercising the
+    chunk-boundary / concat / per-stream-``commit`` machinery, not just the ``b≤chunk`` passthrough.
+
+    Because GDN has no cross-row op (conv window / gated-delta recurrence / both gated RMSNorms all act
+    per row, no positional term) AND each chunked ``mx.quantized_matmul`` is the per-row gemv that is
+    bit-exact vs ``M=1`` (M0 ``c503657``: bit-exact for M≤~10), the chunked packed loop-kill equals the
+    per-stream loop **bit-for-bit at every B** — no fp slack (the bf16 ~1e-7 projection-reorder
+    machinery is what §GDN covers; this is the *packed-runtime* equivalence the real-model bench needs).
+    Cross-checks the production ``QWEN35_LOOPKILL_CHUNK == _M0_CHUNK`` so the runtime chunk IS the
+    M0-validated size (rule 6). Builds its OWN fresh model + packs the first GDN block in place — the
+    shared ``bm`` (and every other test) is untouched."""
+    assert QWEN35_LOOPKILL_CHUNK == _M0_CHUNK, (
+        f"runtime chunk {QWEN35_LOOPKILL_CHUNK} != M0-validated {_M0_CHUNK} (rule 6: keep them linked)")
+    cfg = _cfg()
+    model = _build_random_model(cfg, seed=11)
+    lin_idx = next(i for i, blk in enumerate(model.layers) if blk.is_linear)
+    blk = model.layers[lin_idx]
+    _pack_gdn_block(blk, _PACK_GS, _PACK_BITS)                 # GDN projections → nn.QuantizedLinear
+    hidden = cfg.hidden_size
+    res: dict[int, tuple[float, float, bool]] = {}
+    for seeds in ([3], [2, 0, 4]):                            # B=1 (seeded) and ragged B=3 (incl fresh)
+        b = len(seeds)
+        mx.random.seed(303 + b)
+        lcs_ref = [_GDNLayerState() for _ in range(b)]
+        for s in range(b):
+            for _ in range(seeds[s]):
+                _gdn_step_through_cache(blk, lcs_ref[s], mx.random.normal((1, 1, hidden)).astype(mx.bfloat16))
+        lcs_test = [lcs_ref[s]._copy() for s in range(b)]
+        xs = [mx.random.normal((1, 1, hidden)).astype(mx.bfloat16) for _ in range(b)]
+        out_ref = [_gdn_step_through_cache(blk, lcs_ref[s], xs[s]) for s in range(b)]      # packed M=1 loop
+        x_stacked = mx.concatenate(xs, axis=0) if b > 1 else xs[0]
+        h_norm = blk.input_layernorm(x_stacked)
+        y = _gdn_step_batched(blk.mixer, lcs_test, h_norm, chunk=2)      # packed, CHUNK=2 → 2 chunks @B=3
+        out_test = x_stacked + y
+        mx.eval(out_ref, out_test, [lc.recurrent_state for lc in lcs_test],
+                [lc.conv_state for lc in lcs_test])
+        wo = max(_maxdiff(out_ref[s], out_test[s:s + 1]) for s in range(b))
+        ws = max(max(_maxdiff(lcs_ref[s].recurrent_state, lcs_test[s].recurrent_state),
+                     _maxdiff(lcs_ref[s].conv_state, lcs_test[s].conv_state)) for s in range(b))
+        oo = all(lcs_ref[s].offset == lcs_test[s].offset == seeds[s] + 1 for s in range(b))
+        res[b] = (wo, ws, oo)
+    (o1, s1, f1), (on, sn, fn) = res[1], res[3]
+    b1_exact = o1 == 0.0 and s1 == 0.0 and f1                # B=1: b≤chunk passthrough, strict bit-exact
+    bn_exact = on == 0.0 and sn == 0.0 and fn                # B=3: chunked packed gemv == M=1 (M0)
+    ok = b1_exact and bn_exact
+    print(f"  [{'OK' if ok else 'FAIL'}] §M1 packed+chunked GDN (chunk=2, gs{_PACK_GS}/int{_PACK_BITS}) "
+          f"== per-stream  B=1 bit-exact={b1_exact} (out|Δ|={o1:.0e} state|Δ|={s1:.0e})  "
+          f"B=3 bit-exact={bn_exact} (out|Δ|={on:.0e} state|Δ|={sn:.0e}) offs_ok={f1 and fn}  "
+          f"prod_chunk={QWEN35_LOOPKILL_CHUNK}")
+    return ok
+
+
 def run() -> None:
     cfg = _cfg()
     model = _build_random_model(cfg, seed=1)
@@ -334,6 +416,7 @@ def run() -> None:
     ok &= _test_ragged_loopkill(bm)
     ok &= _test_off_matches_single(bm)
     ok &= _test_gdn_loopkill(bm)
+    ok &= _test_gdn_packed_chunked()
     print("PASS" if ok else "FAIL")
     assert ok
 
