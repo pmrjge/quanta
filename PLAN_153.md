@@ -11,7 +11,9 @@
 > (`parity/qwen35_batched_bench.py` on the Qwen3.6-35B-A3B int4-g64 bake) is **greedy-exact loop==loopkill
 > at every B AND a win — 1.63× @ B=32** (1.20/1.45/1.67× @ B=4/8/16; the dequant path diverged at B≥2,
 > |Δlogit|≈1.3). `QWEN35_BATCHED_LOOPKILL_DEFAULT` + packed both GRADUATED ON; `loopkill ⇒ packed`
-> enforced. See "Qwen3.6 — option B".
+> enforced. See "Qwen3.6 — option B". **Follow-up task (NOT started):** the option-B bench peaks at
+> **79.3 GiB for a 21 GiB int4 artifact** because the routed experts are still **dequantized to bf16** —
+> keep them packed + `gather_qmm` (~79 → ~30 GiB). Full handover: **`PLAN_qwen35_experts.md`**.
 
 ---
 
