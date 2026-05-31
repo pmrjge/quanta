@@ -75,12 +75,14 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from parity.qwen35_batched_test import _build_random_model, _cfg, _maxdiff, _wrap_batched
+from quanta.qwen35.attention import KVCache, Qwen35Attention
 from quanta.qwen35.batched_runtime import (
     QWEN35_BATCHED_LOOPKILL_DEFAULT,
     QWEN35_LOOPKILL_CHUNK,
     Qwen35BatchedResidentModel,
     _gdn_step_batched,
     _gdn_step_through_cache,
+    _gqa_step_through_cache,
 )
 from quanta.qwen35.decode import _GDNLayerState
 from quanta.qwen35.gated_deltanet import GatedDeltaNet
@@ -404,6 +406,101 @@ def _test_gdn_packed_chunked() -> bool:
     return ok
 
 
+# --- §M2: packed + chunked GQA mixer (option-B M2) ------------------------------------------------
+GQA_STEP_TOL = 1e-3  # B>1 full-step: q/k/v/o projections are bit-exact once packed+chunked, so the ONLY
+#                      divergence is the fused padded-SDPA softmax reorder (~1e-6 single layer); a real
+#                      wiring bug is O(0.1+). B=1 (single-stream padded SDPA == mask=None) is ~bit-exact.
+
+
+def _pack_gqa_block(blk, group_size: int, bits: int) -> None:
+    """Swap a GQA block's four q/k/v/o ``nn.Linear`` projections for ``nn.QuantizedLinear`` built from
+    ``mx.quantize`` of the SAME weights — the model-free analogue of ``runtime._load_block(packed=True)``
+    for the GQA half. Mutates the block in place; ``group_size`` must divide each projection's in-dim."""
+    m = blk.mixer
+    assert isinstance(m, Qwen35Attention)
+    for proj in ("q_proj", "k_proj", "v_proj", "o_proj"):
+        lin = getattr(m, proj)
+        out_dims, in_dims = int(lin.weight.shape[0]), int(lin.weight.shape[1])
+        wq, sc, bi = mx.quantize(lin.weight, group_size=group_size, bits=bits)
+        ql = nn.QuantizedLinear(in_dims, out_dims, bias=False, group_size=group_size, bits=bits)
+        ql.weight, ql.scales, ql.biases = wq, sc, bi
+        setattr(m, proj, ql)
+
+
+def _test_gqa_packed_chunked() -> bool:
+    """§M2: PACKED (``nn.QuantizedLinear``) GQA with the CHUNKED loop-kill == the packed GQA per-stream
+    loop — the M2 deliverable. Two parts on a fresh model whose single full-attn block is packed
+    (chunk forced to **2** so B=3 spans two chunks, exercising the boundary/concat machinery):
+
+    * **A — projection chunking BIT-EXACT.** ``_project_chunked(x, 2)`` (q/k/v/gate) == per-stream
+      ``_project(x[s:s+1])`` and chunked ``o_proj`` == per-stream ``o_proj``, all **== 0.0**. This is
+      the core M2 change: each packed ``mx.quantized_matmul`` stays in the M≤chunk gemv regime that M0
+      proved bit-exact vs ``M=1`` — so the batched projection equals the per-stream loop bit-for-bit.
+    * **B — full decode step.** Chunked :meth:`decode_step_batched` vs per-stream
+      :func:`_gqa_step_through_cache` over ragged seeded KV caches: **B=1 bit-exact** (single-stream
+      padded SDPA == ``mask=None``) and **B>1 within ``GQA_STEP_TOL``** (the q/k/v/o projections are now
+      bit-exact, so the lone divergence is the fused padded-SDPA softmax reduction order — argmax-stable
+      ULP, the equivalence the project accepts for batched/tiled SDPA — see ``feedback_batched_rope_bf16``
+      + the InternLM2.5 batched-attention gate). Builds its OWN model — the shared ``bm`` is untouched."""
+    cfg = _cfg()
+    model = _build_random_model(cfg, seed=13)
+    full_idx = next(i for i, blk in enumerate(model.layers) if not blk.is_linear)
+    blk = model.layers[full_idx]
+    _pack_gqa_block(blk, _PACK_GS, _PACK_BITS)               # q/k/v/o → nn.QuantizedLinear
+    m = blk.mixer
+    hidden = cfg.hidden_size
+
+    # --- Part A: projection chunking is bit-exact vs the per-stream M=1 loop -----------------------
+    mx.random.seed(414)
+    bp = 3
+    x = mx.random.normal((bp, 1, hidden)).astype(mx.bfloat16)
+    q_c, k_c, v_c, g_c = m._project_chunked(x, 2)            # chunked (2 chunks @B=3)
+    ref = [m._project(x[s:s + 1]) for s in range(bp)]        # per-stream M=1
+    q_r = mx.concatenate([r[0] for r in ref], axis=0)
+    k_r = mx.concatenate([r[1] for r in ref], axis=0)
+    v_r = mx.concatenate([r[2] for r in ref], axis=0)
+    g_r = mx.concatenate([r[3] for r in ref], axis=0)
+    out = mx.random.normal((bp, 1, m.nh * m.hd)).astype(mx.bfloat16)
+    o_c = mx.concatenate([m.o_proj(out[lo:lo + 2]) for lo in range(0, bp, 2)], axis=0)   # chunked
+    o_r = mx.concatenate([m.o_proj(out[s:s + 1]) for s in range(bp)], axis=0)            # per-stream
+    mx.eval(q_c, k_c, v_c, g_c, q_r, k_r, v_r, g_r, o_c, o_r)
+    proj_d = max(_maxdiff(q_c, q_r), _maxdiff(k_c, k_r), _maxdiff(v_c, v_r), _maxdiff(g_c, g_r))
+    o_d = _maxdiff(o_c, o_r)
+    proj_exact = proj_d == 0.0 and o_d == 0.0
+
+    # --- Part B: full chunked decode step == per-stream loop (B=1 bit-exact; B>1 SDPA ULP) ---------
+    res: dict[int, tuple[float, bool]] = {}
+    for seeds in ([4], [3, 0, 5]):                           # B=1 and ragged B=3 (incl a fresh stream)
+        b = len(seeds)
+        mx.random.seed(515 + b)
+        kvs_ref = [KVCache() for _ in range(b)]
+        for s in range(b):
+            for _ in range(seeds[s]):                        # grow each stream's KV to its ragged offset
+                _gqa_step_through_cache(blk, kvs_ref[s],
+                                        mx.random.normal((1, 1, hidden)).astype(mx.bfloat16), seeds[s])
+        kvs_test = [kvs_ref[s]._copy() for s in range(b)]    # byte-identical seeded state for the test path
+        xs = [mx.random.normal((1, 1, hidden)).astype(mx.bfloat16) for _ in range(b)]
+        out_ref = [_gqa_step_through_cache(blk, kvs_ref[s], xs[s], seeds[s] + 1) for s in range(b)]
+        x_stacked = mx.concatenate(xs, axis=0) if b > 1 else xs[0]
+        h_norm = blk.input_layernorm(x_stacked)
+        y = m.decode_step_batched(h_norm, kv_for_layer=kvs_test,
+                                  offsets=[seeds[s] for s in range(b)],
+                                  seq_hints=[seeds[s] + 1 for s in range(b)], chunk=2)
+        out_test = x_stacked + y
+        mx.eval(out_ref, out_test)
+        wo = max(_maxdiff(out_ref[s], out_test[s:s + 1]) for s in range(b))
+        oo = all(kvs_ref[s].offset == kvs_test[s].offset == seeds[s] + 1 for s in range(b))
+        res[b] = (wo, oo)
+    (o1, f1), (on, fn) = res[1], res[3]
+    b1_exact = o1 < 1e-5 and f1
+    bn_ulp = on < GQA_STEP_TOL and fn
+    ok = proj_exact and b1_exact and bn_ulp
+    print(f"  [{'OK' if ok else 'FAIL'}] §M2 packed+chunked GQA (chunk=2, gs{_PACK_GS}/int{_PACK_BITS}) "
+          f"== per-stream  proj bit-exact={proj_exact} (qkvg|Δ|={proj_d:.0e} o|Δ|={o_d:.0e})  "
+          f"step B=1|Δ|={o1:.2e} B=3|Δ|={on:.2e} (<{GQA_STEP_TOL:.0e}) offs_ok={f1 and fn}")
+    return ok
+
+
 def run() -> None:
     cfg = _cfg()
     model = _build_random_model(cfg, seed=1)
@@ -417,6 +514,7 @@ def run() -> None:
     ok &= _test_off_matches_single(bm)
     ok &= _test_gdn_loopkill(bm)
     ok &= _test_gdn_packed_chunked()
+    ok &= _test_gqa_packed_chunked()
     print("PASS" if ok else "FAIL")
     assert ok
 

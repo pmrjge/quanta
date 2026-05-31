@@ -256,7 +256,8 @@ def batched_decode_step(
                 kv_for_layer = [stream_caches[s][layer_i] for s in range(b)]
                 seq_hints = [stream_caches[s].yarn_seq(offsets[s] + 1, cfg) for s in range(b)]
                 y = blk.mixer.decode_step_batched(h_norm, kv_for_layer=kv_for_layer,
-                                                  offsets=list(offsets), seq_hints=seq_hints)  # [B,1,hidden]
+                                                  offsets=list(offsets), seq_hints=seq_hints,
+                                                  chunk=QWEN35_LOOPKILL_CHUNK)               # [B,1,hidden]
             stacked = x_stacked + y                                                   # [B,1,hidden]
         else:
             # 1) per-stream mixer step (proven path; rule-4 default). Bounded IO loop over the small

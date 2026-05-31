@@ -106,7 +106,8 @@ def _load_block(art: Qwen35Artifact, cfg: Qwen35Config, i: int, *, packed: bool 
     ``nn.QuantizedLinear`` (``mx.quantized_matmul``) instead — batch-M bit-exact, the prerequisite for
     the chunked batched loop-kill (a dense-bf16 GEMM reorders its accumulation across batch-M; see
     ``feedback_batched_rope_bf16`` + M0). MoE / norms / conv / ``A_log`` / ``dt_bias`` are identical
-    either way. **M1 converts the GDN (linear-attn) projections; the GQA half follows in M2.**"""
+    either way. Both mixer halves convert: GDN ``in_proj_*``/``out_proj`` (M1) and GQA ``q/k/v/o``
+    projections (M2)."""
     blk = Qwen35Block(cfg, i)
     norms = art.block_norms(i)
     blk.input_layernorm.weight = _one_plus(norms["input_layernorm"])          # (1+w) convention
@@ -146,11 +147,20 @@ def _load_block(art: Qwen35Artifact, cfg: Qwen35Config, i: int, *, packed: bool 
             m.norm = la["norm.weight"]
     else:
         assert isinstance(m, Qwen35Attention)
-        fa = art.full_attn(i)
-        for proj in _FULL_PROJS:
-            getattr(m, proj).weight = fa[f"{proj}.weight"]
-        m.q_norm = _one_plus(fa["q_norm.weight"])                             # (1+w) convention
-        m.k_norm = _one_plus(fa["k_norm.weight"])
+        if packed:
+            # #153 option B (M2): the four GQA projections stay PACKED (nn.QuantizedLinear); the
+            # per-head q/k RMSNorm weights read bf16 with the (1+w) convention (as the dequant path).
+            p = f"{LM_PREFIX}layers.{i}.self_attn."
+            for proj in _FULL_PROJS:
+                setattr(m, proj, _packed_linear(art, p + proj, getattr(m, proj)))
+            m.q_norm = _one_plus(art.read(p + "q_norm.weight"))
+            m.k_norm = _one_plus(art.read(p + "k_norm.weight"))
+        else:
+            fa = art.full_attn(i)
+            for proj in _FULL_PROJS:
+                getattr(m, proj).weight = fa[f"{proj}.weight"]
+            m.q_norm = _one_plus(fa["q_norm.weight"])                         # (1+w) convention
+            m.k_norm = _one_plus(fa["k_norm.weight"])
 
     moe = art.moe(i)
     blk.mlp.gate = moe["gate"]

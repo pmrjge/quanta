@@ -224,6 +224,29 @@ class Qwen35Attention(nn.Module):
         v = mx.transpose(v, (0, 2, 1, 3))
         return q, k, v, gate
 
+    def _project_chunked(self, x, chunk: int):
+        """:meth:`_project` applied in ``≤chunk`` row-slices (concat over the batch axis 0) so each
+        packed q/k/v projection matmul stays in the batch-M bit-exact ``mx.quantized_matmul`` regime
+        (#153 option B / M0). ``_project`` is fully per-row (projection + per-head RMSNorm + reshape +
+        transpose + gate split — no cross-row op), so this equals the full-batch ``_project``
+        bit-for-bit; chunking only bounds each matmul's M. (``b ≤ chunk`` → a single call, no split.)"""
+        b = x.shape[0]
+        if b <= chunk:
+            return self._project(x)
+        qs, ks, vs, gs = [], [], [], []
+        for lo in range(0, b, chunk):
+            q_c, k_c, v_c, g_c = self._project(x[lo:lo + chunk])
+            qs.append(q_c)
+            ks.append(k_c)
+            vs.append(v_c)
+            if g_c is not None:
+                gs.append(g_c)
+        q = mx.concatenate(qs, axis=0)
+        k = mx.concatenate(ks, axis=0)
+        v = mx.concatenate(vs, axis=0)
+        gate = mx.concatenate(gs, axis=0) if gs else None
+        return q, k, v, gate
+
     def __call__(self, x, *, cache=None, use_fast=True, seq_hint=None):
         b, t, _ = x.shape
         offset = cache.offset if cache is not None else 0
@@ -253,7 +276,7 @@ class Qwen35Attention(nn.Module):
         out = out.reshape(b, t, self.nh * self.hd)
         return self.o_proj(out)
 
-    def decode_step_batched(self, x, *, kv_for_layer, offsets, seq_hints) -> mx.array:
+    def decode_step_batched(self, x, *, kv_for_layer, offsets, seq_hints, chunk: int) -> mx.array:
         """One batched ``B``-stream single-token decode through ``B`` *ragged* per-stream KV caches —
         the #153 loop-kill for the serving decode path (the GQA half of the Qwen3.5 hybrid).
 
@@ -265,9 +288,11 @@ class Qwen35Attention(nn.Module):
         ``[B, 1, hidden]`` (the per-head output gate already applied) — the same residual ``y`` the
         per-stream :meth:`__call__` (``use_fast=True``) returns for each stream.
 
-        Batches the four big projections (q/k/v/o) across the ``B`` streams so each projection weight
-        is read ONCE for all ``B`` (the memory-bandwidth win, mirroring the MoE expert-read
-        amortization), then:
+        Batches the four big projections (q/k/v/o) across the ``B`` streams — applied in row-chunks of
+        ``≤chunk`` (#153 option B / M0): each packed ``mx.quantized_matmul`` stays in the batch-M
+        bit-exact gemv regime (M≤~10), so the chunked projection equals the per-stream ``M=1`` loop
+        bit-for-bit (the weights read ``⌈B/chunk⌉×``, vs ``B``× for the per-stream loop — the bandwidth
+        win shrinks with the chunk but the path stays correct), then:
 
         * **per-stream RoPE** — looped, NOT a batched reimpl: each stream rotates with its OWN absolute
           offset AND its own YaRN ``inv_freq`` (the dynamic factor differs per stream once any stream
@@ -282,9 +307,10 @@ class Qwen35Attention(nn.Module):
           InternLM2.5 / Nemotron use.
 
         Row ``s`` of the result equals :meth:`__call__` on stream ``s`` (at its own offset/seq_hint,
-        ``use_fast=True``) against its own cache, up to the padded-SDPA reduction-order ULPs — the
-        greedy-token-stable equivalence the project accepts for batched/tiled paths. Gated in
-        ``parity/qwen35_batched_loopkill_test.py``.
+        ``use_fast=True``) against its own cache: the q/k/v/o projections are **bit-exact** once
+        packed + chunked (M0) and the per-stream RoPE is bit-identical, so the ONLY divergence is the
+        fused padded-SDPA reduction-order ULP — the greedy-token-stable equivalence the project accepts
+        for batched/tiled paths. Gated in ``parity/qwen35_batched_loopkill_test.py`` (§M2).
         """
         from quanta.modeling.batched_attention import batched_decode_attention_kv
 
@@ -295,7 +321,7 @@ class Qwen35Attention(nn.Module):
             raise ValueError(
                 f"decode_step_batched: B mismatch x={b} kv={len(kv_for_layer)} "
                 f"offsets={len(offsets)} seq_hints={len(seq_hints)}")
-        q, k, v, gate = self._project(x)            # q [B,nh,1,hd]; k/v [B,n_kv,1,hd]; gate [B,1,nh,hd]|None
+        q, k, v, gate = self._project_chunked(x, chunk)  # chunked: each packed proj M≤chunk (bit-exact, M0)
         # per-stream RoPE: loop the exact mx.fast.rope kernel — offset AND YaRN inv_freq differ per
         # stream (bf16-drift trap: never a batched reimpl). Bit-identical per row to __call__.
         q_rows, k_rows = [], []
@@ -314,4 +340,8 @@ class Qwen35Attention(nn.Module):
         if gate is not None:
             out = out * gate.astype(out.dtype)                         # fused per-head output gate
         out = out.reshape(b, t, self.nh * self.hd)
-        return self.o_proj(out)
+        # o-projection in the SAME ≤chunk row-slices (bit-exact regime); the fused SDPA above is the
+        # only op that spans all B (its softmax reorder is the lone greedy-token-stable ULP).
+        if b <= chunk:
+            return self.o_proj(out)
+        return mx.concatenate([self.o_proj(out[lo:lo + chunk]) for lo in range(0, b, chunk)], axis=0)
