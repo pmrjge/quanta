@@ -58,12 +58,17 @@ from quanta.qwen35.gated_deltanet import GatedDeltaNet
 #     batched recurrence, scatter+commit back per-stream via :func:`_gdn_step_batched` (M2, the bigger
 #     lever: 45 of 60 layers are GDN).
 # This is the #18-style loop-kill brought to the Qwen prod path, but UNPAGED (Qwen serving forces
-# ``paged_kv=False``) so it cannot reuse the shared ``PAGED_KV_BATCHED_DEFAULT``. Defaults OFF (rule 4:
-# naive per-stream path until parity-proven); M1+M2 land it behind this flag, M3 flips it ON after the
-# real-model B-sweep. Gated vs the per-stream loop in ``parity/qwen35_batched_loopkill_test.py``: GDN is
-# bit-exact at B=1 / fp-tolerance at B>1 (the projection-GEMM batch-M reorder), GQA is greedy-exact (it
-# also reorders the padded SDPA). ``batch_step`` (tree-spec verify) is untouched (per-replica rollback).
-QWEN35_BATCHED_LOOPKILL_DEFAULT = False
+# ``paged_kv=False``) so it cannot reuse the shared ``PAGED_KV_BATCHED_DEFAULT``. **GRADUATED ON (M4)**
+# after the real-model B=32 bench (``parity/qwen35_batched_bench.py`` on the Qwen3.6-35B-A3B int4-g64
+# bake): with the option-B packed+chunked projections it is **greedy-exact loop==loopkill at every B**
+# (the dequantized path diverged at B≥2, |Δlogit|≈1.3) AND **a win — 1.63x @ B=32** (1.20/1.45/1.67x @
+# B=4/8/16; the win grows with B). The loop-kill REQUIRES packed (``loopkill ⇒ packed`` — a dense-bf16
+# projection reorders across batch-M), enforced by ``_check_loopkill_requires_packed``. Gated vs the
+# per-stream loop in ``parity/qwen35_batched_loopkill_test.py``: under the packed runtime GDN is
+# bit-exact at any B (M≤chunk gemv + fixed-axis fp32 recurrence) and GQA is greedy-exact (the q/k/v/o
+# projections bit-exact once chunked; only the fused padded SDPA softmax reorders). ``batch_step``
+# (tree-spec verify) is untouched (per-replica rollback).
+QWEN35_BATCHED_LOOPKILL_DEFAULT = True
 
 # --- #153 option-B loop-kill chunk size (the batch-M bit-exact regime; UNPAGED Qwen3.5) ------------
 # The loop-kill batches the mixer projections across all B streams. Under the packed runtime those are
@@ -341,7 +346,8 @@ class Qwen35BatchedResidentModel:
     @classmethod
     def from_inner(cls, layers, embed_w: mx.array, norm_w: mx.array, lm_head_w: mx.array,
                    cfg: Qwen35Config, *, max_batch: int = 32, kv_quantized: bool = False,
-                   kv_group_size: int = 64, packed: bool = False) -> Qwen35BatchedResidentModel:
+                   kv_group_size: int = 64, packed: bool = False,
+                   loopkill: bool | None = None) -> Qwen35BatchedResidentModel:
         """Construct from pre-built layers / weights (bypasses artifact load).
 
         Lets the parity test drive ``step_batch`` against a tiny :class:`quanta.qwen35.model.Qwen35Model`
@@ -350,9 +356,14 @@ class Qwen35BatchedResidentModel:
         constraint; production callers (via the ``__init__`` path) get int8 KV by default.
 
         ``packed`` declares whether the passed ``layers`` hold their mixer projections packed
-        (``nn.QuantizedLinear``) — it must be ``True`` to enable the loop-kill (``loopkill ⇒ packed``;
+        (``nn.QuantizedLinear``) — it must be ``True`` to run the loop-kill (``loopkill ⇒ packed``;
         a dense-bf16 projection reorders across batch-M). The loopkill parity gate packs its tiny
-        layers and passes ``packed=True``; the per-stream regression leaves it ``False`` (bf16)."""
+        layers and passes ``packed=True``; the per-stream regression leaves it ``False`` (bf16).
+
+        ``loopkill`` overrides the per-instance loop-kill flag: ``None`` (default) inherits the
+        graduated :data:`QWEN35_BATCHED_LOOPKILL_DEFAULT` (so the serving ``from_inner`` at
+        ``shim/omlx`` gets the loop-kill, paired with the inner's ``packed``); a bf16 test that wants
+        the per-stream path without packing passes ``loopkill=False`` (it can still construct)."""
         self = cls.__new__(cls)
         self._inner = None
         self.max_batch = int(max_batch)
@@ -365,7 +376,8 @@ class Qwen35BatchedResidentModel:
         self._kv_quantized = bool(kv_quantized)
         self._kv_group_size = int(kv_group_size)
         self.packed = bool(packed)        # #153 option B: do the passed layers hold packed projections?
-        self._loopkill = bool(QWEN35_BATCHED_LOOPKILL_DEFAULT)   # #153 hybrid loop-kill (rule-4 flag)
+        self._loopkill = (bool(QWEN35_BATCHED_LOOPKILL_DEFAULT) if loopkill is None
+                          else bool(loopkill))          # #153 hybrid loop-kill (graduated ON in M4)
         self._check_loopkill_requires_packed()
         return self
 

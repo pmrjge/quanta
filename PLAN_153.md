@@ -6,23 +6,36 @@
 > paged stepper `_PagedKVArena`, bit-exact model-free); M2 (compressed stepper) next. Multi-model
 > loop-kill (user's order nemotron→internlm2→qwen3.6): Nemotron DONE + default GRADUATED ON
 > (real-model bench +18%@B48); InternLM2.5 DONE + default GRADUATED ON (real-model bench **3.20×@B32**,
-> scoped flag); **Qwen3.6: option B IN PROGRESS — M0 ✅ `c503657`.** M1+M2 loop-kill BUILT (flag off); the real-model
-> bench BLOCKED graduation (dequantized dense-bf16 projections reorder across batch-M). M0 found option B's
-> premise too strong — `mx.quantized_matmul` is batch-M bit-exact ONLY for M≤~10, so a *full-batch* packed
-> loop-kill still reorders at B=32. **USER DECISION = chunked sub-batch of ≤8** (each chunk an M≤8
-> `quantized_matmul`, bit-exact vs per-stream at any B); M1–M4 build the chunked packed runtime. See
-> "Qwen3.6 — option B".
+> scoped flag); **Qwen3.6: option B COMPLETE — M0–M4 ✅** (`c503657`/`cf299c3`/`9350482`/`0bacba8`/M4).
+> The packed+chunked runtime fixed the dequant-bf16 batch-M reorder: the real-model B-sweep bench
+> (`parity/qwen35_batched_bench.py` on the Qwen3.6-35B-A3B int4-g64 bake) is **greedy-exact loop==loopkill
+> at every B AND a win — 1.63× @ B=32** (1.20/1.45/1.67× @ B=4/8/16; the dequant path diverged at B≥2,
+> |Δlogit|≈1.3). `QWEN35_BATCHED_LOOPKILL_DEFAULT` + packed both GRADUATED ON; `loopkill ⇒ packed`
+> enforced. See "Qwen3.6 — option B".
 
 ---
 
 ## Qwen3.6 — option B: packed-projection runtime (CURRENT ASK, B=32)
 
-**Status.** M1 (`ee305dc`) + M2 (`17c14dd`) built the hybrid loop-kill behind
-`QWEN35_BATCHED_LOOPKILL_DEFAULT=False` (batched GQA + batched Gated-DeltaNet mixer steps replacing the
-per-stream loop). The real-model bench `parity/qwen35_batched_bench.py` was meant to graduate it but
-**caught a real bug**: the loop-kill is NOT greedy-exact at B>1 on the 40-layer int4-g64 bake. The user
-chose **option B** (build the packed runtime so batched projections are bit-exact) and **re-pinned the
-operating point to B=32**.
+**Status: COMPLETE — M0–M4 ✅.** The prior session's M1 (`ee305dc`) + M2 (`17c14dd`) built the hybrid
+loop-kill behind `QWEN35_BATCHED_LOOPKILL_DEFAULT=False`; the real-model bench **caught a real bug** (the
+loop-kill was NOT greedy-exact at B>1 — dequantized dense-bf16 projections reorder across batch-M). Option
+B (this work) built the packed+chunked runtime that fixes it and graduated both defaults:
+
+- **M0 ✅ `c503657`** — chunked-≤8 `mx.quantized_matmul` is batch-M bit-exact (the mechanism).
+- **M1 ✅ `cf299c3`** — packed+chunked GDN mixer (`_load_block(packed)` + chunked `_gdn_step_batched`).
+- **M2 ✅ `9350482`** — packed+chunked GQA mixer (`_project_chunked` + chunked `o_proj`).
+- **M3 ✅ `0bacba8`** — wired `packed` through; `loopkill ⇒ packed` enforced; `qwen35_forward_test`
+  packed==bf16 greedy-exact (|Δ|=1.3e-6); **graduated `packed=True` default**.
+- **M4 ✅** — real-model B-sweep (`parity/qwen35_batched_bench.py`, Qwen3.6-35B-A3B int4-g64): **greedy-exact
+  loop==loopkill at every B AND a win — 1.63× @ B=32** (1.20/1.45/1.67× @ B=4/8/16; the win grows with B);
+  **graduated `QWEN35_BATCHED_LOOPKILL_DEFAULT=True`** (`from_inner` gained a `loopkill` override so bf16
+  per-stream tests still construct). The deliberate B=4 latency-first ORCHESTRATOR pin (`BEST_BATCH`
+  `qwen3_5`, #26) is LEFT untouched — the loop-kill helps at any B≥2; B=32 is the bench/graduation point,
+  not the serving pin.
+
+Original framing (kept for context): the user chose **option B** (build the packed runtime so batched
+projections are bit-exact) and **re-pinned the bench operating point to B=32**.
 
 ### The finding (bench on `Qwen3.6-35B-A3B-quanta_int4g64`, 40 layers = 30 GDN + 10 GQA)
 

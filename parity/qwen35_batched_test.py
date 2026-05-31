@@ -108,15 +108,17 @@ def _build_random_model(cfg: Qwen35Config, seed: int = 0) -> Qwen35Model:
     return model
 
 
-def _wrap_batched(model: Qwen35Model, *, max_batch: int = 8,
-                  packed: bool = False) -> Qwen35BatchedResidentModel:
+def _wrap_batched(model: Qwen35Model, *, max_batch: int = 8, packed: bool = False,
+                  loopkill: bool | None = None) -> Qwen35BatchedResidentModel:
     """Wrap a tiny model into the batched runtime contract WITHOUT loading any artifact (the
     test's whole point is to be model-free). Reuses ``from_inner`` so the batched step machinery
     is exactly the production code path.
 
     ``packed`` declares whether ``model``'s mixer projections are held packed (``nn.QuantizedLinear``)
-    — it must be ``True`` to drive the #153 loop-kill (``loopkill ⇒ packed``). This per-stream
-    regression leaves it ``False`` (bf16 layers); the loopkill gate packs its layers and passes True."""
+    — it must be ``True`` to run the #153 loop-kill (``loopkill ⇒ packed``). ``loopkill`` overrides the
+    instance flag (``None`` ⇒ the graduated default, now ON): a bf16 per-stream test passes
+    ``loopkill=False`` so it can construct without packing; the loopkill gate packs its layers
+    (``packed=True``) and lets the default stand."""
     return Qwen35BatchedResidentModel.from_inner(
         layers=model.layers,
         embed_w=model.embed_tokens.weight,
@@ -125,6 +127,7 @@ def _wrap_batched(model: Qwen35Model, *, max_batch: int = 8,
         cfg=model.cfg,
         max_batch=max_batch,
         packed=packed,
+        loopkill=loopkill,
     )
 
 
@@ -419,7 +422,10 @@ def _test_generate_batched_matches_single(bm: Qwen35BatchedResidentModel) -> boo
 def run() -> None:
     cfg = _cfg()
     model = _build_random_model(cfg, seed=1)
-    bm = _wrap_batched(model, max_batch=8)
+    # This gate validates the per-stream Design-A path (per-stream caches + batched MoE == single-
+    # stream) on bf16 layers; pin loopkill=False so it constructs without packing now that the
+    # loop-kill default is ON (the loop-kill path is gated separately in qwen35_batched_loopkill_test).
+    bm = _wrap_batched(model, max_batch=8, loopkill=False)
     ok = True
     print("\n=== Qwen3.5 batched (B>1) decode parity (tiny, model-free) ===")
     ok &= _test_b_eq_1_prefill_match(bm)

@@ -67,9 +67,11 @@ isolating exactly what M1 changes (the decode GQA step).
 
     uv run --with numpy python -m parity.qwen35_batched_loopkill_test
 
-The real-model B-sweep (ON vs OFF throughput + greedy-exact) lands at M4 in ``parity/qwen35_batched_bench.py``;
-this gate is its parity prerequisite. The default stays OFF (rule 4) until M3 flips
-:data:`quanta.qwen35.batched_runtime.QWEN35_BATCHED_LOOPKILL_DEFAULT` after that bench.
+The real-model B-sweep (ON vs OFF throughput + greedy-exact) ran at M4 in ``parity/qwen35_batched_bench.py``
+on the Qwen3.6-35B-A3B int4-g64 bake: greedy-exact loop==loopkill at every B AND a win — 1.63x @ B=32
+(1.20/1.45/1.67x @ B=4/8/16). :data:`quanta.qwen35.batched_runtime.QWEN35_BATCHED_LOOPKILL_DEFAULT` is
+therefore **graduated ON**; this model-free gate (its parity prerequisite) pins that default and the
+``loopkill ⇒ packed`` enforcement.
 """
 
 from __future__ import annotations
@@ -214,32 +216,45 @@ def _compare(ref_l: list[list[mx.array]], ref_t: list[list[int]],
 def _test_path_exercised(bm: Qwen35BatchedResidentModel) -> bool:
     """The tiny cfg must contain >= 1 full-attention (GQA) AND >= 1 linear-attention (GDN) layer, else a
     loop-kill branch is never hit and the gate would be vacuously green (rule 6: never report a no-op as
-    a pass). The default flag must be OFF (rule 4 — M3 flips it after the real-model bench)."""
+    a pass). The default flag is now ON (M4 graduated it after the real-model B=32 bench: greedy-exact
+    loop==loopkill, 1.63x @ B=32 — ``parity/qwen35_batched_bench.py``)."""
     n_full = sum(0 if blk.is_linear else 1 for blk in bm.layers)
     n_lin = sum(1 if blk.is_linear else 0 for blk in bm.layers)
-    ok = n_full >= 1 and n_lin >= 1 and QWEN35_BATCHED_LOOPKILL_DEFAULT is False
+    ok = n_full >= 1 and n_lin >= 1 and QWEN35_BATCHED_LOOPKILL_DEFAULT is True
     print(f"  [{'OK' if ok else 'FAIL'}] loop-kill path exercised: {n_full} full-attn + {n_lin} "
-          f"linear-attn layer(s); default flag OFF={QWEN35_BATCHED_LOOPKILL_DEFAULT is False}")
+          f"linear-attn layer(s); default flag ON={QWEN35_BATCHED_LOOPKILL_DEFAULT is True}")
     return ok
 
 
 def _test_loopkill_requires_packed() -> bool:
-    """rule 4/6 enforcement: the loop-kill MUST refuse to run on a non-packed (dense-bf16) runtime — its
-    batched mixer projections would reorder across batch-M (the real-model bench's |Δlogit|≈1.3 bug).
-    A bf16 model wrapped ``packed=False``, then toggled ``_loopkill=True``, must RAISE on
-    :meth:`step_batch` — the runtime toggle cannot bypass the guard (it is re-checked every step)."""
+    """rule 4/6 enforcement: the loop-kill MUST refuse a non-packed (dense-bf16) runtime — its batched
+    mixer projections would reorder across batch-M (the real-model bench's |Δlogit|≈1.3 bug). Now that
+    the default is ON (M4), TWO guards:
+
+    * **(a) construction** — wrapping bf16 layers ``packed=False`` at the (ON) default RAISES at
+      construction (``loopkill ⇒ packed``), so a misconfigured serving build fails before serving;
+    * **(b) step_batch** — even if a runtime is forced non-packed AFTER constructing loop-kill-off, a
+      ``_loopkill=True`` toggle is re-checked on every :meth:`step_batch` and RAISES (no silent bypass)."""
     cfg = _cfg()
     model = _build_random_model(cfg, seed=5)              # bf16 — deliberately NOT packed
-    bm = _wrap_batched(model, max_batch=4, packed=False)
-    bm._loopkill = True                                   # toggle the loop-kill on the non-packed runtime
-    raised = False
+    # (a) construction at the now-ON default with packed=False must raise
+    ctor_raised = False
+    try:
+        _wrap_batched(model, max_batch=4, packed=False)   # loopkill inherits the ON default → ⇒ packed
+    except ValueError:
+        ctor_raised = True
+    # (b) the per-step guard re-checks a runtime toggle (construct loop-kill-off, then toggle it on)
+    bm = _wrap_batched(model, max_batch=4, packed=False, loopkill=False)
+    bm._loopkill = True
+    step_raised = False
     try:
         bm.step_batch([3], [bm.make_caches()], [0])
     except ValueError:
-        raised = True
-    print(f"  [{'OK' if raised else 'FAIL'}] loop-kill ⇒ packed enforced (step_batch raises on a "
-          f"non-packed runtime): {raised}")
-    return raised
+        step_raised = True
+    ok = ctor_raised and step_raised
+    print(f"  [{'OK' if ok else 'FAIL'}] loop-kill ⇒ packed enforced: construction raises={ctor_raised} "
+          f"step_batch re-checks={step_raised}")
+    return ok
 
 
 def _test_b1_loopkill(bm: Qwen35BatchedResidentModel) -> bool:
