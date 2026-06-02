@@ -28,14 +28,17 @@ PAGED_KV_DEFAULT = True
 
 # #153: batched-paged KV decode — ONE block-table scatter + ONE gather across all B lock-step streams
 # (the paged sibling of the #18 arena loop-kill), serving the paged keepers (Nemotron, DSV4,
-# InternLM2.5). This SHARED flag now governs DSV4 ONLY and stays OFF until the DSV4 steppers are wired +
-# parity-green (rule 4): #153 M3 flips it for DSV4. The storage primitives
-# (``PagedKVCacheManager.write_*_batched`` / ``gather_*_batched``) already exist and are gated model-free
-# in ``parity/dsv4_paged_batched_test.py`` (M0); a runtime/session reads its own flag to pick the batched
-# scatter/gather over the per-stream loop once dispatched. Nemotron AND InternLM2.5 have GRADUATED to
-# their own ON defaults below — keep this shared flag OFF so flipping them does not preempt the DSV4 M3
-# regression.
-PAGED_KV_BATCHED_DEFAULT = False
+# InternLM2.5). This SHARED flag now governs DSV4 ONLY, and has GRADUATED to ON (#153 M3): the DSV4
+# steppers are wired (M1 dense / M2 compressed — latent-only batched via ``_PagedKVArena``, derived
+# ckv/ikv/ring per-stream so the boundary-snapshot lifecycle is unchanged) and parity-green model-free —
+# batched-paged == the per-stream paged loop BIT-EXACT through the real ``_DSV4BatchedSession`` decode
+# (``parity/dsv4_paged_latent_test.py`` §C), and the M0 storage primitives
+# (``PagedKVCacheManager.write_*_batched`` / ``gather_*_batched``) are gated in
+# ``parity/dsv4_paged_batched_test.py``. The real-model B-sweep bench is the deferred solo-GPU M4 (not a
+# correctness blocker; M0–M3 are model-free). Rule 4 satisfied: parity proven ⇒ default ON, one flag to
+# revert. (Nemotron AND InternLM2.5 graduated earlier via their own scoped ON defaults below, precisely
+# so flipping them did not preempt this DSV4 M3 regression.)
+PAGED_KV_BATCHED_DEFAULT = True
 
 # Nemotron-scoped #153 default: GRADUATED to ON. The loop-kill is parity-proven model-free (bit-exact,
 # ``parity/nemotron_batched_attention_test.py`` §D) AND on the real int4-g64 120B-A12B bake — greedy-exact

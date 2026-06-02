@@ -184,11 +184,14 @@ class DSV4BatchedResidentModel:
             self._arena_set = _KVArenaSet(self.num_layers, self.max_batch, group_size=gs,
                                           quantized=q, comp_specs=comp_specs)
         # #153 batched-paged KV: when serving paged caches (a paged DSV4Cache, latent in a
-        # PagedLatentCacheView), route the DENSE layers' latent update through _PagedKVArena (ONE
-        # block-table scatter + ONE gather, the paged sibling of the #18 arena loop-kill) instead of the
-        # per-stream lcs loop. OFF by default (rule 4: the proven per-stream paged loop stays the default
-        # until the path is parity-green end to end); read live from the module flag so an M3 source flip
-        # — or a per-session set — engages it. Compressed paged layers keep the per-stream loop until M2.
+        # PagedLatentCacheView), route the latent update through _PagedKVArena (ONE block-table scatter +
+        # ONE gather, the paged sibling of the #18 arena loop-kill) instead of the per-stream lcs loop —
+        # on DENSE layers (M1) AND COMPRESSED layers (M2, latent-only batched; the derived ckv/ikv/ring
+        # stay per-stream so the paged boundary-snapshot lifecycle is unchanged). GRADUATED ON by default
+        # (#153 M3: batched-paged == per-stream paged loop is bit-exact model-free through the real
+        # session decode, parity/dsv4_paged_latent_test.py §C; rule 4 — the real-model B-sweep is the
+        # deferred solo-GPU M4, not a correctness blocker). Read from the module flag at construction; a
+        # per-session set still overrides it (the gate flips ON vs OFF that way).
         from quanta.paged import PAGED_KV_BATCHED_DEFAULT
         self._paged_kv_batched = bool(PAGED_KV_BATCHED_DEFAULT)
 
@@ -506,9 +509,9 @@ class DSV4BatchedResidentModel:
         # _PagedKVArena (ONE block-table scatter + ONE gather over the shared manager) — on its DENSE
         # layers (M1) AND its COMPRESSED layers (M2, where only the LATENT is batched; the derived
         # ckv/ikv/ring stay per-stream so the paged boundary-snapshot lifecycle is unchanged). Gated on
-        # self._paged_kv_batched (OFF by default, rule 4 — the proven per-stream paged loop is the default
-        # until the path is parity-green end to end; M3 flips it). M0 proved the batched scatter is bit-
-        # identical to the per-stream write, so the latent round-trip is exact on both regimes.
+        # self._paged_kv_batched (GRADUATED ON by default since #153 M3 — bit-exact vs the per-stream
+        # paged loop, rule 4; revert via the single flag). M0 proved the batched scatter is bit-identical
+        # to the per-stream write, so the latent round-trip is exact on both regimes.
         paged_path = (self._paged_kv_batched and b > 0 and not arena_path
                       and isinstance(caches[0].layers[0], _PagedLayerCache))
         rows = ([c.row for c in caches] if arena_path

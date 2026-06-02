@@ -15,14 +15,29 @@ artifact — a job may be resident), it proves the two halves of DSV4 prefix sha
      on: the restored ring must carry the ``coff*ratio`` raw-hidden tail to pool that window. This is
      unconditional in block_size↔ratio alignment (the snapshot dodges the coupling).
 
-  B. **Engine wiring.** Drives the REAL ``_DSV4BatchedSession`` paged path (``admit`` ->
+  B. **Engine wiring (admit).** Drives the REAL ``_DSV4BatchedSession`` paged path (``admit`` ->
      ``_admit_paged`` -> ``match_prefix`` + ``lookup_at`` + ``prefill_paged`` + ``commit`` +
      ``store_at``) over a duck-typed tiny inner: request 1 prefills from scratch (== discrete one-shot
      final logits); request 2 reuses request 1's committed prefix blocks + restored derived snapshot
      and suffix-prefills (== discrete) — and the engine reports real prefix-reuse + snapshot-hit stats.
 
+  C. **Engine wiring (batched-paged DECODE — the #153 M3 loop-kill).** Drives the REAL
+     ``_DSV4BatchedSession`` *decode* loop (``step_batch`` -> ``_step_paged`` -> the runtime's
+     ``step_batch`` -> ``_decode_batched_single``'s paged path) with the batched-paged loop-kill flag
+     ON, over a ragged ``B``-stream batch that crosses block boundaries DURING decode (so the recurrent
+     boundary-snapshot fires mid-decode). It proves the loop-kill is correct two ways: every emitted
+     logit row (admit + each step, every stream) is **bit-identical** to a discrete continuous decode of
+     the same per-stream token sequence (the ground truth), AND running the SAME session with the flag
+     OFF (the proven per-stream paged loop) gives the same rows — i.e. flipping the #153 default is
+     output-inert. Both flag states run the SAME batched per-layer SDPA; they differ ONLY in how the
+     latent window is materialized (per-stream ``append_kv`` + ``_pad_stack`` vs ONE ``_PagedKVArena``
+     block-table scatter + ONE gather, which M0 proved bit-equal), so the match holds at ``max|Δ|=0``
+     even at ``B>1``. This reaches the session-level integration the stepper-only ``dsv4_paged_batched_test``
+     cannot (offset threading, the decode-time snapshot, the flag dispatch).
+
 The real-model teacher-forced-ppl parity (paged ON == OFF) is DEFERRED to a one-model-at-a-time GPU
-session (it loads the big artifact); this gate is tiny-tensors only.
+session (it loads the big artifact); this gate is tiny-tensors only. The real-model B-sweep throughput
+bench (paged batched vs the per-stream paged loop) is the #153 M4, likewise deferred to a solo GPU.
 
     uv run --with numpy python -m parity.dsv4_paged_latent_test
 """
@@ -329,6 +344,93 @@ def _run_engine(rng) -> bool:
     return good
 
 
+# ---------------------------------------------------------------------------------------------------
+# C. ENGINE WIRING — batched-paged DECODE (the #153 M3 loop-kill). Drive the REAL _DSV4BatchedSession
+#    decode loop and prove it correct two ways: (1) bit-identical to a discrete continuous decode of the
+#    same per-stream tokens (the ground truth); (2) flipping the #153 flag is output-inert (ON == OFF).
+# ---------------------------------------------------------------------------------------------------
+def _run_engine_batched(rng) -> bool:
+    cfg = _cfg((0, 4, 3))                       # dense + ratio-4(+indexer) + ratio-3 -> exercises all paths
+    inner = _FakeInner(cfg, rng)               # ONE shared inner -> identical params for ref + both sessions
+    B, block_size, n_steps = 3, 4, 6
+    # distinct ragged prompts (no cross-stream prefix dedup); lens 5/7/3 over block_size 4 cross block
+    # boundaries DURING decode, so the recurrent boundary-snapshot fires mid-decode (the M2 lifecycle).
+    prompts = [VOCAB_IDS[0:5], VOCAB_IDS[10:17], VOCAB_IDS[20:23]]
+
+    # (ref) discrete continuous greedy decode per stream -> canonical decode tokens + per-position logits.
+    ref_admit: dict[int, mx.array] = {}
+    ref_steps: dict[int, list[mx.array]] = {}
+    decode_toks: dict[int, list[int]] = {}
+    for s in range(B):
+        L = len(prompts[s])
+        cache = D.DSV4Cache(cfg.num_hidden_layers)
+        row = inner(mx.array(prompts[s]), caches=cache, offset=0)[0, -1]   # logits @ last prompt pos
+        mx.eval(row)
+        ref_admit[s] = row
+        toks: list[int] = []
+        steps: list[mx.array] = []
+        for k in range(n_steps):
+            t = int(mx.argmax(row).item())                                 # canonical greedy token t_k
+            toks.append(t)
+            row = inner(mx.array([t]), caches=cache, offset=L + k)[0, -1]   # logits @ pos L+k -> next
+            mx.eval(row)
+            steps.append(row)
+        decode_toks[s] = toks
+        ref_steps[s] = steps
+
+    # drive the REAL session with the canonical tokens, once per flag state.
+    def _drive(loopkill: bool, name: str) -> tuple[dict[int, mx.array], dict[int, list[mx.array]], int]:
+        rt = DSV4BatchedResidentModel.from_inner(inner, max_batch=B)
+        rt._paged_kv_batched = loopkill        # explicit: gate ON vs OFF regardless of the module default
+        sess = _DSV4BatchedSession(capacity=B, runtime=rt, paged_kv=True,
+                                   block_size=block_size, model_name=name)
+        admit = {s: sess.admit(s, prompts[s]) for s in range(B)}
+        stores0 = sess.get_cache_stats()["recurrent"]["snapshot_stores"]
+        steps: dict[int, list[mx.array]] = {s: [] for s in range(B)}
+        for k in range(n_steps):                                           # lock-step batched decode
+            out = sess.step_batch({s: decode_toks[s][k] for s in range(B)})
+            for s in range(B):
+                steps[s].append(out[s])
+        stores1 = sess.get_cache_stats()["recurrent"]["snapshot_stores"]
+        return admit, steps, stores1 - stores0
+
+    off_admit, off_steps, _ = _drive(False, "dsv4ref")        # per-stream paged loop (proven reference)
+    on_admit, on_steps, on_snaps = _drive(True, "dsv4kill")   # batched-paged loop-kill (#153)
+
+    # bar 1 (the M3 guarantee): loop-kill BIT-IDENTICAL to the per-stream paged loop. Both are paged and
+    # run the SAME batched SDPA; the latent IO differs only by the M0-equal scatter/gather, so flipping
+    # the #153 default is output-inert -> max|Δ|=0 even at B>1 (matches the M1/M2 stepper gates).
+    d_onoff = max(
+        max(_maxdiff(on_admit[s], off_admit[s]),
+            max(_maxdiff(on_steps[s][k], off_steps[s][k]) for k in range(n_steps)))
+        for s in range(B))
+    # bar 2 (absolute correctness): loop-kill GREEDY-EXACT vs the discrete continuous SINGLE-stream decode
+    # (the parity ground truth). The batched path reorders bf16 accumulation across the B streams vs B
+    # independent single-stream decodes, so the absolute logit drift is bf16-bound (< 1 bf16 ULP) and
+    # COMPOUNDS over depth/steps — NOT bit-exact, by design (feedback_batched_rope_bf16). The methodology
+    # arbiter for B≥2 is argmax stability: every emitted token must match the reference's (d_disc is the
+    # bf16-noise magnitude, reported for context + guarded only against a gross blowup).
+    def _am(row: mx.array) -> int:
+        return int(mx.argmax(row).item())
+
+    d_disc, argmax_mismatch = 0.0, 0
+    for s in range(B):
+        argmax_mismatch += int(_am(on_admit[s]) != _am(ref_admit[s]))
+        d_disc = max(d_disc, _maxdiff(on_admit[s], ref_admit[s]))
+        for k in range(n_steps):
+            argmax_mismatch += int(_am(on_steps[s][k]) != _am(ref_steps[s][k]))
+            d_disc = max(d_disc, _maxdiff(on_steps[s][k], ref_steps[s][k]))
+
+    onoff_ok = d_onoff == 0.0          # bit-exact: the latent IO differs only by the M0-equal scatter/gather
+    disc_ok = argmax_mismatch == 0 and d_disc < 5e-2   # greedy-exact + a (generous) gross-error guard
+    snap_ok = on_snaps > 0             # a boundary snapshot actually fired DURING decode (M2 lifecycle)
+    good = onoff_ok and disc_ok and snap_ok
+    print(f"  [{'OK' if good else 'FAIL'}] batched-paged decode: ON==OFF |Δ|={d_onoff:.2e} (bit-exact) "
+          f"ON≈discrete |Δ|={d_disc:.2e} argmax_mismatch={argmax_mismatch} "
+          f"decode_snapshots={on_snaps} (B={B} steps={n_steps})")
+    return good
+
+
 def run() -> None:
     rng = np.random.default_rng(0)
     ok = True
@@ -339,6 +441,8 @@ def run() -> None:
     ok &= _run_regime("compressed (no indexer)", 3, T=12, P=4, block_size=4, rng=rng)
     print("B. engine wiring: real _DSV4BatchedSession paged admit (req1 from-scratch, req2 reuse)")
     ok &= _run_engine(rng)
+    print("C. engine wiring: batched-paged DECODE loop-kill (#153 M3) == per-stream paged loop == discrete")
+    ok &= _run_engine_batched(rng)
     print("PASS" if ok else "FAIL")
 
 
