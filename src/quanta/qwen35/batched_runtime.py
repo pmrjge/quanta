@@ -324,7 +324,7 @@ class Qwen35BatchedResidentModel:
     def __init__(self, art_dir: str | Path, *, max_batch: int = 32,
                  n_layers: int | None = None, kv_quantized: bool = True,
                  kv_group_size: int = 64, packed: bool = True,
-                 packed_experts: bool = False) -> None:
+                 packed_experts: bool = True) -> None:
         if max_batch < 1:
             raise ValueError(f"max_batch must be >= 1, got {max_batch}")
         # late import: the real runtime touches the artifact loader; tests that bypass artifact load
@@ -342,7 +342,7 @@ class Qwen35BatchedResidentModel:
         self._kv_quantized = bool(kv_quantized)
         self._kv_group_size = int(kv_group_size)
         self.packed = bool(packed)        # #153 option B: mixer projections held packed (loop-kill ⇒ packed)
-        self.packed_experts = bool(packed_experts)   # routed experts held packed int4 (gather_qmm)
+        self.packed_experts = bool(packed_experts)   # routed experts held packed int4 (gather_qmm); default ON since M3
         self._loopkill = bool(QWEN35_BATCHED_LOOPKILL_DEFAULT)   # #153 hybrid loop-kill (rule-4 flag)
         self._check_loopkill_requires_packed()
 

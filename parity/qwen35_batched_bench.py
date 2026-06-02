@@ -55,11 +55,15 @@ stream decodes exactly WARMUP+GEN).
 
 from __future__ import annotations
 
+import gc
+import math
 import time
 
 import mlx.core as mx
 
 from quanta.qwen35.batched_runtime import Qwen35BatchedResidentModel
+from quanta.qwen35.runtime import Qwen35ResidentModel
+from quanta.qwen35.tokenizer import Qwen35Tokenizer
 
 ART = "/Users/pmrj/models/Qwen3.6-35B-A3B-quanta_int4g64"
 PROMPT_LEN = 128                  # distinct prompt tokens per stream (own GDN state + GQA KV)
@@ -191,8 +195,143 @@ def run(batch_sizes: tuple[int, ...] = BATCH_SIZES) -> None:
     print(verdict)
 
 
+# --- M3 (SOLO GPU): packed-experts (gather_qmm) real-model graduation gate ----------------------------
+# The routed-expert RESIDENT-MEMORY lever: hold the int4 experts PACKED and dispatch via mx.gather_qmm
+# instead of dequantizing them to bf16 + mx.gather_mm. They are the SAME int4 codes (only the kernel
+# differs: gather_qmm fuses the dequant; the bf16 path materializes a bf16 weight via mx.dequantize THEN
+# runs dense gather_mm), so the forward is greedy-exact and the teacher-forced ppl is unchanged — the ONLY
+# thing that moves is resident memory (the bf16-dequant path holds the experts as bf16; packed keeps them
+# int4). NB the bf16-dequant path is the LOSSIER of the two — it rounds each dequantized weight to bf16
+# before the matmul; packed keeps full precision in the fused dequant, so any tiny delta is the REFERENCE's
+# bf16 rounding, not packed drifting. This gate loads the real bake TWICE (packed_experts False, then
+# True), ONE model resident at a time (SOLO; an over-subscribed load OOM-reboots the host), and asserts
+# (a) a large resident drop, (b) greedy-exact 48-token trace, (c) teacher-forced ppl + top-1 agreement
+# unchanged on REAL prose (the CLAUDE.md arbiter — NOT synthetic ids, on which a near-uniform distribution
+# amplifies bf16 rounding into a misleading NLL swing). Both configs keep the graduated packed MIXER
+# (option B, packed=True) — ONLY packed_experts differs, isolating the routed-expert kernel.
+PPL_MAX_TOKENS = 256              # teacher-forced positions cap (the prose is shorter, so all of it is used)
+GREEDY_PROMPT_LEN = 64            # real-prose prefix that seeds the greedy trace
+GREEDY_GEN = 48                   # greedy tokens compared across the two configs (autoregressive top-1)
+
+# The repo's teacher-forced ppl fixture (mirrors parity/ppl.py) — ordinary English prose, on which a
+# coherent runtime is confident, so the packed-vs-bf16 ppl delta reflects bf16 rounding (<~1%), not a
+# quant divergence (a real bug blows ppl up by orders, like the prior project's ~165).
+PROSE = (
+    "Photosynthesis is the process by which green plants, algae, and some bacteria convert "
+    "light energy into chemical energy stored in sugars. Inside the chloroplasts, chlorophyll "
+    "absorbs sunlight, which drives the splitting of water molecules into oxygen, protons, and "
+    "electrons. The oxygen is released into the atmosphere as a byproduct, while the energy "
+    "captured is used to fix carbon dioxide from the air into glucose. This remarkable reaction "
+    "sustains nearly all life on Earth, forming the base of the food chain and regulating the "
+    "balance of oxygen and carbon dioxide in the atmosphere. Without photosynthesis, the planet "
+    "would be unable to support the diversity of organisms that depend, directly or indirectly, "
+    "on plants for food and breathable air."
+)
+
+
+def _teacher_forced(inner: Qwen35ResidentModel, ids: list[int]) -> tuple[float, float, list[int]]:
+    """(mean cross-entropy, top-1 next-token accuracy vs target, per-position argmax) over a token
+    sequence via the all-position prefill forward (``__call__`` with ``caches=None`` -> ``[1,T,vocab]``);
+    f32 for a stable ``logsumexp``. ppl = ``exp(mean ce)``. Mirrors parity/ppl.py. The per-position argmax
+    lets the gate measure packed-vs-bf16 top-1 AGREEMENT (the CLAUDE.md arbiter)."""
+    arr = mx.array(ids)
+    logits = inner(arr)[0].astype(mx.float32)                # [T, vocab]
+    pred, tgt = logits[:-1], arr[1:]                         # position t predicts token t+1
+    ce = mx.logsumexp(pred, axis=-1) - mx.take_along_axis(pred, tgt[:, None], axis=-1)[:, 0]
+    am = mx.argmax(pred, axis=-1)
+    acc = (am == tgt).astype(mx.float32).mean()
+    return float(mx.mean(ce).item()), float(acc.item()), am.tolist()
+
+
+def _greedy_trace(inner: Qwen35ResidentModel, prompt: list[int], n: int) -> list[int]:
+    """Greedy-decode ``n`` tokens from ``prompt`` on a fresh cache (single stream, deterministic) via the
+    cached decode path serving uses (``__call__`` with ``caches`` given). Returns the token trace to be
+    diffed bf16-vs-packed (greedy-exact)."""
+    cache = inner.make_caches()
+    logits = inner(prompt, caches=cache, offset=0)           # prefill the prompt through the cache
+    mx.eval(logits)
+    tok = int(mx.argmax(logits[0, -1]).item())
+    out, off = [tok], len(prompt)
+    for _ in range(n - 1):
+        logits = inner([tok], caches=cache, offset=off)
+        mx.eval(logits)
+        tok = int(mx.argmax(logits[0, -1]).item())
+        out.append(tok)
+        off += 1
+    return out
+
+
+def _measure_config(packed_experts: bool, ppl_ids: list[int], prompt: list[int]) -> dict:
+    """Load ONE config of the real bake, measure resident GiB + greedy trace + teacher-forced ppl/top-1,
+    then return them; the model is the only strong ref inside, so it is released on return (SOLO: only
+    this one model is ever resident). Both configs keep the graduated packed mixer; ONLY ``packed_experts``
+    differs, so any bf16-vs-packed difference isolates the routed-expert kernel (gather_mm dequant vs
+    gather_qmm)."""
+    mx.clear_cache()
+    mx.reset_peak_memory()
+    t0 = time.perf_counter()
+    inner = Qwen35ResidentModel(ART, packed_experts=packed_experts)
+    load_s = time.perf_counter() - t0
+    resident_gib = _gib(mx.get_active_memory())              # resident weight set right after load
+    ce, acc, argmax = _teacher_forced(inner, ppl_ids)
+    trace = _greedy_trace(inner, prompt, GREEDY_GEN)
+    return {"resident_gib": resident_gib, "peak_gib": _gib(mx.get_peak_memory()),
+            "ppl": math.exp(ce), "acc": acc, "argmax": argmax, "trace": trace, "load_s": load_s}
+
+
+def run_packed_experts_gate() -> None:
+    """M3 (SOLO GPU): the real-model packed-experts graduation gate. Loads the int4-g64 bake twice (bf16-
+    dequant experts, then packed int4 experts), ONE model resident at a time, and asserts (a) a large
+    resident-memory drop, (b) greedy-exact 48-token trace, (c) teacher-forced ppl unchanged + near-total
+    top-1 agreement on real prose. Green => graduate ``packed_experts=True`` as the constructor default."""
+    mx.set_wired_limit(int(140 * 1024 ** 3))     # bf16-expert resident + headroom (well under 490 ceiling)
+    tok = Qwen35Tokenizer.from_pretrained(ART)
+    ppl_ids = tok.encode(PROSE, add_bos=True)[:PPL_MAX_TOKENS]   # add_bos no-op for Qwen3.5 (no BOS)
+    prompt = ppl_ids[:GREEDY_PROMPT_LEN]
+    print("\n=== Qwen3.6-35B-A3B int4-g64 M3 packed-experts gate (SOLO; one model resident at a time) ===")
+    print(f"routed experts: bf16-dequant (gather_mm) vs packed int4 (gather_qmm), SAME codes. teacher-forced "
+          f"on {len(ppl_ids)} real-prose tok. expect greedy-exact + ppl/top-1 unchanged; win = RESIDENT mem.")
+    res: dict[bool, dict] = {}
+    for pe in (False, True):                     # bf16 reference first, then packed
+        res[pe] = _measure_config(pe, ppl_ids, prompt)
+        mx.clear_cache()                          # fully release this model before the next loads
+        gc.collect()
+        mx.clear_cache()
+        r, tag = res[pe], ("packed int4 (gather_qmm)" if pe else "bf16-dequant (gather_mm)")
+        print(f"  packed_experts={str(pe):<5} [{tag:<24}]  resident={r['resident_gib']:6.1f} GiB  "
+              f"peak={r['peak_gib']:6.1f} GiB  ppl={r['ppl']:8.4f}  top1={r['acc']:.4f}  load={r['load_s']:.1f}s")
+    ref, pk = res[False], res[True]
+
+    drop = ref["resident_gib"] - pk["resident_gib"]
+    drop_ok = pk["resident_gib"] < 0.6 * ref["resident_gib"]      # expect ~0.3x; 0.6 is a loose bar
+    div = _first_divergence([ref["trace"]], [pk["trace"]])
+    greedy_ok = div is None
+    rel_ppl = abs(pk["ppl"] - ref["ppl"]) / ref["ppl"]
+    ppl_ok = rel_ppl < 0.02                                       # <2% : bf16 rounding, NOT a quant divergence
+    n_pos = min(len(ref["argmax"]), len(pk["argmax"]))
+    agree = sum(ref["argmax"][i] == pk["argmax"][i] for i in range(n_pos)) / max(n_pos, 1)
+    agree_ok = agree >= 0.98                                      # near-total; rare near-tie flips are bf16 noise
+
+    print(f"\n  (a) resident drop : {ref['resident_gib']:.1f} -> {pk['resident_gib']:.1f} GiB "
+          f"(-{drop:.1f}, {pk['resident_gib'] / ref['resident_gib']:.2f}x)  {'OK' if drop_ok else 'FAIL'}")
+    print(f"  (b) greedy-exact  : {GREEDY_GEN} tokens  {'OK' if greedy_ok else 'FAIL'}"
+          + ("" if greedy_ok else f"  [DIFF at step {div[1]}: bf16={div[2]} packed={div[3]}]"))
+    print(f"  (c) ppl unchanged : {ref['ppl']:.4f} -> {pk['ppl']:.4f} (rel {rel_ppl:.2%}); top-1 agree "
+          f"{agree:.4f} (bf16/packed vs target {ref['acc']:.4f}/{pk['acc']:.4f})  "
+          f"{'OK' if (ppl_ok and agree_ok) else 'FAIL'}")
+
+    if not (drop_ok and greedy_ok and ppl_ok and agree_ok):
+        print("FAIL — packed experts not equivalent to / not lighter than bf16 (see above); keep default OFF")
+        raise SystemExit(1)
+    print(f"PASS — packed experts greedy-exact + ppl/top-1 unchanged at {pk['resident_gib']:.0f} GiB "
+          f"resident (vs {ref['resident_gib']:.0f} GiB bf16) -> graduate packed_experts=True")
+
+
 if __name__ == "__main__":
     import sys
 
-    bs = tuple(int(x) for x in sys.argv[1].split(",")) if len(sys.argv) > 1 else BATCH_SIZES
-    run(bs)
+    if len(sys.argv) > 1 and sys.argv[1] == "experts":
+        run_packed_experts_gate()                # M3: packed-experts memory + greedy + NLL gate
+    else:
+        bs = tuple(int(x) for x in sys.argv[1].split(",")) if len(sys.argv) > 1 else BATCH_SIZES
+        run(bs)

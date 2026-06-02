@@ -217,16 +217,17 @@ class Qwen35ResidentModel:
     chunked batched loop-kill (``Qwen35BatchedResidentModel``).
 
     ``packed_experts=True`` additionally holds the routed-expert stacks as packed int4 (``gather_qmm``)
-    rather than dequantized to bf16 (``gather_mm``) — the ~79→~30 GiB resident lever, greedy-exact on
-    the SAME codes (independent of the mixer ``packed`` flag; default OFF per rule 4 until the
-    real-model gate graduates it). The shared expert + router gate stay bf16."""
+    rather than dequantized to bf16 (``gather_mm``) — the resident-memory lever, greedy-exact on the SAME
+    codes (independent of the mixer ``packed`` flag). **Default ON since M3**, graduated by the real-model
+    gate (``parity.qwen35_batched_bench experts``: 63 → 20 GiB resident, 0.32×, greedy-exact, ppl +0.24%
+    on real prose). The shared expert + router gate stay bf16."""
 
     def __init__(self, art_dir: str | Path, *, n_layers: int | None = None,
-                 packed: bool = True, packed_experts: bool = False) -> None:
+                 packed: bool = True, packed_experts: bool = True) -> None:
         self.art = Qwen35Artifact(art_dir)
         self.cfg = self.art.cfg
         self.packed = packed     # #153 option B: hold mixer projections packed (mx.quantized_matmul)
-        self.packed_experts = packed_experts   # routed experts packed int4 (gather_qmm); default OFF
+        self.packed_experts = packed_experts   # routed experts packed int4 (gather_qmm); default ON since M3
         n = self.cfg.num_hidden_layers if n_layers is None else n_layers
         self.layers: list[Qwen35Block] = []
         for i in range(n):  # rule-8: materialize one layer's params, eval, then drop source shards
