@@ -1348,14 +1348,20 @@ def decode_step_compressed_batched(x_t: mx.array, p: dict, cfg: DeepSeekV4Config
     per-stream-offset sibling of :func:`decode_step_compressed`. ONE projection and ONE softmax over
     the per-stream-padded window-latent ++ compressed keys with per-stream window / visibility /
     indexer-top-k masks (each stream attends exactly the keys its single-stream step would). Returns
-    ``[B,1,dim]``. Two interchangeable, output-equivalent cache stores (#18 M3; gated in
-    ``parity/dsv4_batched_attention_test.py``):
+    ``[B,1,dim]``. Three interchangeable, output-equivalent cache stores (gated in
+    ``parity/dsv4_batched_attention_test.py`` (#18 M3) + ``parity/dsv4_paged_batched_test.py`` (#153 M2)):
 
-    * **arena path** (``arena``/``rows``/``comp`` given — the loop-kill): :func:`_compressed_update_arena`
+    * **arena path** (``arena``/``rows``/``comp`` given — the #18 loop-kill): :func:`_compressed_update_arena`
       does the whole cache update batched — ONE latent scatter, ONE batched ring roll, ONE compute-all
       pool masked-scattered into the ckv/ikv arenas — then the window-latent / ckv / ikv are read with
       ONE gather each (no ``_pad_stack``). ``rows[b]`` is stream ``b``'s arena row. Bit-identical
       contents to the per-stream store (same codec + pool arithmetic; affine quant is row-independent).
+    * **paged-hybrid path** (``arena``/``rows`` + ``lcs`` given, ``comp`` None — the #153 M2 loop-kill):
+      the LATENT rides a paged :class:`_PagedKVArena` (ONE block-table scatter + ONE gather, killing the
+      per-stream paged latent write/gather loop), while the derived ckv/ikv/ring stay PER-STREAM on each
+      ``lcs`` view — the small bounded compressor pool, whose paged boundary-snapshot lifecycle is left
+      UNCHANGED. The latent round-trip is bit-exact (M0) and the per-stream pool keeps the derived
+      bit-exact (no batched-pool reorder), so the whole step is ``Δ == 0`` vs the per-stream paged loop.
     * **per-stream path** (``lcs`` given, ``arena`` None — the proven reference, default): per-stream
       (rule-3) latent-KV append + raw-hidden ring push + window-closing pool (:func:`_maybe_pool`), then
       ``_pad_stack`` the streams to ``[B,·,·]``.
@@ -1367,11 +1373,11 @@ def decode_step_compressed_batched(x_t: mx.array, p: dict, cfg: DeepSeekV4Config
     cos_b, sin_b = gather_rope_rows(cos, sin, offsets)         # [B,1,rd/2]
     qr, q, kv = project_qkv_b(x_t, p, cfg, cos_b, sin_b)       # qr [B,1,qlora], q [B,1,H,hd], kv [B,1,hd]
 
-    if arena is not None:                                      # ARENA path: kills the per-stream loop
-        if rows is None or comp is None or len(rows) != b:
+    if arena is not None and comp is not None:                 # ARENA path (#18): kills the per-stream loop
+        if rows is None or len(rows) != b:
             raise ValueError(
-                f"decode_step_compressed_batched: arena path needs comp + rows of length B={b} "
-                f"(got comp={comp is not None}, rows={None if rows is None else len(rows)})")    # rule 6
+                f"decode_step_compressed_batched: arena path needs rows of length B={b} "
+                f"(got rows={None if rows is None else len(rows)})")                              # rule 6
         _compressed_update_arena(x_t, kv, p, cfg, layer_id, ratio, overlap, has_idx,
                                  arena, comp, rows, offsets, cos, sin)
         kv_pad = arena.read_batched(rows).astype(mx.float32)              # ONE gather + dequant
@@ -1379,6 +1385,26 @@ def decode_step_compressed_batched(x_t: mx.array, p: dict, cfg: DeepSeekV4Config
         ncomp_max = max(ncomps)
         ckv = comp.ckv.read_batched(rows).astype(mx.float32) if ncomp_max > 0 else None
         ikv_pad = comp.ikv.read_batched(rows) if (has_idx and ncomp_max > 0) else None
+    elif arena is not None:                                    # PAGED-HYBRID path (#153 M2): latent batched,
+        # derived ckv/ikv/ring per-stream. ONE block-table scatter + ONE gather kill the per-stream paged
+        # latent loop (the #153 lever); the derived pool stays on each lcs view so the paged boundary-
+        # snapshot lifecycle is UNCHANGED and the pool is bit-exact (no batched-pool reorder).
+        if rows is None or lcs is None or len(rows) != b:
+            raise ValueError(
+                f"decode_step_compressed_batched: paged-hybrid path needs lcs + rows of length B={b} "
+                f"(got lcs={lcs is not None}, rows={None if rows is None else len(rows)})")       # rule 6
+        arena.append_batched(rows, kv)                        # latent: ONE scatter (kills the paged loop)
+        for s in range(b):                                    # derived: per-stream pool (IO, rule-3)
+            lc = lcs[s]
+            lc.ratio = ratio
+            _push_ring(lc, x_t[s:s + 1], ratio, overlap)
+            _maybe_pool(lc, p, cfg, layer_id, ratio, offsets[s], cos, sin)
+        kv_pad = arena.read_batched(rows).astype(mx.float32)  # latent: ONE gather + dequant (kills _pad_stack)
+        ncomps = [lc.n_comp() for lc in lcs]
+        ncomp_max = max(ncomps)
+        ckv = _pad_stack([lc.ckv for lc in lcs], ncomp_max).astype(mx.float32) if ncomp_max > 0 else None
+        ikv_pad = (_pad_stack([lc.ikv for lc in lcs], ncomp_max)
+                   if (has_idx and ncomp_max > 0) else None)
     else:                                                     # PER-STREAM reference path (default)
         if rows is not None or comp is not None:
             raise ValueError("decode_step_compressed_batched: rows/comp given without an arena")  # rule 6

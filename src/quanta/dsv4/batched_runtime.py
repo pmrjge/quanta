@@ -502,13 +502,13 @@ class DSV4BatchedResidentModel:
         # arena path (ONE scatter + ONE gather per layer) while a discrete DSV4Cache always keeps the
         # proven per-stream _LayerCache loop — even if the runtime was built with the arena on.
         arena_path = b > 0 and hasattr(caches[0], "row")
-        # #153 M1: a paged DSV4Cache (latent in a PagedLatentCacheView) takes the paged loop-kill on its
-        # DENSE layers via _PagedKVArena (ONE block-table scatter + ONE gather over the shared manager).
-        # Gated on self._paged_kv_batched (OFF by default, rule 4 — the proven per-stream paged loop is
-        # the default until the path is parity-green end to end); compressed paged layers keep the
-        # per-stream loop until M2 batches their derived ckv/ikv/ring. Both write the SAME paged latent
-        # store and M0 proved the batched scatter is bit-identical to the per-stream write, so a mixed
-        # (dense-batched + compressed-per-stream) forward stays exact.
+        # #153 M1+M2: a paged DSV4Cache (latent in a PagedLatentCacheView) takes the paged loop-kill via
+        # _PagedKVArena (ONE block-table scatter + ONE gather over the shared manager) — on its DENSE
+        # layers (M1) AND its COMPRESSED layers (M2, where only the LATENT is batched; the derived
+        # ckv/ikv/ring stay per-stream so the paged boundary-snapshot lifecycle is unchanged). Gated on
+        # self._paged_kv_batched (OFF by default, rule 4 — the proven per-stream paged loop is the default
+        # until the path is parity-green end to end; M3 flips it). M0 proved the batched scatter is bit-
+        # identical to the per-stream write, so the latent round-trip is exact on both regimes.
         paged_path = (self._paged_kv_batched and b > 0 and not arena_path
                       and isinstance(caches[0].layers[0], _PagedLayerCache))
         rows = ([c.row for c in caches] if arena_path
@@ -532,10 +532,15 @@ class DSV4BatchedResidentModel:
                     x = decode_step_compressed_batched(x, p["attn"], cfg, i, None, cos, sin, offsets,
                                                        arena=latent, rows=rows,
                                                        comp=self._arena_set.comp[i])
-            elif paged_path and dense:
-                latent = _PagedKVArena(pmgr, pseqs, i)           # #153 M1: ONE scatter + ONE gather (paged)
-                x = decode_step_dense_batched(x, p["attn"], cfg, i, None, cos, sin, offsets,
-                                              arena=latent, rows=rows)
+            elif paged_path:                                     # #153 M1 (dense) + M2 (compressed)
+                latent = _PagedKVArena(pmgr, pseqs, i)           # ONE block-table scatter + ONE gather
+                if dense:
+                    x = decode_step_dense_batched(x, p["attn"], cfg, i, None, cos, sin, offsets,
+                                                  arena=latent, rows=rows)
+                else:                                            # latent batched; derived ckv/ikv/ring
+                    lcs = [caches[s][i] for s in range(b)]       # stay per-stream (snapshot lifecycle)
+                    x = decode_step_compressed_batched(x, p["attn"], cfg, i, lcs, cos, sin, offsets,
+                                                       arena=latent, rows=rows)   # comp=None -> hybrid
             else:
                 lcs = [caches[s][i] for s in range(b)]                           # this layer per stream
                 if dense:
