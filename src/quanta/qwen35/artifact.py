@@ -184,6 +184,50 @@ class Qwen35Artifact:
         mx.eval(list(out.values()))
         return out
 
+    def _packed_triplet(self, base: str) -> dict:
+        """A routed-expert stack's packed affine triplet for the resident ``gather_qmm`` path —
+        ``{packed, scale, bias, group_size, bits}`` held **verbatim** (NO dequant), the decode width
+        read from the manifest (rule-6: the baked manifest is the single source of truth, never a
+        hardcoded width). Fail loud if ``base`` is not an ``affine_packed`` weight (it has no packed
+        codes). The dict shape :meth:`quanta.qwen35.model.Qwen35MoEModule.set_experts_packed` consumes;
+        the analogue of :func:`quanta.qwen35.runtime._load_quant_triplet` for the 3-D expert stacks."""
+        meta = self.manifest.get(base)
+        if meta is None or meta.get("format") != "affine_packed":
+            raise ValueError(f"{base}: not an affine_packed weight (format="
+                             f"{None if meta is None else meta.get('format')!r}); cannot pack "
+                             f"experts (rule-6)")
+        return {"packed": self.get(base + ".weight_packed"),
+                "scale": self.get(base + ".weight_scale"),
+                "bias": self.get(base + ".weight_bias"),
+                "group_size": int(meta["group_size"]),
+                "bits": int(meta["bits"])}
+
+    def moe_packed(self, i: int) -> dict:
+        """MoE block for layer ``i`` with the routed experts kept **packed int4** (NOT dequantized).
+
+        The memory-lean sibling of :meth:`moe`: ``experts_gate_up`` / ``experts_down`` come back as
+        affine triplet dicts (``{packed, scale, bias, group_size, bits}``) for the resident
+        ``mx.gather_qmm`` path (:func:`quanta.qwen35.moe._routed_sparse_packed`) — the routed experts
+        stay int4-resident (~4× lighter; the ~79→~30 GiB lever) instead of the dequantized-bf16
+        ``[E,*,*]`` stacks :meth:`moe` returns. The router ``gate``, the shared expert, and the
+        shared-gate stay **bf16** (CLAUDE.md: the always-on shared expert is never quantized). The
+        exact dict :func:`quanta.qwen35.moe.qwen35_moe` consumes when it auto-detects packed experts."""
+        p = f"{LM_PREFIX}layers.{i}.mlp."
+        gu = self._packed_triplet(p + "experts.gate_up_proj")  # [E, 2*moe_inter, hidden] int4
+        dn = self._packed_triplet(p + "experts.down_proj")     # [E, hidden, moe_inter]   int4
+        out: dict[str, object] = {
+            "gate": self.read(p + "gate.weight"),
+            "experts_gate_up": gu,
+            "experts_down": dn,
+            "shared_expert_gate": self.read(p + "shared_expert_gate.weight"),
+        }
+        for proj in SHARED_EXPERT_PROJS:
+            out[f"shared_{proj}"] = self.read(p + f"shared_expert.{proj}.weight")
+        mx.eval([out["gate"], out["shared_expert_gate"],
+                 *(out[f"shared_{proj}"] for proj in SHARED_EXPERT_PROJS),
+                 gu["packed"], gu["scale"], gu["bias"], dn["packed"], dn["scale"], dn["bias"]])
+        return out
+
     # --- native MTP block ------------------------------------------------------
     def mtp(self, j: int = 0) -> dict[str, mx.array]:
         """The native MTP block: ``fc`` fusion + pre-norms (bf16), one full-attn (int8) + MoE block.

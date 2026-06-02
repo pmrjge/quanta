@@ -98,16 +98,23 @@ def _packed_linear(art: Qwen35Artifact, base: str, ref: nn.Linear) -> nn.Quantiz
     return ql
 
 
-def _load_block(art: Qwen35Artifact, cfg: Qwen35Config, i: int, *, packed: bool = False) -> Qwen35Block:
+def _load_block(art: Qwen35Artifact, cfg: Qwen35Config, i: int, *, packed: bool = False,
+                packed_experts: bool = False) -> Qwen35Block:
     """Build one runnable :class:`Qwen35Block` for layer ``i`` from the artifact tensors.
 
     ``packed=False`` dequantizes the mixer projections to dense bf16 ``nn.Linear`` (the parity
     reference / fallback). ``packed=True`` (#153 option B) holds each mixer projection as a packed
     ``nn.QuantizedLinear`` (``mx.quantized_matmul``) instead — batch-M bit-exact, the prerequisite for
     the chunked batched loop-kill (a dense-bf16 GEMM reorders its accumulation across batch-M; see
-    ``feedback_batched_rope_bf16`` + M0). MoE / norms / conv / ``A_log`` / ``dt_bias`` are identical
-    either way. Both mixer halves convert: GDN ``in_proj_*``/``out_proj`` (M1) and GQA ``q/k/v/o``
-    projections (M2)."""
+    ``feedback_batched_rope_bf16`` + M0). Both mixer halves convert: GDN ``in_proj_*``/``out_proj``
+    (M1) and GQA ``q/k/v/o`` projections (M2).
+
+    ``packed_experts=False`` dequantizes the routed-expert stacks to bf16 (``art.moe`` → ``gather_mm``,
+    the parity reference). ``packed_experts=True`` holds them as packed int4 triplets (``art.moe_packed``
+    → ``set_experts_packed`` → ``mx.gather_qmm``) so the experts stay int4-resident — the ~79→~30 GiB
+    lever, greedy-exact on the SAME codes (the qwen35-experts task; independent of the mixer ``packed``
+    flag). Norms / conv / ``A_log`` / ``dt_bias`` / router gate / shared expert are identical either
+    way (the shared expert is never quantized)."""
     blk = Qwen35Block(cfg, i)
     norms = art.block_norms(i)
     blk.input_layernorm.weight = _one_plus(norms["input_layernorm"])          # (1+w) convention
@@ -162,10 +169,15 @@ def _load_block(art: Qwen35Artifact, cfg: Qwen35Config, i: int, *, packed: bool 
             m.q_norm = _one_plus(fa["q_norm.weight"])                         # (1+w) convention
             m.k_norm = _one_plus(fa["k_norm.weight"])
 
-    moe = art.moe(i)
-    blk.mlp.gate = moe["gate"]
-    blk.mlp.set_experts(moe["experts_gate_up"], moe["experts_down"])
-    blk.mlp.shared_gate_proj = moe["shared_gate_proj"]
+    if packed_experts:
+        moe = art.moe_packed(i)                          # routed experts as packed int4 triplets
+        blk.mlp.gate = moe["gate"]
+        blk.mlp.set_experts_packed(moe["experts_gate_up"], moe["experts_down"])
+    else:
+        moe = art.moe(i)                                 # routed experts dequantized to bf16
+        blk.mlp.gate = moe["gate"]
+        blk.mlp.set_experts(moe["experts_gate_up"], moe["experts_down"])
+    blk.mlp.shared_gate_proj = moe["shared_gate_proj"]   # shared expert + gate always bf16
     blk.mlp.shared_up_proj = moe["shared_up_proj"]
     blk.mlp.shared_down_proj = moe["shared_down_proj"]
     blk.mlp.shared_expert_gate = moe["shared_expert_gate"]
@@ -173,11 +185,20 @@ def _load_block(art: Qwen35Artifact, cfg: Qwen35Config, i: int, *, packed: bool 
 
 
 def _block_arrays(blk: Qwen35Block) -> list[mx.array]:
-    """Every resident array of one block — nn params plus the MoE expert stacks (plain attrs)."""
+    """Every resident array of one block — nn params plus the MoE expert stacks (plain attrs).
+
+    Under ``packed_experts`` the routed stacks are packed triplet dicts
+    (``{packed, scale, bias, group_size, bits}``), so eval their component arrays — the int4 codes
+    must be materialized and pinned (rule-8), exactly as the dequantized bf16 stacks are on the
+    default path (the int metadata is not an array and is not eval'd)."""
     arrs = [v for _, v in tree_flatten(blk.parameters())]
-    arrs += [blk.mlp.experts_gate_up, blk.mlp.experts_down, blk.mlp.gate,
-             blk.mlp.shared_gate_proj, blk.mlp.shared_up_proj, blk.mlp.shared_down_proj,
-             blk.mlp.shared_expert_gate]
+    for stack in (blk.mlp.experts_gate_up, blk.mlp.experts_down):
+        if isinstance(stack, dict):
+            arrs += [stack["packed"], stack["scale"], stack["bias"]]
+        else:
+            arrs.append(stack)
+    arrs += [blk.mlp.gate, blk.mlp.shared_gate_proj, blk.mlp.shared_up_proj,
+             blk.mlp.shared_down_proj, blk.mlp.shared_expert_gate]
     return arrs
 
 
@@ -193,17 +214,23 @@ class Qwen35ResidentModel:
     codes, never a dequantized bf16 weight). It is the SAME quantized weights the ``packed=False`` path
     dequantizes to bf16, so the two are greedy-exact (gated in ``parity/qwen35_forward_test.py``);
     ``packed=False`` is kept as the bf16 parity reference / fallback. Packed is the prerequisite for the
-    chunked batched loop-kill (``Qwen35BatchedResidentModel``)."""
+    chunked batched loop-kill (``Qwen35BatchedResidentModel``).
+
+    ``packed_experts=True`` additionally holds the routed-expert stacks as packed int4 (``gather_qmm``)
+    rather than dequantized to bf16 (``gather_mm``) — the ~79→~30 GiB resident lever, greedy-exact on
+    the SAME codes (independent of the mixer ``packed`` flag; default OFF per rule 4 until the
+    real-model gate graduates it). The shared expert + router gate stay bf16."""
 
     def __init__(self, art_dir: str | Path, *, n_layers: int | None = None,
-                 packed: bool = True) -> None:
+                 packed: bool = True, packed_experts: bool = False) -> None:
         self.art = Qwen35Artifact(art_dir)
         self.cfg = self.art.cfg
         self.packed = packed     # #153 option B: hold mixer projections packed (mx.quantized_matmul)
+        self.packed_experts = packed_experts   # routed experts packed int4 (gather_qmm); default OFF
         n = self.cfg.num_hidden_layers if n_layers is None else n_layers
         self.layers: list[Qwen35Block] = []
         for i in range(n):  # rule-8: materialize one layer's params, eval, then drop source shards
-            blk = _load_block(self.art, self.cfg, i, packed=packed)
+            blk = _load_block(self.art, self.cfg, i, packed=packed, packed_experts=packed_experts)
             mx.eval(_block_arrays(blk))
             self.layers.append(blk)
             self.art.release()

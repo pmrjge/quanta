@@ -47,6 +47,7 @@ from quanta.qwen35.gated_deltanet import (
 )
 from quanta.qwen35.model import Qwen35MoEModule, Qwen35Model
 from quanta.qwen35.moe import qwen35_moe
+from quanta.qwen35.runtime import _block_arrays
 
 
 def _maxdiff(a: mx.array, b: mx.array) -> float:
@@ -376,6 +377,48 @@ def _packed_forward_parity(cfg: Qwen35Config) -> tuple[bool, float]:
     return greedy, _maxdiff(lg_bf16, lg_pk)
 
 
+def _packed_experts_forward_parity(cfg: Qwen35Config) -> tuple[bool, float]:
+    """M2 packed-experts-vs-bf16 forward gate: an assembled ``Qwen35Model`` whose routed experts are
+    held PACKED (``set_experts_packed`` → ``mx.gather_qmm``, the resident memory-lean path) == the bf16
+    reference (the SAME int4 codes dequantized → ``gather_mm``), **GREEDY-EXACT**.
+
+    The assembled-model sibling of :func:`_moe_packed_parity` (which proved it for the isolated MoE
+    module): proves the packed experts compose through the full hybrid forward (GDN + GQA + MoE every
+    layer, residual mixing), and that :func:`quanta.qwen35.runtime._block_arrays` surfaces the packed
+    triplet COMPONENT arrays (not the dict / int metadata) — the rule-8 pinning plumbing the resident
+    loader relies on under ``packed_experts=True``. This is what M2 wires through ``_load_block`` /
+    ``_block_arrays`` / the runtimes; the real-artifact gate (residency + ppl) is M3. Both models share
+    the seed so their mixers are bf16-identical — experts-packing is the ONLY difference.
+    ``moe_intermediate_size=64`` (the tiny cfg's 16 is below the g32 down-proj in-dim minimum)."""
+    cfg = dataclasses.replace(cfg, moe_intermediate_size=64, shared_expert_intermediate_size=64)
+    mx.random.seed(4)
+    model_bf16 = Qwen35Model(cfg)
+    _randomize_model(model_bf16)
+    mx.random.seed(4)
+    model_pk = Qwen35Model(cfg)
+    _randomize_model(model_pk)
+    plumbing_ok = True
+    for blk_b, blk_p in zip(model_bf16.layers, model_pk.layers, strict=True):
+        wq_gu, sc_gu, bi_gu = mx.quantize(blk_b.mlp.experts_gate_up, group_size=_EXP_GS, bits=_EXP_BITS)
+        wq_dn, sc_dn, bi_dn = mx.quantize(blk_b.mlp.experts_down, group_size=_EXP_GS, bits=_EXP_BITS)
+        blk_b.mlp.set_experts(  # bf16 reference: the SAME codes dequantized → gather_mm
+            mx.dequantize(wq_gu, sc_gu, bi_gu, group_size=_EXP_GS, bits=_EXP_BITS),
+            mx.dequantize(wq_dn, sc_dn, bi_dn, group_size=_EXP_GS, bits=_EXP_BITS))
+        blk_p.mlp.set_experts_packed(  # packed int4 triplets → gather_qmm (the resident path)
+            {"packed": wq_gu, "scale": sc_gu, "bias": bi_gu, "group_size": _EXP_GS, "bits": _EXP_BITS},
+            {"packed": wq_dn, "scale": sc_dn, "bias": bi_dn, "group_size": _EXP_GS, "bits": _EXP_BITS})
+        # rule-8 plumbing: every entry _block_arrays surfaces for the packed block is an mx.array (the
+        # int4 codes / scales / biases get pinned; the group_size/bits ints are not eval'd).
+        plumbing_ok = plumbing_ok and all(isinstance(a, mx.array) for a in _block_arrays(blk_p))
+    length = 12
+    ids = mx.random.randint(0, cfg.vocab_size, (length,))
+    lg_bf16, _, _ = model_bf16(ids, use_fast=True, seq_hint=length)
+    lg_pk, _, _ = model_pk(ids, use_fast=True, seq_hint=length)
+    mx.eval(lg_bf16, lg_pk)
+    greedy = bool(mx.all(mx.argmax(lg_bf16, axis=-1) == mx.argmax(lg_pk, axis=-1)).item())
+    return (greedy and plumbing_ok), _maxdiff(lg_bf16, lg_pk)
+
+
 def run() -> None:
     cfg = _tiny_cfg()
 
@@ -386,6 +429,7 @@ def run() -> None:
     moe_pk_ok, moe_pk_d, moe_pk_dense_d, moe_pk_mod_d = _moe_packed_parity()
     model_base_ok, model_naive_ok, model_naive_r, model_dec_ok, model_dec_r = _model_parity(cfg)
     packed_ok, packed_d = _packed_forward_parity(cfg)
+    pk_exp_ok, pk_exp_d = _packed_experts_forward_parity(cfg)
 
     print("\n=== Qwen3.5-397B-A17B forward parity (tiny, model-free) ===")
     print(f"GDN scan==chunk==decode (+state)     : {gdn_ok}  d_chunk={gdn_dc:.2e} d_step={gdn_ds:.2e}")
@@ -398,11 +442,12 @@ def run() -> None:
     print(f"model naive==optimized               : {model_naive_ok}  rel={model_naive_r:.2e}")
     print(f"model prefill==stepwise decode       : {model_dec_ok}  rel={model_dec_r:.2e}")
     print(f"packed==bf16 forward (greedy-exact)  : {packed_ok}  |Δlogit|={packed_d:.2e}")
+    print(f"packed-EXPERTS==bf16 fwd (greedy)    : {pk_exp_ok}  |Δlogit|={pk_exp_d:.2e}")
     assert all([gdn_ok, gdn_mod_ok, attn_ok, moe_ok, moe_pk_ok, model_base_ok, model_naive_ok,
-                model_dec_ok, packed_ok])
+                model_dec_ok, packed_ok, pk_exp_ok])
     print("Qwen3.5 forward OK (GDN scan==chunk==decode; GQA fast==naive==decode; MoE sparse==dense"
           " + packed gather_qmm==bf16-dequant==dense; assembled model finite + naive==opt +"
-          " prefill==decode; packed mixer==bf16 greedy-exact)")
+          " prefill==decode; packed mixer==bf16 greedy-exact; packed-experts==bf16 greedy-exact)")
 
 
 if __name__ == "__main__":
