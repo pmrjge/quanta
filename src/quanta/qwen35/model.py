@@ -46,6 +46,14 @@ class Qwen35MoEModule(nn.Module):
     def set_experts(self, gate_up: mx.array, down: mx.array) -> None:
         self.experts_gate_up, self.experts_down = gate_up, down
 
+    def set_experts_packed(self, gate_up: dict, down: dict) -> None:
+        """Hold the routed experts as **packed int4 triplets** (``{packed, scale, bias, group_size,
+        bits}``) instead of dequantized bf16 ``[E,*,*]`` stacks — :func:`qwen35_moe` auto-detects the
+        dict and dispatches ``mx.gather_qmm`` (the memory-lean resident path; greedy-exact vs
+        :meth:`set_experts`, the SAME int4 codes). Threaded by ``Qwen35ResidentModel(packed_experts=
+        True)``; independent of the option-B mixer ``packed`` flag."""
+        self.experts_gate_up, self.experts_down = gate_up, down
+
     def _params(self) -> dict:
         return {
             "gate": self.gate,

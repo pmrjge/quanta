@@ -32,6 +32,8 @@ heavy invocation, NOT run here:
 
 from __future__ import annotations
 
+import dataclasses
+
 import mlx.core as mx
 import mlx.nn as nn
 
@@ -43,7 +45,7 @@ from quanta.qwen35.gated_deltanet import (
     gdn_recurrence,
     gdn_step,
 )
-from quanta.qwen35.model import Qwen35Model
+from quanta.qwen35.model import Qwen35MoEModule, Qwen35Model
 from quanta.qwen35.moe import qwen35_moe
 
 
@@ -206,6 +208,68 @@ def _moe_parity(cfg: Qwen35Config) -> tuple[bool, float]:
     return _maxdiff(y_sparse, y_dense) < 1e-4, _maxdiff(y_sparse, y_dense)
 
 
+# --- MoE packed experts: gather_qmm == bf16-dequant gather_mm == dense oracle -------------------
+_EXP_GS, _EXP_BITS = 32, 4   # affine int4 g32 over the expert in-dims (hidden=32, moe_inter=64 ≥ g32)
+
+
+def _moe_packed_parity() -> tuple[bool, float, float, float]:
+    """M1 packed-experts gate: routed MoE via ``mx.gather_qmm`` over PACKED int4 expert stacks
+    (:func:`quanta.qwen35.moe._routed_sparse_packed`) == the bf16-dequant ``mx.gather_mm`` path
+    (:func:`~quanta.qwen35.moe._routed_sparse`) on the SAME codes, the dense oracle still matches,
+    and :meth:`Qwen35MoEModule.set_experts_packed` reproduces the function-level packed result.
+
+    The expert sibling of :func:`_packed_forward_parity` (which proved it for the mixer): build one
+    ``mx.quantize`` codestream, run ``qwen35_moe`` once over its ``mx.dequantize`` (dict auto-detect →
+    ``gather_mm``) and once over the packed triplet dict (→ ``gather_qmm``). Only the kernel differs
+    (fused-quantized vs separate-dequant), f32 throughout (random weights + scales default f32) ⇒ a
+    clean ~ULP diff, NOT a quant change (teacher-forced ppl cannot distinguish them — same codes).
+    Uses ``moe_intermediate_size=64`` (the shared tiny cfg's 16 is below the g32 minimum, so the
+    down-proj in-dim ``inter`` would not quantize); ``hidden=32`` is one g32 group for gate_up."""
+    mx.random.seed(3)
+    cfg = dataclasses.replace(_tiny_cfg(), moe_intermediate_size=64,
+                              shared_expert_intermediate_size=64)
+    h, e, inter = cfg.hidden_size, cfg.num_experts, cfg.moe_intermediate_size
+    si = cfg.shared_expert_intermediate_size
+    gate_up = mx.random.normal((e, cfg.moe_gate_up_out, h)) * 0.1         # [E, 2*inter, h] f32
+    down = mx.random.normal((e, h, inter)) * 0.1                          # [E, h, inter]   f32
+    wq_gu, sc_gu, bi_gu = mx.quantize(gate_up, group_size=_EXP_GS, bits=_EXP_BITS)
+    wq_dn, sc_dn, bi_dn = mx.quantize(down, group_size=_EXP_GS, bits=_EXP_BITS)
+    common = {
+        "gate": mx.random.normal((e, h)),
+        "shared_gate_proj": mx.random.normal((si, h)) * 0.1,
+        "shared_up_proj": mx.random.normal((si, h)) * 0.1,
+        "shared_down_proj": mx.random.normal((h, si)) * 0.1,
+        "shared_expert_gate": mx.random.normal((1, h)),
+    }
+    gu_pack = {"packed": wq_gu, "scale": sc_gu, "bias": bi_gu, "group_size": _EXP_GS, "bits": _EXP_BITS}
+    dn_pack = {"packed": wq_dn, "scale": sc_dn, "bias": bi_dn, "group_size": _EXP_GS, "bits": _EXP_BITS}
+    p_bf16 = {**common,
+              "experts_gate_up": mx.dequantize(wq_gu, sc_gu, bi_gu, group_size=_EXP_GS, bits=_EXP_BITS),
+              "experts_down": mx.dequantize(wq_dn, sc_dn, bi_dn, group_size=_EXP_GS, bits=_EXP_BITS)}
+    p_pack = {**common, "experts_gate_up": gu_pack, "experts_down": dn_pack}
+
+    x = mx.random.normal((1, 9, h))
+    y_pack = qwen35_moe(x, p_pack, cfg, sparse=True)     # gather_qmm over packed int4 codes
+    y_bf16 = qwen35_moe(x, p_bf16, cfg, sparse=True)     # gather_mm over dequantized codes
+    y_dense = qwen35_moe(x, p_bf16, cfg, sparse=False)   # dense oracle (every expert)
+
+    # Qwen35MoEModule.set_experts_packed wiring == the function-level packed path (identical codes)
+    mod = Qwen35MoEModule(cfg)
+    mod.gate = common["gate"]
+    mod.shared_gate_proj = common["shared_gate_proj"]
+    mod.shared_up_proj = common["shared_up_proj"]
+    mod.shared_down_proj = common["shared_down_proj"]
+    mod.shared_expert_gate = common["shared_expert_gate"]
+    mod.set_experts_packed(gu_pack, dn_pack)
+    y_mod = mod(x, sparse=True)
+
+    mx.eval(y_pack, y_bf16, y_dense, y_mod)
+    d_pack = _maxdiff(y_pack, y_bf16)
+    d_dense = _maxdiff(y_bf16, y_dense)
+    d_mod = _maxdiff(y_mod, y_pack)
+    return (d_pack < 1e-4 and d_dense < 1e-4 and d_mod < 1e-6), d_pack, d_dense, d_mod
+
+
 # --- assembled tiny model --------------------------------------------------------------------
 def _randomize_model(model: Qwen35Model) -> None:
     cfg = model.cfg
@@ -319,6 +383,7 @@ def run() -> None:
     gdn_mod_ok, gdn_mod_r = _gdn_module_parity(cfg)
     attn_ok, attn_fn, attn_dec = _attn_parity(cfg)
     moe_ok, moe_d = _moe_parity(cfg)
+    moe_pk_ok, moe_pk_d, moe_pk_dense_d, moe_pk_mod_d = _moe_packed_parity()
     model_base_ok, model_naive_ok, model_naive_r, model_dec_ok, model_dec_r = _model_parity(cfg)
     packed_ok, packed_d = _packed_forward_parity(cfg)
 
@@ -327,14 +392,17 @@ def run() -> None:
     print(f"GDN module prefill==stepwise decode  : {gdn_mod_ok}  rel={gdn_mod_r:.2e}")
     print(f"GQA fast==naive ; decode==prefill    : {attn_ok}  fast={attn_fn:.2e} dec={attn_dec:.2e}")
     print(f"MoE sparse==dense (top-10 softmax)   : {moe_ok}  maxdiff={moe_d:.2e}")
+    print(f"MoE packed gather_qmm==bf16==dense   : {moe_pk_ok}  d_pack={moe_pk_d:.2e} "
+          f"d_dense={moe_pk_dense_d:.2e} d_mod={moe_pk_mod_d:.2e}")
     print(f"model forward finite + shaped        : {model_base_ok}")
     print(f"model naive==optimized               : {model_naive_ok}  rel={model_naive_r:.2e}")
     print(f"model prefill==stepwise decode       : {model_dec_ok}  rel={model_dec_r:.2e}")
     print(f"packed==bf16 forward (greedy-exact)  : {packed_ok}  |Δlogit|={packed_d:.2e}")
-    assert all([gdn_ok, gdn_mod_ok, attn_ok, moe_ok, model_base_ok, model_naive_ok, model_dec_ok,
-                packed_ok])
-    print("Qwen3.5 forward OK (GDN scan==chunk==decode; GQA fast==naive==decode; MoE sparse==dense;"
-          " assembled model finite + naive==opt + prefill==decode; packed==bf16 greedy-exact)")
+    assert all([gdn_ok, gdn_mod_ok, attn_ok, moe_ok, moe_pk_ok, model_base_ok, model_naive_ok,
+                model_dec_ok, packed_ok])
+    print("Qwen3.5 forward OK (GDN scan==chunk==decode; GQA fast==naive==decode; MoE sparse==dense"
+          " + packed gather_qmm==bf16-dequant==dense; assembled model finite + naive==opt +"
+          " prefill==decode; packed mixer==bf16 greedy-exact)")
 
 
 if __name__ == "__main__":

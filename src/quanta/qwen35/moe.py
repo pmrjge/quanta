@@ -9,13 +9,17 @@
   ``[E, hidden, moe_inter]``. Each expert is a SwiGLU ``down(silu(gate) * up)`` (width 1024).
   Dispatch is sparse :func:`mx.gather_mm` over the gathered (token, slot) rows — no per-expert
   python loop (rule-3), token-chunked for bounded long-context prefill. The post-bake resident
-  runtime swaps ``gather_mm`` -> ``gather_qmm`` over the packed stacks (same ``[E,out,in]`` layout).
+  runtime swaps ``gather_mm`` -> ``gather_qmm`` over the **packed** int4 stacks
+  (:func:`_routed_sparse_packed`; same ``[E,out,in]`` layout) so the experts stay int4-resident
+  (~4× lighter) instead of dequantized to bf16 — auto-detected when the expert stacks are packed
+  triplet dicts.
 * **Shared expert** (always-on, width 1024): a SwiGLU ``shared_down(silu(shared_gate)·shared_up)``
   whose *whole* output is scaled by a learned sigmoid scalar gate ``sigmoid(x @ shared_expert_gate)``
   (Qwen2-MoE shared-gate), then added to the routed sum.
 
-Two numerically equivalent routed paths (gated in ``parity/qwen35_forward_test.py``): the sparse
-``gather_mm`` dispatch and a dense reference that runs every expert and masks — they must match.
+Three numerically equivalent routed paths (gated in ``parity/qwen35_forward_test.py``): the sparse
+bf16 ``gather_mm`` dispatch, its packed-int4 ``gather_qmm`` sibling (same codes, fused dequant), and
+a dense reference that runs every expert and masks — they must all match.
 """
 
 from __future__ import annotations
@@ -78,6 +82,48 @@ def _routed_sparse(xf: mx.array, idx: mx.array, gate_up: mx.array, down: mx.arra
     return d.reshape(n, topk, hidden)                                     # [N, topk, hidden]
 
 
+def _routed_sparse_packed(xf: mx.array, idx: mx.array, gate_up: dict, down: dict,
+                          inter: int) -> mx.array:
+    """Sparse routed SwiGLU via ``mx.gather_qmm`` over the **packed int4** expert stacks.
+
+    The memory-lean sibling of :func:`_routed_sparse`: ``gate_up`` / ``down`` are packed affine
+    triplets ``{"packed", "scale", "bias", "group_size", "bits"}`` (the ``[E, 2*inter, hidden]`` /
+    ``[E, hidden, inter]`` int4 codestream held verbatim — never dequantized to a bf16 ``[E,*,*]``
+    array), so the routed experts stay int4-resident (~4× lighter; the ~79→~30 GiB lever).
+    ``mx.gather_qmm`` dequantizes each routed expert's codes inline. Plain **affine** int4 — no AWQ
+    activation rescale (unlike DSV4's :func:`quanta.dsv4.moe._swiglu_stack_packed`) — and a **fused**
+    ``gate_up`` ⇒ exactly **two** ``gather_qmm`` calls (gate_up, then down).
+
+    Output-equivalent to :func:`_routed_sparse` on the SAME codes (greedy-exact — only the kernel
+    differs: fused-quantized vs ``mx.dequantize`` + dense ``gather_mm``), and **batch-invariant**: it
+    is the same per-(token,slot) **M=1 matvec** structure as ``gather_mm``, so it does NOT reorder
+    accumulation across batch-M (the #153 bug stays fixed; the "MoE is exempt" finding holds).
+
+    ``mx.gather_qmm`` arg order differs from ``gather_mm``: the **activation comes first**
+    (``lhs_indices`` gathers its rows), the packed weight stack second (``rhs_indices`` gathers its
+    ``E`` axis); ``transpose=True`` matches the ``[E, out, in]`` layout (``x[.,in] @ W[.,out,in].T``).
+    Unsorted — a clean packed-vs-dequant diff at the identical dispatch order ``_routed_sparse`` uses
+    (``sorted_indices`` is an optional bandwidth lever, deferred). No activation dtype cast: the qmm
+    output follows the baked ``scale`` dtype (bf16 or fp32), so the model-free f32 gate is a clean
+    ~ULP fused-vs-separate-dequant diff and the bf16 runtime stays bf16 (matches the mixer path).
+    """
+    n, hidden = xf.shape
+    topk = idx.shape[1]
+    mc = n * topk
+    exp = idx.reshape(-1)                                                 # [mc] expert id per slot
+    tok = mx.repeat(mx.arange(n, dtype=mx.int32), topk)                   # [mc] token per slot
+    rows = mx.arange(mc, dtype=mx.int32)                                  # identity lhs gather
+    x_in = xf[tok]                                                        # [mc, hidden] per-slot acts
+    gu = mx.gather_qmm(x_in[:, None, :], gate_up["packed"], gate_up["scale"], gate_up["bias"],
+                       lhs_indices=rows, rhs_indices=exp, transpose=True,
+                       group_size=int(gate_up["group_size"]), bits=int(gate_up["bits"]))[:, 0, :]
+    h = _swiglu_gate_up(gu, inter)                                        # [mc, inter]
+    d = mx.gather_qmm(h[:, None, :], down["packed"], down["scale"], down["bias"],
+                      lhs_indices=rows, rhs_indices=exp, transpose=True,
+                      group_size=int(down["group_size"]), bits=int(down["bits"]))[:, 0, :]
+    return d.reshape(n, topk, hidden)                                     # [N, topk, hidden]
+
+
 def _routed_dense(xf: mx.array, idx: mx.array, w: mx.array, gate_up: mx.array, down: mx.array,
                   inter: int) -> mx.array:
     """Dense reference: run **every** expert on every token, then combine only the top-k.
@@ -130,19 +176,26 @@ def qwen35_moe(x: mx.array, p: dict, cfg: Qwen35Config, *, sparse: bool = True,
         )
     xf = x.reshape(n, hidden)
     idx, w = qwen35_route(xf, p["gate"], cfg, topk_override=topk)
+    # Auto-detect packed int4 experts (a triplet dict) → gather_qmm; bf16 stacks → gather_mm. Same
+    # signature, same matvec, greedy-exact (mirrors DSV4's dsv4_moe routed_fn auto-detect).
+    packed = isinstance(p["experts_gate_up"], dict)
     if sparse:
+        routed_fn = _routed_sparse_packed if packed else _routed_sparse
         chunk = token_chunk if token_chunk and token_chunk > 0 else n
         multi = n > chunk
         parts = []
         for c0 in range(0, n, chunk):  # bounded chunked-prefill loop; experts stay vectorized
             c1 = min(c0 + chunk, n)
-            slots = _routed_sparse(xf[c0:c1], idx[c0:c1], p["experts_gate_up"],
-                                   p["experts_down"], inter)              # [nc, topk, hidden]
+            slots = routed_fn(xf[c0:c1], idx[c0:c1], p["experts_gate_up"],
+                              p["experts_down"], inter)                   # [nc, topk, hidden]
             rc = mx.sum(slots.astype(mx.float32) * w[c0:c1][:, :, None], axis=1)  # [nc, hidden]
             parts.append(rc)
             if multi:
                 mx.eval(rc)
         routed = parts[0] if not multi else mx.concatenate(parts, axis=0)
+    elif packed:  # rule-6: the dense oracle runs mx.einsum over bf16 stacks — never a packed dict
+        raise ValueError("qwen35_moe(sparse=False) is the bf16 dense oracle; packed int4 experts "
+                         "require sparse=True (gather_qmm). Refusing to dequant silently.")
     else:
         routed = _routed_dense(xf, idx, w, p["experts_gate_up"], p["experts_down"], inter)
     y = routed.astype(mx.float32) + _shared(xf, p)
