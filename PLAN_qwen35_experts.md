@@ -3,7 +3,8 @@
 > Durable, repo-tracked handover for the NEXT task. Read `CLAUDE.md` first (permanent rules +
 > quant policy), then **`PLAN_153.md`** (the just-finished Qwen3.6 **option B** packed-mixer work —
 > the `nn.QuantizedLinear`/`_packed_linear`/`_load_quant_triplet` machinery this task reuses), then
-> this. **Status: NOT STARTED.** This completes the Qwen3.6 runtime's *documented* `gather_qmm`
+> this. **Status: COMPLETE — M1 ✅ `a6b3b49`, M2 ✅ `d17882e`, M3 ✅ `f720fda`; `packed_experts`
+> graduated default ON (63.4 → 20.3 GiB resident, greedy-exact, ppl +0.24% on real prose).** This completes the Qwen3.6 runtime's *documented* `gather_qmm`
 > design: keep the int4 **routed experts** packed and dispatch via `mx.gather_qmm` instead of
 > dequantizing them to bf16 and running `mx.gather_mm`. **The big memory lever: ~79 → ~30 GiB
 > resident** (the option-B bench peaked at **79.3 GiB for a 21 GiB int4 artifact** — the experts are
@@ -95,7 +96,7 @@ packed_experts=...)` (`dsv4/runtime.py:85`).
 
 ## Milestones (model-free M1–M2; M3 = solo-GPU real-model gate)
 
-- **M1 — packed routed path in `moe.py` + `Qwen35MoEModule`.** Add `_routed_sparse_packed(xf, idx,
+- **M1 ✅ `a6b3b49` — packed routed path in `moe.py` + `Qwen35MoEModule`.** Add `_routed_sparse_packed(xf, idx,
   gate_up, down, inter)` (the `gather_qmm` body above), and dispatch it from `qwen35_moe` by
   **auto-detecting a dict** (`isinstance(p["experts_gate_up"], dict)`) — exactly DSV4's
   `routed_fn = _swiglu_stack_packed if isinstance(experts["w1"], dict) else _swiglu_stack`
@@ -107,7 +108,7 @@ packed_experts=...)` (`dsv4/runtime.py:85`).
   gate lives in the Qwen35 MoE/forward parity test — extend it with a packed leg, building the packed
   triplet from `mx.quantize` codes exactly as `qwen35_forward_test._packed_forward_parity` does for
   the mixer.)
-- **M2 — wire `packed_experts` through `_load_block` + the runtimes.** Under `packed_experts=True`,
+- **M2 ✅ `d17882e` — wire `packed_experts` through `_load_block` + the runtimes.** Under `packed_experts=True`,
   `_load_block` reads the packed triplets (**reuse `_load_quant_triplet`** — runtime.py:66, it is
   shape-agnostic and already returns `(.weight_packed, .weight_scale, .weight_bias, bits, gs)` for the
   3-D stacks at `…mlp.experts.gate_up_proj` / `…experts.down_proj`) and calls `set_experts_packed`
@@ -121,13 +122,21 @@ packed_experts=...)` (`dsv4/runtime.py:85`).
   `qwen35_forward_test` packed-experts-vs-bf16 forward greedy-exact + full model-free regression
   (`qwen35_batched_test`, `qwen35_batched_loopkill_test`, `qwen35_forward_test`) — the loop-kill is
   unaffected (experts were already batch-invariant).
-- **M3 — real-model gate + graduate (DEFERRED, SOLO GPU; OOM-reboot hazard, one model at a time).**
-  Load the real int4-g64 bake with `packed_experts=True` (extend `parity/qwen35_batched_bench.py` or a
-  small driver): assert (a) **resident drop ~79 → ~30 GiB**, (b) **greedy-exact** vs the
-  `packed_experts=False` (bf16-expert) path on real prompts, (c) **teacher-forced ppl unchanged** (the
-  methodology arbiter). `gather_qmm` reads int4 (bandwidth-cheap) so decode tok/s should be neutral-to-
-  better — record it but memory + correctness are the gate. If green → **graduate
-  `packed_experts=True`** default. RUN SOLO.
+- **M3 ✅ `f720fda` — real-model gate + graduate (SOLO GPU; one model at a time).** New gate
+  `uv run python -m parity.qwen35_batched_bench experts` loads the real int4-g64 bake **TWICE**
+  (`packed_experts` False then True, ONE model resident at a time — `gc.collect`+`mx.clear_cache`
+  between, 140 GiB wired limit) and asserts: (a) **resident 63.4 → 20.3 GiB** (−43.1, **0.32×**) — the
+  bf16-dequant RESIDENT is 63.4, not the option-B 79.3 which was the PEAK@B32 incl. transient; (b)
+  **greedy-exact** 48-tok cached-decode trace; (c) **ppl 2.3150 → 2.3204** (rel **0.24%**) + top-1 agree
+  **0.9858** on REAL prose (`_teacher_forced` mirrors `parity/ppl.py`: repo PROSE fixture +
+  `Qwen35Tokenizer.from_pretrained`; Qwen3.5 has no BOS so `add_bos` is a no-op). **Methodology note:**
+  a first attempt on SYNTHETIC ids falsely failed (c) at |ΔNLL|≈2e-2 — near-uniform synthetic ids
+  amplify bf16 rounding; CLAUDE.md's arbiter is ppl + top-1 on REAL prose (model confident → robust),
+  and bf16-dequant is the LOSSIER path (it rounds each dequant weight to bf16 PRE-matmul; `gather_qmm`
+  keeps full precision in the fused dequant), so packed isn't drifting — greedy is bit-identical. All
+  green → **graduated `packed_experts=True`** default in `Qwen35ResidentModel.__init__` (runtime.py:225)
+  + `Qwen35BatchedResidentModel.__init__` (batched_runtime.py:327); `from_inner` detects from layers +
+  the shim rides the default ⇒ serving auto-upgraded (no shim edit). RAN SOLO.
 
 ## File anchors
 - `src/quanta/qwen35/moe.py` — `_routed_sparse` (62), `_swiglu_gate_up` (55, reuse), `_routed_dense`
