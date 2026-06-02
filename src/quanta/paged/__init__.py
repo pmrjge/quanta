@@ -34,8 +34,11 @@ PAGED_KV_DEFAULT = True
 # batched-paged == the per-stream paged loop BIT-EXACT through the real ``_DSV4BatchedSession`` decode
 # (``parity/dsv4_paged_latent_test.py`` §C), and the M0 storage primitives
 # (``PagedKVCacheManager.write_*_batched`` / ``gather_*_batched``) are gated in
-# ``parity/dsv4_paged_batched_test.py``. The real-model B-sweep bench is the deferred solo-GPU M4 (not a
-# correctness blocker; M0–M3 are model-free). Rule 4 satisfied: parity proven ⇒ default ON, one flag to
+# ``parity/dsv4_paged_batched_test.py``. M4 ✅ DONE (``parity/dsv4_paged_batched_bench.py``): loop ==
+# loopkill BIT-exact on the real int4-g64 bake at B∈{1,32,48} AND +13% decode tok/s at B=32 & B=48 (the
+# per-stream latent loop replaced by ONE scatter + ONE gather; smaller than #18 M5's unpaged arena/bat
+# +37% since DSV4 batches only the latent — derived ckv/ikv/ring stay per-stream — and MoE dominates
+# decode FLOPs). Rule 4 satisfied: parity proven ⇒ default ON, one flag to
 # revert. (Nemotron AND InternLM2.5 graduated earlier via their own scoped ON defaults below, precisely
 # so flipping them did not preempt this DSV4 M3 regression.)
 PAGED_KV_BATCHED_DEFAULT = True
