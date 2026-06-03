@@ -17,19 +17,28 @@ That is the mistake this project exists to not repeat.
 
 ## Active task (transient — full handover in PLAN.md)
 
-**#18 — kill the per-stream KV-update IO loop** in DSV4 batched decode (replace the
-`B` ragged per-stream `_LayerCache` streams with a persistent `max_batch`-sized
-**batched KV arena** — ONE scatter write + ONE gather read; flag `kv_arena`, **default
-ON since M4**) is **COMPLETE — all milestones M0–M5 done & committed**: M0 ✅ `41a4d0f`,
-M1 ✅ `6f33cc1`, M2 ✅ `05d1171`, M3 ✅ `bf7af6b`, M4 ✅ `e08888d` (default ON; serving
-leases an arena row per stream, a discrete `DSV4Cache` still takes the per-stream loop —
-dispatch keys off the cache type), **M5 ✅ `f4935b5`** (real-model B-sweep bench on the
-DeepSeek-V4-Flash int4-g64 bake: arena **greedy-exact** vs the per-stream loop AND
-**+37% decode throughput at B=32**, the prod operating point; `arena/bat` monotone in B).
-**No #18 work remains** (optional non-blocking follow-up: extend the bench to B=48/64 on
-a free solo GPU). Full context, design, file/line anchors, gates, and the M5 results
-table are in **`PLAN.md`** (repo root). Cadence (standing user instruction): single
-thread, NO subagents, commit each milestone, then STOP for the user to compact.
+**None in flight.** The batched-decode / paged-KV / expert-footprint sweep across the
+serving keepers (DSV4, Nemotron, InternLM2.5, Qwen3.6) is fully landed:
+
+- **#18** — kill the per-stream KV-update IO loop in DSV4 batched decode via a persistent
+  `max_batch` **batched KV arena** (ONE scatter + ONE gather; flag `kv_arena`, default ON):
+  **COMPLETE M0–M5** (`41a4d0f`/`6f33cc1`/`05d1171`/`bf7af6b`/`e08888d`/`f4935b5`; M5 real-model
+  bench arena **greedy-exact** vs the per-stream loop AND **+37% decode tok/s @ B=32**).
+  Handover **`PLAN.md`**.
+- **#152** — block-paged KV with copy-on-write prefix sharing: **CLOSED**; `PAGED_KV_DEFAULT`
+  ON; all keepers real-paged-green.
+- **#153** — bring the #18 loop-kill to the PROD **paged** path (ONE block-table scatter + ONE
+  gather): **COMPLETE across all keepers + Qwen3.6** — DSV4 M0–M4
+  (`62609ba`/`c442c31`/`35dcd78`/`d19a254`/`cb2476b`, +13% @ B=32/48), Nemotron (+18% @ B=48),
+  InternLM2.5 (**3.20× @ B=32**), Qwen3.6 option-B (1.63× @ B=32) — each graduated ON behind its
+  own scoped flag. Handover **`PLAN_153.md`**.
+- **qwen35 routed-expert packing** — keep int4 experts packed + `mx.gather_qmm` instead of
+  dequant-to-bf16: **COMPLETE** (`a6b3b49`/`d17882e`/`f720fda`, marked complete `b62596e`;
+  resident **63→20 GiB**, greedy-exact, ppl unchanged). Handover **`PLAN_qwen35_experts.md`**.
+
+Optional, non-blocking: extend the #18 bench to B=48/64 on a free solo GPU (largely subsumed —
+#153 M4 already benched DSV4 at B=48). Cadence (standing user instruction): single thread, NO
+subagents, commit each milestone, then STOP for the user to compact.
 
 ---
 
