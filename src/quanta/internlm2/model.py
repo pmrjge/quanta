@@ -115,7 +115,9 @@ class InternLM2Model(nn.Module):
 
     def __call__(self, token_ids: mx.array, *, caches: list[KVCache] | None = None,
                  use_fast: bool = True, seq_hint: int | None = None,
-                 abs_pos_start: int | None = None, last_only: bool = False) -> mx.array:
+                 abs_pos_start: int | None = None, last_only: bool = False,
+                 capture_layers: tuple[int, ...] | None = None,
+                 ) -> mx.array | tuple[mx.array, dict[int, mx.array]]:
         """Forward ``[B, T]`` token ids → logits ``[B, T, vocab]``.
 
         ``caches`` (one ``KVCache`` per layer) enables incremental decode; pass ``None`` for prefill.
@@ -128,19 +130,32 @@ class InternLM2Model(nn.Module):
         uses absolute positions via ``cache.offset`` already — the override is only for chunked
         prefill).  ``last_only`` slices the residual to its last row before the output head,
         matching the packed path.
+
+        ``capture_layers`` (EAGLE-3 spec-decode substrate): when set, also return a
+        ``{layer: hidden[T, H]}`` dict of each named layer's **post-layer residual** (the low/mid/high
+        target features the drafter fuses) alongside the logits — ``(logits, caps)``. Captured before
+        the final norm and independent of ``last_only`` (always the full ``T`` positions of batch 0,
+        since EAGLE spec-decode is single-stream). ``None`` (default) returns logits only — the shipped
+        path, byte-for-byte unchanged. Mirrors
+        :meth:`quanta.minimax.runtime.MiniMaxResidentModel.__call__`'s capture convention.
         """
         if seq_hint is None and abs_pos_start is not None and caches is None:
             seq_hint = abs_pos_start + token_ids.shape[-1]
+        cap_set = set(capture_layers) if capture_layers else set()
+        caps: dict[int, mx.array] = {}
         x = self.tok_embeddings(token_ids)
         for i, layer in enumerate(self.layers):
             cache = caches[i] if caches is not None else None
             x = layer(x, cache=cache, use_fast=use_fast, seq_hint=seq_hint)
+            if i in cap_set:
+                caps[i] = x[0]                                  # [T, hidden] post-layer residual (batch 0)
         x = self.norm(x)
         if last_only:
             x = x[:, -1:, :]
-        if self.cfg.tie_word_embeddings:
-            return x @ self.tok_embeddings.weight.T
-        return self.output(x)
+        logits = x @ self.tok_embeddings.weight.T if self.cfg.tie_word_embeddings else self.output(x)
+        if cap_set:
+            return logits, caps
+        return logits
 
     def decode_batched(self, stream_tokens: list, caches: list, offsets: list[int], *,
                        paged_batched: bool = False) -> mx.array:
