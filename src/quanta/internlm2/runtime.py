@@ -227,7 +227,9 @@ class _PackedModel:
 
     def __call__(self, token_ids: mx.array, *, caches=None,
                  abs_pos_start: int | None = None,
-                 last_only: bool = False) -> mx.array:
+                 last_only: bool = False,
+                 capture_layers: tuple[int, ...] | None = None,
+                 ) -> mx.array | tuple[mx.array, dict[int, mx.array]]:
         """Forward ``[B, T]`` token ids → ``[B, T, vocab]`` (or ``[B, 1, vocab]`` if ``last_only``).
 
         ``abs_pos_start`` is the absolute position of ``token_ids[..., 0]`` in the full sequence.
@@ -241,9 +243,19 @@ class _PackedModel:
         caller (generate-loop / chunked prefill) only ever needs the last position's logits during
         prefill anyway, so this is purely a memory-safety win, not a semantic change.
 
+        ``capture_layers`` (EAGLE-3 spec-decode substrate): when set, also return a
+        ``{layer: hidden[T, H]}`` dict of each named layer's **post-layer residual** (batch 0)
+        alongside the logits — ``(logits, caps)`` — captured before the final norm and independent of
+        ``last_only`` (EAGLE spec-decode is single-stream). ``None`` (default) returns logits only,
+        the shipped path byte-for-byte unchanged. Matches the bf16
+        :meth:`quanta.internlm2.model.InternLM2Model.__call__` capture convention so the two paths are
+        interchangeable behind :class:`InternLM2ResidentModel` (see :mod:`quanta.internlm2.eagle`).
+
         Dynamic-NTK is auto-engaged when ``cache.offset + T > cfg.max_position_embeddings``: the
         RoPE base is rescaled per InternLM2's formula and applied uniformly across every layer.
         """
+        cap_set = set(capture_layers) if capture_layers else set()
+        caps: dict[int, mx.array] = {}
         x = mx.take(self.embed, token_ids, axis=0)                          # [B, T, H]
         t = x.shape[1]
         if abs_pos_start is None:
@@ -259,11 +271,16 @@ class _PackedModel:
                                        abs_pos_start=abs_pos_start, seq_len=seq_len)
             n = _rmsnorm(x, layer.ffn_norm, self.cfg.norm_eps)
             x = x + _packed_ffn(n, layer)
+            if i in cap_set:
+                caps[i] = x[0]                                              # [T, H] post-layer residual (batch 0)
         x = _rmsnorm(x, self.final_norm, self.cfg.norm_eps)
         if last_only:
             x = x[:, -1:, :]                                                # [B, 1, H]
         head = self.embed if self.cfg.tie_word_embeddings else self.lm_head
-        return x @ head.T
+        logits = x @ head.T
+        if cap_set:
+            return logits, caps
+        return logits
 
     def decode_batched(self, stream_tokens: list, caches: list, offsets: list[int], *,
                        paged_batched: bool = False) -> mx.array:
@@ -362,12 +379,28 @@ class InternLM2ResidentModel:
     def make_caches(self) -> InternLM2Cache:
         return self.new_cache()
 
+    def embed_head(self) -> tuple[mx.array, mx.array]:
+        """Frozen ``[V, H]`` token-embedding + LM-head matrices for the EAGLE-3 drafter, resolving
+        packed vs bf16 and tied vs untied. The drafter indexes ``embed[tok]`` for the next-token
+        feature and maps its head-space output through ``head.T`` to logits, so both must be the raw
+        ``[V, H]`` arrays the target itself uses (see :mod:`quanta.internlm2.eagle`)."""
+        m = self._model
+        if isinstance(m, _PackedModel):
+            embed = m.embed
+            head = embed if self.cfg.tie_word_embeddings else m.lm_head
+        else:
+            embed = m.tok_embeddings.weight
+            head = embed if self.cfg.tie_word_embeddings else m.output.weight
+        return embed, head
+
     def __call__(self, token_ids: mx.array, *,
                  cache: InternLM2Cache | None = None,
                  caches: InternLM2Cache | list | None = None,
                  offset: int | None = None,
                  use_fast: bool = True,
-                 last_only: bool = False) -> mx.array:
+                 last_only: bool = False,
+                 capture_layers: tuple[int, ...] | None = None,
+                 ) -> mx.array | tuple[mx.array, dict[int, mx.array]]:
         """Forward ``[B, T]`` token ids → ``[B, T, vocab]`` logits.
 
         Cache kwargs (accepts both forms — the oMLX ``_SingleTokenStepper`` passes ``caches=``):
@@ -382,6 +415,11 @@ class InternLM2ResidentModel:
 
         ``use_fast`` is plumbed for signature symmetry with the bf16 path; the packed path always
         uses ``mx.fast.rope`` + ``mx.fast.scaled_dot_product_attention``.
+
+        ``capture_layers`` (EAGLE-3 spec-decode): when set, returns ``(logits, {layer: hidden[T, H]})``
+        of each named layer's post-layer residual — threaded to the active inner forward (packed or
+        bf16), which capture identically. ``None`` (default) returns logits only. The EAGLE adapter
+        :mod:`quanta.internlm2.eagle` drives this with :meth:`embed_head` and :meth:`new_cache`.
         """
         del use_fast  # packed runtime is always fast
         # Normalize input shape: the oMLX shim's ``_SingleTokenStepper`` passes a 1-D ``[T]`` array
@@ -411,10 +449,12 @@ class InternLM2ResidentModel:
 
         if isinstance(self._model, _PackedModel):
             return self._model(token_ids, caches=cache_list,
-                                abs_pos_start=abs_pos_start, last_only=last_only)
+                                abs_pos_start=abs_pos_start, last_only=last_only,
+                                capture_layers=capture_layers)
         # bf16 reference path
         return self._model(token_ids, caches=cache_list, use_fast=True,
-                            abs_pos_start=abs_pos_start, last_only=last_only)
+                            abs_pos_start=abs_pos_start, last_only=last_only,
+                            capture_layers=capture_layers)
 
     def decode_batched(self, stream_tokens: list, caches: list, offsets: list[int], *,
                        paged_batched: bool = False) -> mx.array:
