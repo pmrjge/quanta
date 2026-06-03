@@ -111,9 +111,10 @@ These live **outside the repo** under `~/models` and do not survive a disk forma
 
 1. **Clone + verify:** `git clone git@gitlab.com:pmrj/final_quanta.git` → confirm `git log` shows
    `871258f` (M0) on `main`. Reinstall `uv`; `uv sync`.
-2. **Restore the auto-memory dir** (the project brain, 164 KB) to
-   `~/.claude/projects/-Users-pmrj-Environment-quant-finally-quanta/memory/` from your backup — it is
-   NOT in the repo. `MEMORY.md` + the `project_*.md` / `feedback_*.md` files seed a fresh session.
+2. **Restore the agent memory** (the project brain) — now **committed in-repo at `.claude/memory/`**,
+   so NO separate `~/.claude` backup is needed. After cloning, run `bash scripts/restore_claude_memory.sh`
+   to copy it into `~/.claude/projects/<slug>/memory/` (or `--symlink` to keep future memory edits living
+   in the repo). `MEMORY.md` + the `project_*.md` / `feedback_*.md` files seed a fresh session.
 3. **Restore `~/models`** (or the subset you backed up) — at minimum the int8-g64 InternLM2 bake for
    M1. Bakes are regenerable from sources + repo bake scripts (hours each) if not backed up; sources
    are re-downloadable from HF.

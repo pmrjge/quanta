@@ -57,4 +57,9 @@ scratch/
 *.swp
 
 # ---- Claude Code (local agent state / settings) ----
-.claude/
+# Ignore everything under .claude/ (worktrees, settings, local state) EXCEPT the committed
+# agent-memory snapshot below — the project "brain" is tracked so it travels with the repo and
+# survives a machine reformat without a separate ~/.claude backup. Restore it to the per-project
+# Claude memory dir on a fresh machine via scripts/restore_claude_memory.sh.
+.claude/*
+!.claude/memory/
