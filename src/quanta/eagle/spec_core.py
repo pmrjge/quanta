@@ -49,6 +49,8 @@ def spec_generate(
     layers: tuple[int, ...],
     eos_id: int | None = None,
     cache_eval_fn: CacheEvalFn | None = None,
+    head_bits: int | None = None,
+    head_group_size: int = 64,
 ) -> tuple[list[int], dict]:
     """Lossless EAGLE-3 spec-decode, model-agnostic.
 
@@ -71,13 +73,23 @@ def spec_generate(
         cache_eval_fn: optional ``(caches) -> list[mx.array]`` for explicit ``mx.eval`` of the cache
             state between rounds. Kimi uses this for memory control under 398 GiB resident; MiniMax's
             runtime self-evals each token's KV growth so ``None`` is correct there.
+        head_bits: if set, the per-draft-step vocab projection (run ``k``× per round — the dominant
+            drafter cost) uses ``mx.quantized_matmul`` against a ``head_bits``/``head_group_size``
+            quantization of ``head`` instead of a bf16 ``[H]×[H,V]`` matmul. ``head`` drives only
+            DRAFT-token selection — the target's own head does the lossless verify inside
+            ``forward_fn`` — so quantizing it changes draft *speed*, never correctness. Default
+            ``None`` = the exact bf16 path (byte-unchanged for every existing caller).
+        head_group_size: affine group size for the ``head_bits`` quantization (default 64).
 
     Returns:
         ``(tokens, stats)`` — ``stats['mean_accept']`` is the mean number of tokens emitted per target
         forward (1 = no speedup, ``k+1`` = perfect). Output is bit-identical to plain greedy decode.
     """
     prompt_ids = list(prompt_ids)
-    head_t = head.T
+    if head_bits is not None:
+        hwq, hsc, hbs = mx.quantize(head, group_size=head_group_size, bits=head_bits)  # draft-only, lossless
+    else:
+        head_t = head.T
 
     logits, caps = forward_fn(mx.array(prompt_ids), caches, 0, layers)
     cache_evals = cache_eval_fn(caches) if cache_eval_fn is not None else []
@@ -100,7 +112,12 @@ def spec_generate(
         for j in range(k):
             recur, normed = drafter.step(feat, embed[tok][None, None], offset=q + 1 + j,
                                          cache=dc, mask=None)
-            tok = int(mx.argmax(normed[0, 0] @ head_t).item())
+            if head_bits is not None:
+                tok = int(mx.argmax(mx.quantized_matmul(
+                    normed[0], hwq, hsc, hbs, transpose=True,
+                    group_size=head_group_size, bits=head_bits)[0]).item())
+            else:
+                tok = int(mx.argmax(normed[0, 0] @ head_t).item())
             drafts.append(tok)
             feat = recur                               # self-feed the feature-space recurrent output
 

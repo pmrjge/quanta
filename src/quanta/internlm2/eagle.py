@@ -50,7 +50,7 @@ def internlm2_capture_forward(model):
 def spec_generate(
     model, drafter: EagleDrafter, embed: mx.array, head: mx.array, prompt_ids,
     *, max_new: int, k: int = 4, layers: tuple[int, ...] = DEFAULT_CAPTURE_LAYERS,
-    eos_id: int | None = None,
+    eos_id: int | None = None, head_bits: int | None = None, head_group_size: int = 64,
 ) -> tuple[list[int], dict]:
     """Lossless EAGLE-3 spec-decode for InternLM2.5 (:class:`~quanta.internlm2.runtime.InternLM2ResidentModel`).
     Returns ``(tokens, stats)`` — output is bit-identical to plain greedy regardless of drafter
@@ -58,7 +58,9 @@ def spec_generate(
 
     Builds a fresh :class:`~quanta.internlm2.decode.InternLM2Cache` via ``model.new_cache()`` and
     wires the InternLM2 forward / truncate into :func:`quanta.eagle.spec_core.spec_generate`. The
-    runtime tracks KV growth itself, so no explicit ``cache_eval_fn`` is needed."""
+    runtime tracks KV growth itself, so no explicit ``cache_eval_fn`` is needed. ``head_bits`` (opt-in)
+    quantizes the per-draft-step vocab projection — the dominant drafter cost — and is lossless-safe
+    (draft-only; the target verifies with its own head)."""
     cache = model.new_cache()
 
     def forward_fn(ids, c, offset, capture_layers):
@@ -68,4 +70,5 @@ def spec_generate(
         c.truncate(length)
 
     return _spec_core(forward_fn, cache, truncate_fn, drafter, embed, head, prompt_ids,
-                      max_new=max_new, k=k, layers=layers, eos_id=eos_id)
+                      max_new=max_new, k=k, layers=layers, eos_id=eos_id,
+                      head_bits=head_bits, head_group_size=head_group_size)
