@@ -15,10 +15,19 @@ That is the mistake this project exists to not repeat.
 
 ---
 
-## Active task (transient — full handover in PLAN.md)
+## Active task (transient — full handover in PLAN_minference.md)
 
-**None in flight.** The batched-decode / paged-KV / expert-footprint sweep across the
-serving keepers (DSV4, Nemotron, InternLM2.5, Qwen3.6) is fully landed:
+**In flight: InternLM2.5 sparse-prefill (MInference family) — M0 ✅ `871258f`, M1 next.** Handover
+**`PLAN_minference.md`**. Reuse the validated block-sparse substrate (`quanta.modeling.xattention`,
+`gather_sparse_attention`/`sparse_prefill_mask`, `threshold=1.0`==dense); M0 wired a `self.sparse`
+hook into `InternLM2Attention` (default None = dense byte-unchanged) + model-free gate
+`parity/internlm2_xattn_test.py`. M1 next = real-model long-doc **ppl** sweep on the int8-g64 bake
+(solo GPU); `ppl_long.py` is Kimi-bound ⇒ write `parity/internlm2_ppl_sparse.py` sibling.
+
+Prior InternLM2.5 **EAGLE spec-decode** track is **COMPLETE** (M0–M3, `ec0f6f3`; **1.42× lossless @
+k=2** via drafter quantization — memory `project_internlm2_eagle.md`). The earlier batched-decode /
+paged-KV / expert-footprint sweep across the serving keepers (DSV4, Nemotron, InternLM2.5, Qwen3.6)
+is fully landed:
 
 - **#18** — kill the per-stream KV-update IO loop in DSV4 batched decode via a persistent
   `max_batch` **batched KV arena** (ONE scatter + ONE gather; flag `kv_arena`, default ON):
