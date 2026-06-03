@@ -32,6 +32,7 @@ import mlx.nn as nn
 
 from quanta.cache_quant import dequantize_last_axis, quantize_last_axis
 from quanta.internlm2.config import InternLM2Config
+from quanta.modeling.xattention import XAttnConfig, gather_sparse_attention, sparse_prefill_mask
 
 
 class KVCache:
@@ -188,6 +189,12 @@ class InternLM2Attention(nn.Module):
         self.wv = nn.Linear(cfg.hidden_size, cfg.kv_dim, bias=bias)
         self.wo = nn.Linear(cfg.q_dim, cfg.hidden_size, bias=bias)
 
+        # XAttention block-sparse prefill (lossy; ppl-gated, not parity). None => dense.
+        # Engages only on from-scratch prefill (t == kv_len) at/above cfg.min_seq; decode
+        # (t == 1) and cache-continuation stay dense. Mirrors quanta.modeling.attention's
+        # ``self.sparse`` hook; reuses the same validated block-sparse substrate.
+        self.sparse: XAttnConfig | None = None
+
     def _project(self, x: mx.array) -> tuple[mx.array, mx.array, mx.array]:
         """q,k,v -> [B, H, T, D] / [B, n_kv, T, D]."""
         b, t, _ = x.shape
@@ -215,11 +222,23 @@ class InternLM2Attention(nn.Module):
         kv_len = k.shape[2]
         kr = mx.repeat(k, self.rep, axis=1)                     # GQA: kv head -> its query group
         vr = mx.repeat(v, self.rep, axis=1)
-        if use_fast:
-            mask = "causal" if t > 1 else None
+
+        # XAttention block-sparse prefill: per-(query-)head scoring over the GQA-repeated kr/vr —
+        # exactly what dense SDPA sees — so threshold=1.0 reproduces dense causal attention.
+        # ``self.sparse is None`` => is_sparse_prefill False, mask falls back to causal, and the
+        # dense path below is byte-for-byte unchanged.
+        sparse = self.sparse
+        is_sparse_prefill = sparse is not None and t == kv_len and t >= sparse.min_seq
+        if is_sparse_prefill and sparse.gather:                 # block-gathered execution (speed path)
+            out = gather_sparse_attention(q, kr, vr, self.scale, sparse)
+        elif use_fast:
+            sparse_mask = sparse_prefill_mask(q, kr, self.scale, sparse) if is_sparse_prefill else None
+            mask = sparse_mask if sparse_mask is not None else ("causal" if t > 1 else None)
             out = mx.fast.scaled_dot_product_attention(q, kr, vr, scale=self.scale, mask=mask)
         else:
-            scores = (q @ mx.swapaxes(kr, -1, -2)) * self.scale + _causal_mask(t, kv_len, q.dtype)
+            sparse_mask = sparse_prefill_mask(q, kr, self.scale, sparse) if is_sparse_prefill else None
+            add = sparse_mask if sparse_mask is not None else _causal_mask(t, kv_len, q.dtype)
+            scores = (q @ mx.swapaxes(kr, -1, -2)) * self.scale + add
             w = mx.softmax(scores.astype(mx.float32), axis=-1).astype(q.dtype)
             out = w @ vr
         out = mx.transpose(out, (0, 2, 1, 3))                   # [B, T, H, D]
