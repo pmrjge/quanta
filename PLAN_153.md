@@ -2,8 +2,11 @@
 
 > Durable, repo-tracked handover for the NEXT task. Read `CLAUDE.md` first (permanent
 > rules + model facts), then `PLAN.md` (#18, the batched KV arena — DONE M0–M5; the
-> machinery #153 reuses), then this. **Status: DSV4 core M0–M1 DONE (storage primitives + dense
-> paged stepper `_PagedKVArena`, bit-exact model-free); M2 (compressed stepper) next. Multi-model
+> machinery #153 reuses), then this. **Status: ✅ #153 COMPLETE across ALL keepers (DSV4, Nemotron,
+> InternLM2.5, Qwen3.6).** DSV4 core M0–M4 DONE: M0 `62609ba` (storage primitives), M1 `c442c31` (dense
+> paged stepper `_PagedKVArena`), M2 `35dcd78` (compressed/latent-only stepper, derived per-stream), M3
+> `d19a254` (graduated `PAGED_KV_BATCHED_DEFAULT` ON, bit-exact model-free), M4 `cb2476b` (real-model
+> paged-batched bench — loop==loopkill BIT-exact at B∈{1,32,48} AND +13% decode tok/s @ B=32/48). Multi-model
 > loop-kill (user's order nemotron→internlm2→qwen3.6): Nemotron DONE + default GRADUATED ON
 > (real-model bench +18%@B48); InternLM2.5 DONE + default GRADUATED ON (real-model bench **3.20×@B32**,
 > scoped flag); **Qwen3.6: option B COMPLETE — M0–M4 ✅** (`c503657`/`cf299c3`/`9350482`/`0bacba8`/M4).
@@ -287,8 +290,9 @@ Nemotron's `_fused_attn_layer` inlines the equivalent core). (Started BEFORE DSV
   runtime (`nn.QuantizedLinear`) with the loop-kill projections **chunked ≤8** (M0 `c503657` found
   full-batch quantized also reorders at B≥12); operating point re-pinned **B=32**. Full design +
   milestones (M0 ✅) in the **"Qwen3.6 — option B"** section above.
-- **DSV4** (single-stream latent, paged) — the core #153 path; M1 done, M2–M3 remain (deferred behind
-  the multi-model order the user chose).
+- **DSV4** (single-stream latent, paged) — the core #153 path; ✅ **M0–M4 DONE** (`62609ba`/`c442c31`/
+  `35dcd78`/`d19a254`/`cb2476b`); `PAGED_KV_BATCHED_DEFAULT` GRADUATED ON at M3; real-model bench at M4
+  (loop==loopkill bit-exact, +13% @ B=32/48).
 
 ---
 
@@ -382,7 +386,7 @@ and #18-arena paths are untouched.
 
 ---
 
-## Milestones (mirroring #18; M0–M3 model-free, M4 deferred GPU)
+## Milestones (mirroring #18; M0–M3 model-free, M4 deferred GPU) — ✅ ALL DONE
 
 - **M0 ✅ DONE — batched scatter/gather on `PagedKVCacheManager` + flag.** Generic over the
   component dict ⇒ serves single-stream latent AND k/v in one primitive (see the M0-DONE
@@ -407,18 +411,23 @@ and #18-arena paths are untouched.
   materialized (masked padding inert), so even B≥2 is exact. Regressions green
   (`dsv4_batched_attention_test`, `dsv4_paged_latent_test` incl. real `_DSV4BatchedSession`
   admit/reuse `|Δ|=0` with the flag off, `dsv4_batched_test`) + ruff/compileall/lock/diff/pytest.
-- **M2 — compressed stepper + batched derived.** Reuse `_CompArena` for ckv/ikv/ring, seeded
-  from each stream's per-stream paged-cache derived state (the snapshot/restore lifecycle) and
-  snapshotted at boundaries. The hard milestone (derived batching × paged boundary snapshots).
-  Gate: compressed paged-batched == per-stream paged loop.
-- **M3 — wire `_step_paged` + flag default ON + regression.** `_step_paged` leases/uses the
-  batched-paged handle, threads `mgr.advance`/`commit` + recurrent snapshots, frees on release;
-  dispatch keys off cache type. Flip `paged_kv_batched` default ON after parity. Gate: extend
-  `parity/dsv4_paged_latent_test.py` for the batched-paged path + full regression
-  (pytest/ruff/compileall/lock/diff).
-- **M4 — real-model B-sweep bench (DEFERRED, solo GPU).** Like #18 M5: paged-batched vs
-  per-stream paged loop on the real DSV4-Flash bake. Not a correctness blocker (M0–M3 gated
-  model-free). Expect the same +Nx @ B that M5 showed for the unpaged arena.
+- **M2 ✅ DONE (`35dcd78`) — compressed stepper, latent-only batched.** Batches ONLY the latent (rides
+  `_PagedKVArena`); the derived ckv/ikv/ring stay PER-STREAM, so the paged boundary-snapshot lifecycle is
+  UNCHANGED — the PLAN's "batch the derived/`_CompArena`" guess was SIDESTEPPED (not the lever; smallest-safe
+  change). New paged-hybrid path in `decode_step_compressed_batched` (arena+rows+lcs, comp=None), 3-way
+  dispatch. Gate `parity/dsv4_paged_batched_test.py` §`_run_compressed_stepper`: compressed paged-batched ==
+  per-stream paged loop **BIT-exact (`max|Δ|=0`)** (ratio-4 +idx & ratio-3, B=4 + B=1).
+- **M3 ✅ DONE (`d19a254`) — graduated `PAGED_KV_BATCHED_DEFAULT` ON.** No `_step_paged`/omlx change needed —
+  M1/M2 flag-dispatch already wired `_step_paged`→`step_batch`→`_decode_batched_single` paged path. Gate
+  `parity/dsv4_paged_latent_test.py` §C: `_run_engine_batched` drives the REAL `_DSV4BatchedSession` decode
+  over ragged B=3 crossing block boundaries — ON==OFF bit-exact (`|Δ|=0`) AND greedy-exact vs discrete
+  (argmax_mismatch=0, decode_snapshots=5). Full regression green.
+- **M4 ✅ DONE (`cb2476b`) — real-model B-sweep bench (solo GPU).** `parity/dsv4_paged_batched_bench.py`
+  drives the REAL `_DSV4BatchedSession` paged decode on the DSV4-Flash int4-g64 bake, distinct prompts,
+  flips `rt._paged_kv_batched`: loop == loopkill **BIT-exact at B∈{1,32,48}** (both run the one batched SDPA;
+  latent store differs only by M0-equal scatter/gather) AND **+13% decode tok/s @ B=32 & B=48** (peak
+  ~192 GiB). Smaller than #18 M5's unpaged arena/bat +37% because DSV4 batches only the latent (derived
+  per-stream) and MoE dominates decode FLOPs. Confirmation + win quantification (flag already ON since M3).
 
 ---
 
