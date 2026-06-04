@@ -1,4 +1,4 @@
-"""InternLM2.5 long-doc sparse-prefill ppl gate — M1 (XAttention) + M2 (A-shape) selectors.
+"""InternLM2.5 long-doc sparse-prefill ppl gate — M1 (XAttention) + M2 (A-shape) + M3 (vertical-slash).
 
 Measures the **quality cost** of block-sparse prefill on the real int8-g64 InternLM2.5-7B bake,
 per selector, against the dense teacher (ppl / top-1 / Δppl%):
@@ -9,6 +9,10 @@ per selector, against the dense teacher (ppl / top-1 / Δppl%):
   the keep-all variant (``local = n_blocks``) is the parity anchor (== dense), L=4/L=2 the tightening
   windows whose cost is measured, plus an L=4 gather twin. A-shape feeds the **same** execution as
   XAttention — only the block-*selection* differs (``XAttnConfig.selector``).
+* **M3 — vertical-slash** (MInference §3): a GLOBAL pattern from an online probe of the last query
+  block — top-``vert`` vertical key-blocks ∪ top-``slash`` slash block-offset bands — applied to
+  every query block through the same execution. keep-all (``vert = slash = n_blocks``) is the parity
+  anchor (== dense); v3s3/v2s2 the tightening patterns whose cost is measured, plus a v3s3 gather twin.
 
 Sparse attention is **lossy ⇒ ppl-gated, never numeric-parity-gated** (CLAUDE.md rule 4). This is
 the quality baseline every later MInference selector (M2+) is judged against. Two things it proves
@@ -149,6 +153,20 @@ def run(n_layers: int | None = None, max_tokens: int = 1024) -> None:
     variants.append(("ashape L=4 gat", XAttnConfig(block=128, stride=16, selector="ashape",
                                                    local=4, min_seq=0, gather=True)))
 
+    # M3: vertical-slash selector (MInference §3) — a global pattern from the last query block's
+    # probe: top-`vert` vertical key-blocks ∪ top-`slash` slash block-offset bands, applied to every
+    # query block through the SAME execution (only XAttnConfig.selector differs). keep-all
+    # (vert=slash=n_blocks) keeps every causal block ⇒ == dense (the real-model parity anchor); v3s3 /
+    # v2s2 are tightening patterns whose ppl cost is measured; the v3s3 gather twin checks the gather
+    # speed-path == the mask quality-path on the bake (the M3 invariant — both use the one global index).
+    variants.append(("vslash keepall", XAttnConfig(block=128, stride=16, selector="vslash",
+                                                   vert=nblk, slash=nblk, min_seq=0, gather=False)))
+    for vv in (3, 2):
+        variants.append((f"vslash v{vv}s{vv}", XAttnConfig(block=128, stride=16, selector="vslash",
+                                                          vert=vv, slash=vv, min_seq=0, gather=False)))
+    variants.append(("vslash v3s3 gat", XAttnConfig(block=128, stride=16, selector="vslash",
+                                                    vert=3, slash=3, min_seq=0, gather=True)))
+
     emb = art.embed()
     h0 = emb[arr][None]                                   # [1, T, H] bf16
     del emb
@@ -213,6 +231,18 @@ def run(n_layers: int | None = None, max_tokens: int = 1024) -> None:
     d_a4 = 100 * (a4_mask - dense) / dense
     d_a2 = 100 * (a2_mask - dense) / dense
 
+    # M3 vertical-slash gates: keep-all == dense (the real-model parity anchor) and gather==mask (the
+    # M3 invariant — both executions read the ONE global index) are hard correctness checks; the
+    # tight-pattern Δppl is the *measured* cost (recorded, not pass/fail — vertical-slash is one of a
+    # per-head menu, not forced on every head). v_sane only catches a blown-up integration.
+    v_keepall = ppls["vslash keepall"]
+    v3_mask, v3_gat, v2_mask = ppls["vslash v3s3"], ppls["vslash v3s3 gat"], ppls["vslash v2s2"]
+    v_anchor = abs(v_keepall - dense) / dense < 0.01     # keep-all (vert=slash=n_blocks) == dense
+    v_twin = abs(v3_gat - v3_mask) / v3_mask < 0.01      # vertical-slash gather speed-path == mask path
+    v_sane = v2_mask < 2.0 * dense                       # tightest pattern not blown up (bug catch)
+    d_v3 = 100 * (v3_mask - dense) / dense
+    d_v2 = 100 * (v2_mask - dense) / dense
+
     print(f"\n  dense ppl<20: {healthy} ({dense:.3f})   "
           f"gather==mask @0.9 (<1%): {twin} (Δ={abs(gat90 - mask90):.2e})")
     print(f"  xattn  t=0.90 Δppl = {d90:+.2f}%   free(≤2%): {free}   sane(≤8%): {sane}")
@@ -220,9 +250,14 @@ def run(n_layers: int | None = None, max_tokens: int = 1024) -> None:
           f"gather==mask @L=4 (<1%): {a_twin} (Δ={abs(a4_gat - a4_mask):.2e})")
     print(f"  ashape L=4 Δppl = {d_a4:+.2f}%   L=2 Δppl = {d_a2:+.2f}%   "
           f"(static selector — cost recorded; cf. xattn t=0.9 {d90:+.2f}%)")
-    ok = healthy and twin and sane and a_anchor and a_twin and a_sane
+    print(f"  vslash keep-all==dense (<1%): {v_anchor} (Δ={abs(v_keepall - dense):.2e})   "
+          f"gather==mask @v3s3 (<1%): {v_twin} (Δ={abs(v3_gat - v3_mask):.2e})")
+    print(f"  vslash v3s3 Δppl = {d_v3:+.2f}%   v2s2 Δppl = {d_v2:+.2f}%   "
+          f"(global probe pattern — cost recorded; cf. xattn t=0.9 {d90:+.2f}%)")
+    ok = (healthy and twin and sane and a_anchor and a_twin and a_sane
+          and v_anchor and v_twin and v_sane)
     print(f"\n{'PASS' if ok else 'FAIL'}  (xattn t=0.90 {'FREE' if free else 'NOT free'}; "
-          f"A-shape integrated — keep-all anchored, gather==mask, cost recorded)")
+          f"A-shape + vertical-slash integrated — keep-all anchored, gather==mask, cost recorded)")
     if not ok:
         raise SystemExit(1)
 

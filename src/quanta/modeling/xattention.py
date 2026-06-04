@@ -56,18 +56,27 @@ class XAttnConfig:
     # "xattn"  — antidiagonal block scoring + nucleus selection (the validated default).
     # "ashape" — MInference A-shape: attention sink (block 0) + a ``local``-block causal window,
     #            purely positional (no scoring). Static/lossier; MInference assigns it per-head.
+    # "vslash" — MInference vertical-slash: a global pattern from an online probe of the LAST query
+    #            block's attention to all keys (MInference §3) — top-``vert`` vertical key-blocks
+    #            (columns everyone attends) ∪ top-``slash`` slash block-offset bands (diagonals at a
+    #            fixed query-minus-key offset) — applied to every query block. Data-dependent but the
+    #            pattern is built ONCE from the last block (prefill-only; decode stays dense).
     selector: str = "xattn"
     local: int = 8  # A-shape local window width in blocks (incl. the diagonal); selector="ashape" only
+    vert: int = 8   # vertical-slash: # of vertical key-blocks kept globally; selector="vslash" only
+    slash: int = 8  # vertical-slash: # of slash block-offset bands kept globally; selector="vslash" only
 
     def __post_init__(self) -> None:
         if self.block % self.stride != 0:
             raise ValueError(f"block {self.block} must be divisible by stride {self.stride}")
         if self.budget is not None and self.budget < 1:
             raise ValueError(f"budget must be >= 1, got {self.budget}")
-        if self.selector not in ("xattn", "ashape"):
-            raise ValueError(f"selector must be 'xattn' or 'ashape', got {self.selector!r}")
+        if self.selector not in ("xattn", "ashape", "vslash"):
+            raise ValueError(f"selector must be 'xattn', 'ashape', or 'vslash', got {self.selector!r}")
         if self.local < 1:
             raise ValueError(f"local must be >= 1, got {self.local}")
+        if self.vert < 1 or self.slash < 1:
+            raise ValueError(f"vert/slash must be >= 1, got vert={self.vert}, slash={self.slash}")
 
 
 # Runtime default sparse config: bounded block-gather XAttention prefill (gather=True,
@@ -152,13 +161,86 @@ def ashape_keep(tq: int, tk: int, q_offset: int, local: int) -> mx.array:
     return (window | (j == 0)) & causal                # ∪ sink (block 0), re-clamped causal
 
 
+def vertical_slash_index(
+    q: mx.array, k: mx.array, scale: float, cfg: XAttnConfig
+) -> tuple[mx.array, mx.array, mx.array]:
+    """MInference vertical-slash index from an online probe of the LAST query block (MInference §3).
+
+    Runs the *last* (real) query block's attention over all keys, then decomposes that probe two
+    ways to pick a single GLOBAL block pattern that is then applied to every query block:
+
+    * **vertical** — per-key-*column* mass summed over the probe queries, pooled to key blocks; the
+      top-``cfg.vert`` key blocks are kept as vertical stripes (columns everyone attends). Sink block
+      0 is excluded from the top-k (it is force-kept anyway), so the budget is spent on real columns.
+    * **slash** — per-token-*offset* mass (query-pos − key-pos) summed over the probe, pooled to
+      block-offsets; the top-``cfg.slash`` block-offsets are kept as diagonal bands. Offset 0 (the
+      diagonal) is excluded (force-kept). A token-offset δ is binned to block-offset ``δ // block``.
+
+    Returns ``(vert_keep [B,H,Tk] bool, slash_keep [B,H,Tq] bool, key_mass [B,H,Tk] float)`` — the two
+    boolean selections plus the per-key-block probe mass, reused as the gather-budget priority. The
+    probe is one ``[B,H,lp,S]`` attention matrix (``lp`` = last-block size ≤ ``block``); a plain
+    ``q@kᵀ`` matmul (not ``mx.fast.sdpa``) because the *attention weights* are needed, not the output.
+    Guarded by ``max_alloc_gb`` (fail loud, never OOM). Data-dependent but built ONCE from the last
+    block — a prefill-only pattern (decode stays dense); the per-(query,key) execution mask the
+    selection feeds is still strictly causal, so no future *content* leaks into earlier positions.
+    """
+    bsz, h, t, _ = q.shape
+    s = k.shape[2]
+    blk = cfg.block
+    tq = (t + blk - 1) // blk
+    tk = (s + blk - 1) // blk
+    p0 = (tq - 1) * blk                          # first token of the last (real) query block
+    q_last = q[:, :, p0:, :]                      # [B,H,lp,D]
+    lp = q_last.shape[2]
+
+    gb = bsz * h * lp * s * 4 / 1e9               # fp32 probe attention [B,H,lp,S]
+    if gb > cfg.max_alloc_gb:
+        raise MemoryError(
+            f"vertical_slash probe [B,H,{lp},{s}] ~= {gb:.1f} GB exceeds max_alloc_gb="
+            f"{cfg.max_alloc_gb}; the long-context probe needs key-chunking (not yet implemented)."
+        )
+
+    qpos = mx.arange(p0, p0 + lp)[:, None]        # [lp,1] abs query positions
+    kpos = mx.arange(s)[None, :]                  # [1,S]
+    sc = (q_last @ mx.swapaxes(k, -1, -2)) * scale            # [B,H,lp,S] raw probe scores
+    sc = mx.where(kpos <= qpos, sc, NEG_INF)                  # causal
+    a = mx.softmax(sc.astype(mx.float32), axis=-1)           # [B,H,lp,S] probe attention
+
+    # vertical: column mass over probe queries → per-key-block; sink (block 0) out of the top-k.
+    col = _pad_to(a.sum(axis=2), blk, axis=2)                # [B,H,tk*blk]
+    key_mass = col.reshape(bsz, h, tk, blk).sum(axis=3)      # [B,H,tk]
+    kk = mx.arange(tk)[None, None, :]
+    vscore = mx.where(kk == 0, NEG_INF, key_mass)
+    vrank = mx.argsort(mx.argsort(-vscore, axis=-1), axis=-1)  # rank of each block (0 = largest)
+    vert_keep = vrank < min(cfg.vert, tk)                    # [B,H,tk] bool
+
+    # slash: token-offset mass (qpos − kpos) → per block-offset; diagonal (offset 0) out of the top-k.
+    # gather a[r, p0+r-δ] for each probe row r and offset δ — the offset-δ key of that row — then
+    # sum over r. One gather + one sum (no per-token loop); invalid (non-causal) entries zeroed.
+    n_off = t
+    r = mx.arange(lp)[:, None]
+    dl = mx.arange(n_off)[None, :]
+    c_idx = (p0 + r - dl).astype(mx.int32)                   # [lp,n_off] key index for offset dl
+    valid = (dl <= p0 + r) & (c_idx >= 0)                    # causal & in-range
+    gi = mx.broadcast_to(mx.clip(c_idx, 0, s - 1)[None, None], (bsz, h, lp, n_off))
+    g = mx.where(valid[None, None], mx.take_along_axis(a, gi, axis=-1), 0.0)  # [B,H,lp,n_off]
+    slash_tok = _pad_to(g.sum(axis=2), blk, axis=2)          # [B,H,tq*blk]
+    slash_off = slash_tok.reshape(bsz, h, tq, blk).sum(axis=3)   # [B,H,tq] per block-offset
+    oo = mx.arange(tq)[None, None, :]
+    sscore = mx.where(oo == 0, NEG_INF, slash_off)
+    srank = mx.argsort(mx.argsort(-sscore, axis=-1), axis=-1)
+    slash_keep = srank < min(cfg.slash, tq)                  # [B,H,tq] bool
+    return vert_keep, slash_keep, key_mass
+
+
 def select_keep(
-    q: mx.array, k: mx.array, scale: float, cfg: XAttnConfig, q_offset: int = 0
+    q: mx.array, k: mx.array, scale: float, cfg: XAttnConfig, q_offset: int = 0,
+    index: tuple[mx.array, mx.array, mx.array] | None = None,
 ) -> tuple[mx.array, mx.array]:
     """Selector dispatch → ``(keep, rank)`` block masks ``[B, H, Tq, Tk]`` for ``cfg.selector``.
 
     ``keep`` is the bool block keep-mask; ``rank`` is the per-block priority used to order the kept
-    blocks when the gather budget cap binds (higher = gathered first). The two selectors share the
+    blocks when the gather budget cap binds (higher = gathered first). The selectors share the
     downstream execution (additive mask / block gather) verbatim — they differ ONLY here:
 
     * ``"xattn"`` — antidiagonal block scores → nucleus selection; ``rank`` is the score itself, so
@@ -166,6 +248,11 @@ def select_keep(
       pre-selector path** (``select_blocks(block_scores(…))``), so XAttention quality is unchanged.
     * ``"ashape"`` — positional sink + ``local``-block window; ``rank`` is block recency (key-block
       index ``j``), so a binding budget keeps the nearest-to-diagonal local blocks.
+    * ``"vslash"`` — global vertical key-blocks ∪ slash block-offset bands from a last-block probe
+      (:func:`vertical_slash_index`). The pattern is GLOBAL, so the caller computes it once over the
+      whole sequence and threads it in via ``index`` (the chunked gather path reuses the same global
+      index for every chunk — that is what keeps gather == mask). ``rank`` is the per-key-block probe
+      mass. When ``index`` is None it is computed here from ``(q, k)`` (the whole-sequence case).
 
     ``q_offset`` is the global block index of the first query row (the chunked gather path passes its
     chunk origin so causality/window use global positions); ``q_offset=0`` is the whole-sequence case.
@@ -176,6 +263,24 @@ def select_keep(
         tk = (k.shape[2] + cfg.block - 1) // cfg.block
         keep = mx.broadcast_to(ashape_keep(tq, tk, q_offset, cfg.local)[None, None], (bsz, h, tq, tk))
         rank = mx.broadcast_to(mx.arange(tk, dtype=mx.float32)[None, None, None, :], (bsz, h, tq, tk))
+        return keep, rank
+    if cfg.selector == "vslash":
+        bsz, h = q.shape[0], q.shape[1]
+        blk = cfg.block
+        tq = (q.shape[2] + blk - 1) // blk
+        tk = (k.shape[2] + blk - 1) // blk
+        if index is None:
+            index = vertical_slash_index(q, k, scale, cfg)
+        vert_keep, slash_keep, key_mass = index
+        i = mx.arange(q_offset, q_offset + tq)[:, None]
+        j = mx.arange(tk)[None, :]
+        causal = j <= i
+        off = mx.clip((i - j).astype(mx.int32), 0, slash_keep.shape[-1] - 1)   # [tq,tk] block-offset
+        slsh = mx.take(slash_keep, off, axis=-1)                # [B,H,tq,tk] slash band membership
+        vert = vert_keep[:, :, None, :tk]                       # [B,H,1,tk] broadcast over query rows
+        forced = (j == i) | (j == 0)                            # diagonal (local) + sink (block 0)
+        keep = (vert | slsh | forced) & causal                 # [B,H,tq,tk]
+        rank = mx.broadcast_to(key_mass[:, :, None, :tk], (bsz, h, tq, tk))
         return keep, rank
     scores = block_scores(q, k, scale, cfg.block, cfg.stride)
     return select_blocks(scores, cfg.threshold, q_offset), scores
@@ -212,7 +317,10 @@ def sparse_prefill_mask(
             f"sparse_prefill_mask [B,H,T,S] ~= {gb:.1f} GB (T={t}, heads={h}) exceeds "
             f"max_alloc_gb={cfg.max_alloc_gb}; enable XAttnConfig.gather=True for long context."
         )
-    keep, _ = select_keep(q, k, scale, cfg, 0)
+    # vertical-slash needs ONE global pattern (from the last query block's probe); xattn/ashape
+    # select locally so they pass index=None and select inside select_keep.
+    index = vertical_slash_index(q, k, scale, cfg) if cfg.selector == "vslash" else None
+    keep, _ = select_keep(q, k, scale, cfg, 0, index)
     return additive_mask(keep, t, s, cfg.block, q.dtype)
 
 
@@ -257,13 +365,19 @@ def gather_sparse_attention(
     cb = _chunk_blocks(bsz, h, blk, d, vd, cap, cfg.max_alloc_gb)  # query blocks per chunk
     inf = mx.array(float("inf"))
 
+    # vertical-slash builds ONE global pattern from the last query block's probe (over the *unpadded*
+    # q/k, so the probe is the last REAL block) and applies it to every chunk — computed once here,
+    # not per chunk, so all chunks select identically (that is what keeps gather == mask). xattn and
+    # ashape select locally per chunk (index stays None).
+    index = vertical_slash_index(q, k, scale, cfg) if cfg.selector == "vslash" else None
+
     outs: list[mx.array] = []
     for c0 in range(0, nb, cb):
         c1 = min(c0 + cb, nb)  # query blocks [c0,c1); causal horizon = key blocks [0,c1)
         m = c1 - c0
         q_chunk = qp[:, :, c0 * blk : c1 * blk, :]  # [B,H,m*blk,d]
 
-        keep, rank = select_keep(q_chunk, kp[:, :, : c1 * blk, :], scale, cfg, c0)  # [B,H,m,c1]
+        keep, rank = select_keep(q_chunk, kp[:, :, : c1 * blk, :], scale, cfg, c0, index)  # [B,H,m,c1]
         counts = mx.sum(keep.astype(mx.int32), axis=-1)  # [B,H,m]
         max_k = min(int(mx.max(counts).item()), cap)
         capped = mx.minimum(counts, max_k)  # [B,H,m]

@@ -125,15 +125,62 @@ window) +0.58%**, **L=2 (256-tok window) +3.76%** — A-shape is cheaper-but-los
 M1 xattn reproduced bit-identically in the same run (t=0.90 +0.31%, gather==mask 5.9e-3), confirming
 the `select_keep` refactor did not regress the validated path.
 
-### M3+ — vertical-slash selector + per-head pattern assignment (remaining)
-- **Vertical-slash** = specific key *columns* (vertical lines) attended by all queries + diagonal/slash
-  bands. Token-column-level, not pure block — needs its own index construction (online estimation
-  from the last query block's attention, MInference §3); the block-sparse pattern maps onto
-  `select_keep`-style selection. Lands as its own milestone + ppl gate (vs the M1/M2 baselines).
+### M3 ✅ — vertical-slash selector (MInference §3) — DONE
+Added MInference's **vertical-slash** selector onto the SAME validated block-gather / additive-mask
+execution. Unlike xattn/ashape (which select *locally* per query block), vertical-slash builds ONE
+**global** pattern from an online probe of the LAST query block's attention to all keys, then applies
+it to every query block. The probe (`vertical_slash_index`) runs the last real query block's actual
+attention (`q_last @ kᵀ` softmax — a plain matmul, since the attention *weights* are needed, not the
+output; guarded by `max_alloc_gb`), then decomposes it two ways:
+- **vertical** — per-key-*column* mass summed over the probe queries, pooled to key blocks → top-`vert`
+  key blocks kept as vertical stripes (columns every query attends); sink block 0 excluded from the
+  top-k (force-kept anyway).
+- **slash** — per-token-*offset* mass (query-pos − key-pos), summed via one gather+sum over the probe,
+  pooled to block-offsets (`δ // block`) → top-`slash` block-offsets kept as diagonal bands; offset 0
+  (the diagonal) excluded (force-kept).
+
+The keep is then positional given (vert, slash): `keep[i,j] = causal & (j∈vert | (i−j)∈slash | j==0 |
+j==i)`. Because the pattern is global, the caller computes the index **once** over the whole sequence
+and threads it into every chunk of the gather path — so gather and mask select identically (the twin).
+Smallest-diff design: a `"vslash"` branch on `select_keep(…, index=None)` + a `vert`/`slash` field on
+`XAttnConfig`; `sparse_prefill_mask`/`gather_sparse_attention` precompute the index for vslash only.
+xattn/ashape paths byte-for-byte unchanged.
+- `src/quanta/modeling/xattention.py`: `XAttnConfig.{vert,slash}` (+ validation), `vertical_slash_index`,
+  `select_keep` `"vslash"` branch + `index` param; both execution paths precompute & thread the index.
+- `parity/internlm2_vslash_test.py` (NEW, model-free, fp32, T=500, real `InternLM2Attention`):
+  `vertical_slash_index`+`select_keep` strictly causal (no future block) / diagonal+sink always kept /
+  keep-all == full causal mask; keep-all (vert,slash ≥ n_blocks) mask **== dense EXACTLY (0.00)** +
+  gather 5e-8; **gather==mask** at v=s=1 (5e-8); tight pattern drops blocks (3.7e-2); budget cap
+  engages; `min_seq>T` gates off (0.00); perturb-last-token leaves block 0 unchanged (0.00 — block 0's
+  selectable set is force-pinned to {0} by causality, so it is probe-independent). Run:
+  `uv run python -m parity.internlm2_vslash_test`.
+- `parity/internlm2_ppl_sparse.py` (EXTENDED): vslash variants (keep-all anchor, v3s3, v2s2, v3s3
+  gather twin) + M3 gates alongside the M1/M2 gates (re-validated unchanged in the same solo run).
+- Gates: M0 `internlm2_xattn_test` + M2 `internlm2_ashape_test` + `xattention_parity` still green
+  (xattn/ashape unchanged); `internlm2_vslash_test` green; pytest/ruff/compileall/`uv lock
+  --check`/`git diff --check` clean.
+
+**RESULTS (32 layers, 823 tok / 7 blocks; same bake & doc as M1/M2):** dense ppl **12.3379** (top-1
+44.2%). **vslash keep-all == dense EXACTLY (Δppl 0.00)** — real-model parity anchor. **vslash
+gather==mask @ v3s3: 0.217% rel (Δppl 2.76e-2 < 1%)** — M3 invariant (kernel fp drift only; same global
+index, budget never binds at 7 blocks). Measured cost: **v3s3 +3.01%**, **v2s2 +7.29%** (monotone in
+kept blocks). At this **short** 7-block doc vertical-slash is the lossiest of the three (cf. xattn
+t=0.9 +0.31%, ashape L=4 +0.58%) — expected: it is a *long-context, per-head-assigned* pattern (its
+global vertical tokens + slash bands pay off at 100K+, not on a doc with little long-range structure);
+the gate's job is correct integration (anchor + twin green) + an honest cost measurement, not to win at
+7 blocks. M1/M2 reproduced bit-identically in the same run (xattn t=0.9 +0.31% / gather==mask 5.9e-3;
+ashape L=4 +0.58% / gather==mask 2.2e-3), confirming the `index` refactor did not regress them.
+
+### M4+ — per-head offline pattern assignment (remaining)
 - **Per-head offline pattern assignment** (kernel-aware search) is the MInference setup step: give
-  each head the cheapest pattern (A-shape / vertical-slash / block-sparse) that holds its quality.
-  Can start fixed-per-head and refine. The selectors are now plug-compatible (`XAttnConfig.selector`),
-  so per-head assignment is a routing layer over them. Each selector/assignment = its own milestone.
+  each head the cheapest pattern (A-shape / vertical-slash / block-sparse) that holds its quality —
+  this is where vertical-slash earns its place (assigned only to the heads it suits, not forced on
+  every head as the M3 ppl gate does). Can start fixed-per-head and refine. The selectors are now
+  plug-compatible (`XAttnConfig.selector`), so per-head assignment is a routing layer over them: the
+  `self.sparse` hook becomes a per-head list/array of configs (or a head→selector map) the attention
+  module dispatches over. Each assignment scheme = its own milestone + ppl gate (vs the M1/M2/M3
+  baselines). A natural long-context follow-up: key-chunk the vertical-slash probe (currently one
+  `max_alloc_gb`-guarded matmul) so it scales past the gate's short doc to 100K+ where vslash wins.
 
 ---
 
