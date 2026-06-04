@@ -226,17 +226,70 @@ xattn fallback at this short doc). M1/M2/M3 reproduced bit-identically in the sa
 +3.01% / twin 2.76e-2), confirming the `head_selectors` field + `_attn_heads` extraction regressed
 nothing.
 
-### M5+ — per-head *params* + long-context (remaining)
-- **Per-head params, not just kind** (the "refine" of M4's shared-per-kind params): generalize
-  `head_selectors` so each head can carry its OWN params (different `local`/`vert`/`slash`/`threshold`),
-  and replace the fixed `tol` with MInference's actual **kernel-aware FLOP-budgeted search** (pick the
-  per-head pattern+params minimizing approximation error under a target kept-block budget). Its own
-  milestone + ppl gate vs M4.
-- **Long-context probe**: key-chunk the vertical-slash probe (currently one `max_alloc_gb`-guarded
+### M5 ✅ — per-head *params* (kernel-aware FLOP-budgeted search) — DONE
+Generalized M4 from per-head *kind* (shared per-kind params) to per-head *params*: each query head carries
+its OWN selector params (ashape `local`, xattn `threshold`), and the offline assignment becomes
+MInference's **kernel-aware FLOP-budgeted search** — per head, the most accurate candidate (kind, params)
+whose cost fits a FLOP budget. Like M4 it is a pure **routing layer** over the validated M1/M2/M3
+selectors: head `h`'s kept-block mask is byte-identical to the uniform keep for `head_specs[h]`'s (kind,
+params). Smallest-diff design:
+- a frozen **`HeadSpec(kind, threshold, local, vert, slash)`** + a `head_specs: tuple[HeadSpec,…] | None`
+  field on `XAttnConfig` (None ⇒ fall back to M4's `head_selectors` / uniform — every path byte-for-byte
+  unchanged; takes precedence when set, both-set rejected). `_select_keep_per_head_specs` computes each
+  *distinct* spec's keep/rank for ALL heads (a bounded loop over the DISTINCT specs present — the
+  search-grid size, never per-head/per-token, rule 3), stacks `[n_spec,B,H,Tq,Tk]`, routes per head with
+  one `take_along_axis`. vslash params are **shared, not per-head**: the global probe index is threaded
+  once, so a vslash spec's vert/slash must equal the config's (fail-loud `__post_init__` guard);
+  ashape/xattn select locally so their params are freely per-head. Per-head vslash *param* variation is
+  deferred to M6 (which reworks the probe).
+- `assign_head_specs(errors[C,H], costs[C], candidates, budget)` — the **dual** of M4's policy: per head
+  the most accurate candidate whose kernel-aware cost ≤ budget (else the cheapest). Pure/positional ⇒
+  unit-testable.
+- `InternLM2Attention._attn_qkv` — a parity-preserving extraction of `_attn_heads`' front half (project +
+  RoPE + cache + GQA-repeat), shared with the new offline `_attn_keep_counts` (per-head mean kept blocks
+  for a candidate = its measured FLOP cost). `__call__`/`_attn_heads` behavior unchanged.
+
+Deliverables:
+- `src/quanta/modeling/xattention.py`: `HeadSpec`, `XAttnConfig.head_specs` (+ validation: non-empty,
+  mutually-exclusive-with-`head_selectors`, vslash-pin), `_select_keep_per_head_specs`, `select_keep`
+  per-spec dispatch (precedence over M4), `_uses_vslash` head_specs case, `assign_head_specs`.
+- `src/quanta/internlm2/attention.py`: `_attn_qkv` extraction + offline `_attn_keep_counts`; imports.
+- `parity/internlm2_perhead_params_test.py` (NEW, model-free, fp32, T=500, real `InternLM2Attention`):
+  `assign_head_specs` budget policy (budget-excludes-accurate / full-budget / under-budget / tie) +
+  routing exactness incl. **same-kind heads at different params** + uniform-as-per-head-specs == uniform
+  (0.00) + MIXED keep-all == dense, mask **(0.00)** & gather (5e-8) + gather==mask (4e-8) +
+  sparsity-active + budget-capped + min_seq-gated + causal-safe + validation (vslash-pin / both-set /
+  non-HeadSpec / length mismatch rejected). Run: `uv run python -m parity.internlm2_perhead_params_test`.
+- `parity/internlm2_ppl_sparse.py` (EXTENDED): per-layer per-candidate error (reusing the M4 dense
+  calibration) + kernel-aware cost via `_attn_keep_counts`, sorted cheap→accurate, `assign_head_specs`
+  at `ph2_budget=4.0` blocks; `perhd-p` / `perhd-p gat` (derived) + `perhd-p anchor` (mixed keep-all)
+  variants + M5 gates + a realized (kind,params) mix readout, alongside the M1/M2/M3/M4 gates.
+- Gates: M0 xattn + M2 ashape + M3 vslash + M4 perhead + `xattention_parity` still green (all prior paths
+  unchanged); `internlm2_perhead_params_test` green; pytest/ruff/compileall/`uv lock --check`/`git diff
+  --check` clean.
+
+**RESULTS (32 layers, 823 tok / 7 blocks; same bake & doc as M1–M4):** dense ppl **12.3379** (top-1
+44.2%). **perhd-p mixed keep-all == dense EXACTLY (Δppl 0.00)** — the per-head-params parity anchor.
+**perhd-p gather==mask: Δ=3.29e-3 (<1%)** — the M5 twin. Measured: **perhd-p Δppl +0.15%** — **better than
+M4's per-head-kind (+0.40%) AND the best uniform (xattn t=0.9 +0.31%)** — with the FLOP-budgeted search
+(budget=4 blocks) assigning (Σ 32 layers × 32 heads = 1024) **ashape:L4 771 (75%), xattn:t0.9 239 (23%),
+vslash:v2s2 6 (1%), xattn:t0.95 8 (1%)**. Per-head params let 75% of heads run the cheap static
+ashape-L4 kernel (uniform +0.58% alone) while each head still gets its most-accurate-affordable
+approximation, so the aggregate beats forcing any single pattern everywhere — the MInference thesis,
+realized. M1/M2/M3/M4 reproduced bit-identically in the same run (xattn t=0.9 +0.31% / twin 5.94e-3;
+ashape L=4 +0.58% / twin 2.16e-3; vslash v3s3 +3.01% / twin 2.76e-2; M4 perhead +0.40% / anchor 0.00 /
+twin 8.88e-3 / mix 86/14/0), confirming the `head_specs` field + `_attn_qkv` extraction regressed nothing.
+
+### M6+ — long-context probe + wall-clock bench (remaining)
+- **Long-context vertical-slash probe**: key-chunk the probe (currently one `max_alloc_gb`-guarded
   matmul) so it scales past the gate's short doc to 100K+ where vslash earns assignments (at 7 blocks it
-  takes 0%). Pair with a real wall-clock **gather-path prefill bench** — the actual FLOP/memory speedup
-  (the mask path measures quality only; with fast SDPA + an additive block mask MLX still computes the
-  full QKᵀ).
+  takes ~0–1%). Thread a param-INDEPENDENT probe (per-key-block + per-offset masses) so per-head vslash
+  *params* (vert/slash) can also vary (the M5 deferral) while gather still == mask. Its own milestone +
+  ppl gate.
+- **Gather-path prefill bench**: a real wall-clock measurement of the `gather=True` speed path — the
+  actual FLOP/memory win (the mask path measures quality only; with fast SDPA + an additive block mask
+  MLX still computes the full QKᵀ). Pair it with the long-context probe so vslash's long-range payoff is
+  measured where it lands.
 
 ---
 

@@ -32,7 +32,14 @@ import mlx.nn as nn
 
 from quanta.cache_quant import dequantize_last_axis, quantize_last_axis
 from quanta.internlm2.config import InternLM2Config
-from quanta.modeling.xattention import XAttnConfig, gather_sparse_attention, sparse_prefill_mask
+from quanta.modeling.xattention import (
+    XAttnConfig,
+    _uses_vslash,
+    gather_sparse_attention,
+    select_keep,
+    sparse_prefill_mask,
+    vertical_slash_index,
+)
 
 
 class KVCache:
@@ -206,17 +213,16 @@ class InternLM2Attention(nn.Module):
         v = mx.transpose(v, (0, 2, 1, 3))
         return q, k, v
 
-    def _attn_heads(self, x: mx.array, *, cache: KVCache | None = None, use_fast: bool = True,
-                    seq_hint: int | None = None) -> mx.array:
-        """Per-head attention output ``[B, nh, T, head_dim]`` *before* the ``wo`` projection.
+    def _attn_qkv(self, x: mx.array, *, cache: KVCache | None = None, use_fast: bool = True,
+                  seq_hint: int | None = None) -> tuple[mx.array, mx.array, mx.array, int]:
+        """Project + RoPE (+ cache update) + GQA-repeat → ``(q, kr, vr, kv_len)``.
 
-        The body of :meth:`__call__` up to (not including) the output projection — extracted so the
-        per-head offline pattern-assignment search (M4) can read each head's attention output under a
-        given ``self.sparse`` selector and compare it head-by-head to dense, without duplicating the
-        projection / RoPE / dynamic-NTK / GQA-repeat / sparse-dispatch logic. :meth:`__call__` is
-        exactly ``wo(transpose(_attn_heads(x)).reshape(...))`` — a pure extraction, no behavior change.
+        The shared *front half* of :meth:`_attn_heads` (and of the offline :meth:`_attn_keep_counts`):
+        everything before the sparse/dense attention dispatch. ``q`` is ``[B, nh, T, D]``; ``kr``/``vr``
+        are the GQA-repeated key/value ``[B, nh, kv_len, D]`` (each kv head fanned out to its query
+        group — exactly what dense SDPA attends). Pure extraction — no behavior change.
         """
-        b, t, _ = x.shape
+        _, t, _ = x.shape
         offset = cache.offset if cache is not None else 0
         seq_len = seq_hint if seq_hint is not None else (offset + t)
         # NTK base depends on the *current* total seq len, NOT per-position — recompute per fwd.
@@ -230,6 +236,36 @@ class InternLM2Attention(nn.Module):
         kv_len = k.shape[2]
         kr = mx.repeat(k, self.rep, axis=1)                     # GQA: kv head -> its query group
         vr = mx.repeat(v, self.rep, axis=1)
+        return q, kr, vr, kv_len
+
+    def _attn_keep_counts(self, x: mx.array, sparse: XAttnConfig, *, use_fast: bool = True,
+                          seq_hint: int | None = None) -> mx.array:
+        """Per-head mean kept key-blocks for ``sparse`` on this input → ``[nh]`` — the offline
+        kernel-aware FLOP cost of a candidate selector (M5 per-head-params search).
+
+        **Calibration-only**, never a forward path: reuses :meth:`_attn_qkv` so the q/k it scores are
+        exactly what the forward attends, then counts the blocks :func:`select_keep` keeps (averaged over
+        batch and query blocks). vslash uses its ONE global probe index, like the real execution. The
+        attention FLOP is ∝ kept blocks, so this average kept-block count is the dominant cost term the
+        FLOP-budgeted search compares candidates on.
+        """
+        q, kr, _, _ = self._attn_qkv(x, cache=None, use_fast=use_fast, seq_hint=seq_hint)
+        index = vertical_slash_index(q, kr, self.scale, sparse) if _uses_vslash(sparse) else None
+        keep, _ = select_keep(q, kr, self.scale, sparse, 0, index)        # [B, nh, Tq, Tk] bool
+        return mx.mean(mx.sum(keep.astype(mx.float32), axis=-1), axis=(0, 2))   # [nh] avg kept/query
+
+    def _attn_heads(self, x: mx.array, *, cache: KVCache | None = None, use_fast: bool = True,
+                    seq_hint: int | None = None) -> mx.array:
+        """Per-head attention output ``[B, nh, T, head_dim]`` *before* the ``wo`` projection.
+
+        The body of :meth:`__call__` up to (not including) the output projection — extracted so the
+        per-head offline pattern-assignment search (M4/M5) can read each head's attention output under a
+        given ``self.sparse`` selector and compare it head-by-head to dense, without duplicating the
+        projection / RoPE / dynamic-NTK / GQA-repeat / sparse-dispatch logic. :meth:`__call__` is
+        exactly ``wo(transpose(_attn_heads(x)).reshape(...))`` — a pure extraction, no behavior change.
+        """
+        t = x.shape[1]
+        q, kr, vr, kv_len = self._attn_qkv(x, cache=cache, use_fast=use_fast, seq_hint=seq_hint)
 
         # XAttention block-sparse prefill: per-(query-)head scoring over the GQA-repeated kr/vr —
         # exactly what dense SDPA sees — so threshold=1.0 reproduces dense causal attention.

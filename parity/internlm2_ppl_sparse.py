@@ -1,5 +1,5 @@
 """InternLM2.5 long-doc sparse-prefill ppl gate — M1 (XAttention) + M2 (A-shape) + M3 (vertical-slash)
-+ M4 (per-head assignment).
++ M4 (per-head kind) + M5 (per-head params).
 
 Measures the **quality cost** of block-sparse prefill on the real int8-g64 InternLM2.5-7B bake,
 per selector, against the dense teacher (ppl / top-1 / Δppl%):
@@ -21,6 +21,14 @@ per selector, against the dense teacher (ppl / top-1 / Δppl%):
   assignment is the parity anchor (== dense); the derived assignment's ppl + its realized selector mix
   are recorded, with a gather twin. The win is cheaper kernels at bounded quality, not beating the
   single best uniform — so the derived Δppl is a measured result, not a pass/fail bar.
+* **M5 — per-head params**: generalizes M4 from per-head *kind* to per-head *params* — each head carries
+  its own ``HeadSpec`` (kind + params), and the offline policy becomes a **kernel-aware FLOP-budgeted
+  search** (:func:`assign_head_specs`): per head, the most accurate candidate (kind, params) whose cost
+  (measured mean kept blocks via ``_attn_keep_counts`` + a per-kind selection-kernel constant) fits a
+  FLOP budget. The candidate grid spans multiple param-points per kind (ashape L2/L4, xattn t0.90/t0.95,
+  vslash v2s2), so two heads of the same kind can land on different params. Same anchors as M4 (a MIXED
+  keep-all == dense; a gather twin); the derived Δppl + realized (kind, params) mix are the measured
+  result.
 
 Sparse attention is **lossy ⇒ ppl-gated, never numeric-parity-gated** (CLAUDE.md rule 4). This is
 the quality baseline every later MInference selector (M2+) is judged against. Two things it proves
@@ -51,13 +59,19 @@ job (the OOM-reboot hazard):
 from __future__ import annotations
 
 import sys
+from dataclasses import replace
 
 import mlx.core as mx
 
 from quanta.internlm2.artifact import InternLM2Artifact
 from quanta.internlm2.model import _DecoderLayer, _load_decoder_layer
 from quanta.internlm2.tokenizer import InternLM2Tokenizer
-from quanta.modeling.xattention import XAttnConfig, assign_head_selectors
+from quanta.modeling.xattention import (
+    HeadSpec,
+    XAttnConfig,
+    assign_head_selectors,
+    assign_head_specs,
+)
 
 ARTIFACT = "/Users/pmrj/models/internlm2_5-7b-chat-1m-quanta_int8g64"
 THRESHOLDS = (0.95, 0.9, 0.8)
@@ -125,6 +139,30 @@ def _metrics(logits: mx.array, arr: mx.array) -> tuple[float, float]:
     ppl = mx.exp(ce.mean()).item()
     acc = (mx.argmax(lg, axis=-1) == targets).astype(mx.float32).mean().item()
     return ppl, acc
+
+
+# --- M5 per-head-params search helpers ------------------------------------------------------------
+# Per-kind selection-KERNEL cost (block-equivalent), added to a candidate's measured mean kept-block
+# count to make the FLOP budget kernel-aware: ashape is purely positional (no probe / no scoring),
+# vslash pays one global probe, xattn pays per-block antidiagonal scoring. Coarse — the attention FLOP
+# (∝ kept blocks) dominates; these only tilt ties toward the cheaper kernel at equal kept-block count.
+_KERNEL_OVH = {"ashape": 0.0, "vslash": 0.25, "xattn": 0.5}
+
+
+def _uni(sp: HeadSpec) -> XAttnConfig:
+    """Uniform (single-selector) XAttnConfig realizing one HeadSpec — used to measure that candidate's
+    per-head error and kept-block cost on the calibration forward."""
+    return XAttnConfig(block=128, stride=16, selector=sp.kind, threshold=sp.threshold,
+                       local=sp.local, vert=sp.vert, slash=sp.slash, min_seq=0, gather=False)
+
+
+def _spec_label(sp: HeadSpec) -> str:
+    """Short readable (kind, params) tag for the realized per-head-params mix readout."""
+    if sp.kind == "ashape":
+        return f"ashape:L{sp.local}"
+    if sp.kind == "vslash":
+        return f"vslash:v{sp.vert}s{sp.slash}"
+    return f"xattn:t{sp.threshold:g}"
 
 
 def run(n_layers: int | None = None, max_tokens: int = 1024) -> None:
@@ -199,15 +237,43 @@ def run(n_layers: int | None = None, max_tokens: int = 1024) -> None:
                             local=nblk, vert=nblk, slash=nblk, min_seq=0, gather=False)
     ph_labels = ["perhead anchor", "perhead", "perhead gat"]
 
+    # M5: per-head PARAMS. The candidate grid spans multiple param-points per kind (ashape L2/L4, vslash
+    # v2s2, xattn t0.90/t0.95), so two heads of the same kind can land on DIFFERENT params. Per layer
+    # (below) each candidate's per-head error vs dense AND its kernel-aware FLOP cost (mean kept blocks +
+    # per-kind kernel constant) are measured on the dense calibration forward; candidates are sorted
+    # cheap→accurate; ``assign_head_specs`` picks per head the most accurate one that fits ``ph2_budget``
+    # blocks (else the cheapest). The single vslash candidate is v2s2, so every derived head_specs config
+    # carries vert=slash=2 (the shared global probe index; pin-validated). A MIXED keep-all per-head-specs
+    # assignment is the parity anchor (== dense); a gather twin checks the M5 invariant. The derived Δppl
+    # + realized (kind,params) mix are the measured result (not pass/fail).
+    ph2_cand = [
+        HeadSpec("ashape", local=2),
+        HeadSpec("ashape", local=4),
+        HeadSpec("vslash", vert=2, slash=2),
+        HeadSpec("xattn", threshold=0.90),
+        HeadSpec("xattn", threshold=0.95),
+    ]
+    ph2_budget = 4.0                                             # FLOP budget in mean-kept-blocks/query
+    ph2_anchor_specs = tuple(
+        [HeadSpec("xattn", threshold=1.0), HeadSpec("ashape", local=nblk),
+         HeadSpec("vslash", vert=nblk, slash=nblk)][h % 3]
+        for h in range(cfg.num_attention_heads))
+    ph2_anchor = XAttnConfig(block=128, stride=16, head_specs=ph2_anchor_specs, vert=nblk, slash=nblk,
+                             min_seq=0, gather=False)
+    ph2_labels = ["perhd-p anchor", "perhd-p", "perhd-p gat"]
+    dist2: dict[str, int] = {_spec_label(sp): 0 for sp in ph2_cand}   # realized (kind,params) mix
+
     emb = art.embed()
     h0 = emb[arr][None]                                   # [1, T, H] bf16
     del emb
     art.release()
     mx.clear_cache()
-    labels = [lab for lab, _ in variants] + ph_labels
+    labels = [lab for lab, _ in variants] + ph_labels + ph2_labels
     hs = [h0 for _ in labels]                             # diverge after the embedding (shared h0)
-    ph_anchor_i, ph_mask_i, ph_gat_i = len(variants), len(variants) + 1, len(variants) + 2
-    dist = {k: 0 for k in cand_kinds}                     # realized assignment mix (Σ over layers×heads)
+    nv = len(variants)
+    ph_anchor_i, ph_mask_i, ph_gat_i = nv, nv + 1, nv + 2
+    ph2_anchor_i, ph2_mask_i, ph2_gat_i = nv + 3, nv + 4, nv + 5
+    dist = {k: 0 for k in cand_kinds}                     # realized M4 assignment mix (Σ over layers×heads)
 
     for i in range(n):
         layer = _DecoderLayer(cfg)
@@ -234,6 +300,28 @@ def run(n_layers: int | None = None, max_tokens: int = 1024) -> None:
         ph_gat_cfg = XAttnConfig(block=128, stride=16, head_selectors=assign, min_seq=0,
                                  gather=True, **ph_params)
 
+        # M5: per-head PARAMS — reuse the SAME dense calibration (dense_heads/den). Per candidate measure
+        # per-head output relerr AND kernel-aware cost (mean kept blocks + per-kind kernel constant), sort
+        # cheap→accurate (so policy ties break to the cheaper), then budget-search the per-head (kind,
+        # params). The vslash candidate is v2s2 ⇒ the derived configs carry vert=slash=2 (pin-validated).
+        errs2, costs2 = [], []
+        for sp2 in ph2_cand:
+            uc = _uni(sp2)
+            layer.attention.sparse = uc
+            ch2 = layer.attention._attn_heads(xn, use_fast=True)
+            errs2.append(mx.sqrt(mx.sum((ch2 - dense_heads).astype(mx.float32) ** 2, axis=(0, 2, 3))) / den)
+            costs2.append(float(mx.mean(layer.attention._attn_keep_counts(xn, uc))) + _KERNEL_OVH[sp2.kind])
+        order = mx.argsort(mx.array(costs2)).tolist()            # cheap → accurate (tie → cheaper)
+        cand_o = [ph2_cand[o] for o in order]
+        errs_o = mx.stack([errs2[o] for o in order], axis=0)     # [C, nh] sorted
+        costs_o = mx.array([costs2[o] for o in order])
+        assign2 = assign_head_specs(errs_o, costs_o, cand_o, ph2_budget)   # tuple[HeadSpec]*nh
+        for sp2 in assign2:
+            dist2[_spec_label(sp2)] += 1
+        ph2_mask_cfg = XAttnConfig(block=128, stride=16, head_specs=assign2, vert=2, slash=2,
+                                   min_seq=0, gather=False)
+        ph2_gat_cfg = replace(ph2_mask_cfg, gather=True)
+
         for vi, (_, sp) in enumerate(variants):
             layer.attention.sparse = sp                  # M0 hook; None ⇒ dense, byte-unchanged
             hs[vi] = layer(hs[vi], use_fast=True)        # offset 0, t == kv_len ⇒ from-scratch prefill
@@ -244,6 +332,13 @@ def run(n_layers: int | None = None, max_tokens: int = 1024) -> None:
         hs[ph_mask_i] = layer(hs[ph_mask_i], use_fast=True)
         layer.attention.sparse = ph_gat_cfg
         hs[ph_gat_i] = layer(hs[ph_gat_i], use_fast=True)
+        # M5 perhead-params streams: anchor (fixed mixed keep-all); mask/gather use this layer's search.
+        layer.attention.sparse = ph2_anchor
+        hs[ph2_anchor_i] = layer(hs[ph2_anchor_i], use_fast=True)
+        layer.attention.sparse = ph2_mask_cfg
+        hs[ph2_mask_i] = layer(hs[ph2_mask_i], use_fast=True)
+        layer.attention.sparse = ph2_gat_cfg
+        hs[ph2_gat_i] = layer(hs[ph2_gat_i], use_fast=True)
         mx.eval(hs)
         del layer
         art.release()
@@ -321,6 +416,19 @@ def run(n_layers: int | None = None, max_tokens: int = 1024) -> None:
     n_assign = sum(dist.values())
     mix = "  ".join(f"{k} {dist[k]}/{n_assign} ({100 * dist[k] / n_assign:.0f}%)" for k in cand_kinds)
 
+    # M5 per-head-params gates: a MIXED keep-all per-head-specs assignment == dense (the parity anchor)
+    # and the derived assignment's gather==mask (the M5 twin) are hard checks; the derived Δppl + the
+    # realized (kind,params) mix are the measured result (recorded, not pass/fail).
+    ph2_anchor_ppl = ppls["perhd-p anchor"]
+    ph2_mask, ph2_gat = ppls["perhd-p"], ppls["perhd-p gat"]
+    ph2_anchor_ok = abs(ph2_anchor_ppl - dense) / dense < 0.01    # mixed keep-all == dense
+    ph2_twin = abs(ph2_gat - ph2_mask) / ph2_mask < 0.01         # perhd-p gather speed-path == mask path
+    ph2_sane = ph2_mask < 2.0 * dense                            # derived assignment not blown up
+    d_ph2 = 100 * (ph2_mask - dense) / dense
+    n_assign2 = sum(dist2.values())
+    mix2 = "  ".join(f"{lab} {dist2[lab]} ({100 * dist2[lab] / n_assign2:.0f}%)"
+                     for lab in dist2 if dist2[lab])
+
     print(f"\n  dense ppl<20: {healthy} ({dense:.3f})   "
           f"gather==mask @0.9 (<1%): {twin} (Δ={abs(gat90 - mask90):.2e})")
     print(f"  xattn  t=0.90 Δppl = {d90:+.2f}%   free(≤2%): {free}   sane(≤8%): {sane}")
@@ -337,11 +445,15 @@ def run(n_layers: int | None = None, max_tokens: int = 1024) -> None:
     print(f"  perhead Δppl = {d_ph:+.2f}%  (tol={ph_tol}; assign Σlayers×heads: {mix})")
     print(f"           cf. uniform ingredients — ashape L=2 {d_a2:+.2f}%   vslash v2s2 {d_v2:+.2f}%   "
           f"xattn t=0.9 {d90:+.2f}%")
+    print(f"  perhd-p mixed keep-all==dense (<1%): {ph2_anchor_ok} (Δ={abs(ph2_anchor_ppl - dense):.2e})"
+          f"   gather==mask (<1%): {ph2_twin} (Δ={abs(ph2_gat - ph2_mask):.2e})")
+    print(f"  perhd-p Δppl = {d_ph2:+.2f}%  (budget={ph2_budget} blocks; assign Σlayers×heads: {mix2})")
     ok = (healthy and twin and sane and a_anchor and a_twin and a_sane
-          and v_anchor and v_twin and v_sane and ph_anchor_ok and ph_twin and ph_sane)
+          and v_anchor and v_twin and v_sane and ph_anchor_ok and ph_twin and ph_sane
+          and ph2_anchor_ok and ph2_twin and ph2_sane)
     print(f"\n{'PASS' if ok else 'FAIL'}  (xattn t=0.90 {'FREE' if free else 'NOT free'}; A-shape + "
-          f"vertical-slash + per-head assignment integrated — keep-all anchored, gather==mask, "
-          f"cost recorded)")
+          f"vertical-slash + per-head kind + per-head params integrated — keep-all anchored, "
+          f"gather==mask, cost recorded)")
     if not ok:
         raise SystemExit(1)
 

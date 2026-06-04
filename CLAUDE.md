@@ -17,7 +17,7 @@ That is the mistake this project exists to not repeat.
 
 ## Active task (transient — full handover in PLAN_minference.md)
 
-**In flight: InternLM2.5 sparse-prefill (MInference family) — M4 ✅, M5 next.** Handover
+**In flight: InternLM2.5 sparse-prefill (MInference family) — M5 ✅, M6 next.** Handover
 **`PLAN_minference.md`**. Reuse the validated block-sparse substrate (`quanta.modeling.xattention`,
 `gather_sparse_attention`/`sparse_prefill_mask`, `threshold=1.0`==dense); M0 wired a `self.sparse`
 hook into `InternLM2Attention` (default None = dense byte-unchanged). M1 measured XAttention's lossy
@@ -44,9 +44,23 @@ _attn_heads` extraction so the ppl harness measures per-head error vs dense. Mod
 validation) + real-model gate: **perhead mixed keep-all == dense EXACTLY**, gather==mask (8.88e-3),
 measured **+0.40% ppl** with the offline router assigning **86% xattn / 14% A-shape / 0% vslash** (Σ
 32×32 heads) — buys back A-shape-L2's +3.76% → +0.40% (≈ best uniform xattn +0.31%) while running 14% of
-heads on the cheaper static kernel; vslash 0% at 7 blocks (long-context pattern, per M3). M5 next =
-**per-head *params*** (not just kind) + kernel-aware FLOP-budgeted search + key-chunk the vslash probe
-for long context, ppl-gated vs M4.
+heads on the cheaper static kernel; vslash 0% at 7 blocks (long-context pattern, per M3). **M5 made the
+selector per-head *params*** (not just kind): a frozen `HeadSpec(kind, threshold, local, vert, slash)` +
+`head_specs` tuple on `XAttnConfig` (None = M4/uniform, byte-unchanged; precedence over `head_selectors`,
+both-set rejected) routing each head to its own (kind, params) via `_select_keep_per_head_specs` (bounded
+loop over DISTINCT specs, not heads → one `take_along_axis`; vslash params shared via the threaded global
+index, fail-loud pin; ashape/xattn params freely per-head); offline policy `assign_head_specs` = the dual
+of M4's (most-accurate candidate within a kernel-aware FLOP `budget`, else cheapest); a parity-preserving
+`_attn_qkv` extraction shared by `_attn_heads` + the new offline `_attn_keep_counts` (per-candidate cost =
+mean kept blocks). Model-free `parity/internlm2_perhead_params_test.py` (budget policy + routing-exactness
+incl. same-kind-different-params + mixed-keep-all==dense + gather==mask + validation) + real-model gate:
+**perhd-p mixed keep-all == dense EXACTLY**, gather==mask (3.29e-3), measured **+0.15% ppl** — **beats M4's
+per-head-kind +0.40% AND best uniform xattn +0.31%** — with the FLOP-budgeted search (budget=4 blocks)
+assigning **75% ashape:L4 / 23% xattn:t0.9 / 1% vslash / 1% xattn:t0.95** (Σ 32×32 heads); per-head params
+let 75% of heads run the cheap static kernel while each still gets its most-accurate-affordable approx, so
+the aggregate beats any uniform — the MInference thesis. M6 next = **long-context vertical-slash probe**
+(key-chunk it + thread a param-independent probe so per-head vslash *params* vary too) + a wall-clock
+**gather-path prefill bench**, ppl-gated vs M5.
 
 Prior InternLM2.5 **EAGLE spec-decode** track is **COMPLETE** (M0–M3, `ec0f6f3`; **1.42× lossless @
 k=2** via drafter quantization — memory `project_internlm2_eagle.md`). The earlier batched-decode /

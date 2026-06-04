@@ -30,6 +30,41 @@ NEG_INF = float("-inf")
 
 
 @dataclass(frozen=True)
+class HeadSpec:
+    """One query head's selector **kind + its own selection params** (M5 per-head params).
+
+    M4's ``head_selectors`` routes each head to a selector *kind* but shares one set of params across
+    every head of that kind. M5 lets each head carry its OWN params: a length-``num_query_heads`` tuple
+    of ``HeadSpec`` on :class:`XAttnConfig` (``head_specs``) names, per head, both the kind and the
+    params its kind reads (``xattn`` → ``threshold``, ``ashape`` → ``local``, ``vslash`` → ``vert`` /
+    ``slash``; the others are ignored for that head). Frozen + hashable so distinct specs dedupe to the
+    bounded per-spec loop in :func:`_select_keep_per_head_specs` (rule 3 — the loop is over DISTINCT
+    specs, never heads).
+
+    ``vslash`` params are **shared, not per-head**: the global probe index is computed once over the
+    whole sequence and threaded into every gather chunk (that is what keeps gather == mask), so a
+    ``vslash`` spec's ``vert``/``slash`` must equal the enclosing config's (validated in
+    :meth:`XAttnConfig.__post_init__`, fail-loud). Per-head ``vslash`` param variation awaits the
+    long-context probe-chunking milestone, which reworks the probe to thread param-independent masses.
+    ``ashape``/``xattn`` select locally per spec, so their params are freely per-head here.
+    """
+
+    kind: str = "xattn"
+    threshold: float = 0.9
+    local: int = 8
+    vert: int = 8
+    slash: int = 8
+
+    def __post_init__(self) -> None:
+        if self.kind not in ("xattn", "ashape", "vslash"):
+            raise ValueError(f"HeadSpec.kind must be 'xattn', 'ashape', or 'vslash', got {self.kind!r}")
+        if self.local < 1:
+            raise ValueError(f"HeadSpec.local must be >= 1, got {self.local}")
+        if self.vert < 1 or self.slash < 1:
+            raise ValueError(f"HeadSpec.vert/slash must be >= 1, got vert={self.vert}, slash={self.slash}")
+
+
+@dataclass(frozen=True)
 class XAttnConfig:
     """Block-sparse prefill config. ``threshold`` is the nucleus mass to retain.
 
@@ -73,6 +108,15 @@ class XAttnConfig:
     # selectors). Heads sharing a kind share that kind's params (``threshold``/``local``/``vert``/
     # ``slash``); per-head *params* are a later refinement. Built offline by :func:`assign_head_selectors`.
     head_selectors: tuple[str, ...] | None = None
+    # --- per-head *params* (M5): each head carries its OWN selector kind + params (not just a kind). --
+    # None ⇒ fall back to ``head_selectors`` (M4) / uniform ``selector`` — every path unchanged. When set,
+    # a length-``num_query_heads`` tuple of :class:`HeadSpec` (kind + that kind's params), taking
+    # precedence over ``head_selectors`` (setting both is rejected). ``select_keep`` dispatches per head
+    # via :func:`_select_keep_per_head_specs` — each head's keep is byte-identical to the uniform keep for
+    # its spec (pure routing). vslash specs must share this config's ``vert``/``slash`` (the global probe
+    # index is threaded once — see :class:`HeadSpec`); ashape/xattn params are freely per-head. Built
+    # offline by :func:`assign_head_specs` (kernel-aware FLOP-budgeted search).
+    head_specs: tuple[HeadSpec, ...] | None = None
 
     def __post_init__(self) -> None:
         if self.block % self.stride != 0:
@@ -92,6 +136,22 @@ class XAttnConfig:
             if unknown:
                 raise ValueError(f"head_selectors has unknown selector kind(s) {unknown}; "
                                  "valid kinds: 'xattn', 'ashape', 'vslash'")
+        if self.head_specs is not None:
+            if self.head_selectors is not None:
+                raise ValueError("set at most one of head_specs (per-head params) / head_selectors "
+                                 "(per-head kind) — both route per head")
+            if len(self.head_specs) == 0:
+                raise ValueError("head_specs must be a non-empty tuple (or None)")
+            for sp in self.head_specs:
+                if not isinstance(sp, HeadSpec):
+                    raise ValueError(f"head_specs entries must be HeadSpec, got {type(sp).__name__}")
+                # vslash's global probe index is shared/threaded ⇒ per-head vslash params are not
+                # supported yet; a vslash spec must match this config's vert/slash (fail loud, rule 6).
+                if sp.kind == "vslash" and (sp.vert != self.vert or sp.slash != self.slash):
+                    raise ValueError(
+                        f"vslash HeadSpec vert/slash ({sp.vert}/{sp.slash}) must match the config's "
+                        f"({self.vert}/{self.slash}) — the global probe index is shared. Per-head vslash "
+                        "param variation awaits the long-context probe-chunking milestone.")
 
 
 # Runtime default sparse config: bounded block-gather XAttention prefill (gather=True,
@@ -250,7 +310,10 @@ def vertical_slash_index(
 
 def _uses_vslash(cfg: XAttnConfig) -> bool:
     """True iff any head uses the vertical-slash selector — so the caller precomputes its ONE global
-    index. Uniform: ``selector == "vslash"``. Per-head: ``"vslash"`` appears in ``head_selectors``."""
+    index. Uniform: ``selector == "vslash"``. Per-head: ``"vslash"`` appears in ``head_selectors`` (M4)
+    or as any ``HeadSpec.kind`` in ``head_specs`` (M5)."""
+    if cfg.head_specs is not None:
+        return any(sp.kind == "vslash" for sp in cfg.head_specs)
     if cfg.head_selectors is not None:
         return "vslash" in cfg.head_selectors
     return cfg.selector == "vslash"
@@ -292,6 +355,47 @@ def _select_keep_per_head(
     return keep, rank
 
 
+def _select_keep_per_head_specs(
+    q: mx.array, k: mx.array, scale: float, cfg: XAttnConfig, q_offset: int,
+    index: tuple[mx.array, mx.array, mx.array] | None,
+) -> tuple[mx.array, mx.array]:
+    """Per-head **param** dispatch → ``(keep, rank)`` ``[B,H,Tq,Tk]`` routing each head to its spec.
+
+    Generalizes :func:`_select_keep_per_head` (M4, kind-only) to per-head *params*: ``cfg.head_specs``
+    is a length-``H`` tuple of :class:`HeadSpec` (kind + params). Computes each *distinct* spec's
+    ``(keep, rank)`` for ALL heads (a bounded loop over the DISTINCT specs present — the search-grid
+    size, never a per-head/per-token hot loop, rule 3), stacks them ``[n_spec,B,H,Tq,Tk]``, and selects
+    per head the slice from that head's spec with one ``take_along_axis``. So head ``h``'s keep is
+    byte-identical to the uniform keep for ``head_specs[h]``'s (kind, params) — pure routing, no new
+    selection math. The vslash global ``index`` (threaded by the caller; all vslash specs share this
+    config's vert/slash, enforced at config build) is forwarded to vslash sub-selections so per-head
+    gather == mask.
+    """
+    h = q.shape[1]
+    specs = cfg.head_specs
+    if len(specs) != h:
+        raise ValueError(f"head_specs has {len(specs)} entries but attention has {h} query heads")
+    uniq: list[HeadSpec] = []
+    for sp in specs:                                   # distinct specs in first-seen (deterministic) order
+        if sp not in uniq:
+            uniq.append(sp)
+    keeps: list[mx.array] = []
+    ranks: list[mx.array] = []
+    for sp in uniq:                                    # bounded over DISTINCT specs, not heads
+        sub = replace(cfg, head_specs=None, head_selectors=None, selector=sp.kind,
+                      threshold=sp.threshold, local=sp.local, vert=sp.vert, slash=sp.slash)
+        kp, rk = select_keep(q, k, scale, sub, q_offset, index if sp.kind == "vslash" else None)
+        keeps.append(kp)
+        ranks.append(rk.astype(mx.float32))
+    stacked_keep = mx.stack(keeps, axis=0)             # [n_spec, B, H, Tq, Tk]
+    stacked_rank = mx.stack(ranks, axis=0)
+    pick = mx.array([uniq.index(sp) for sp in specs], dtype=mx.int32)   # [H] spec index per head
+    ind = mx.broadcast_to(pick.reshape(1, 1, h, 1, 1), (1, *stacked_keep.shape[1:]))
+    keep = mx.take_along_axis(stacked_keep, ind, axis=0)[0]
+    rank = mx.take_along_axis(stacked_rank, ind, axis=0)[0]
+    return keep, rank
+
+
 def select_keep(
     q: mx.array, k: mx.array, scale: float, cfg: XAttnConfig, q_offset: int = 0,
     index: tuple[mx.array, mx.array, mx.array] | None = None,
@@ -316,10 +420,14 @@ def select_keep(
     ``q_offset`` is the global block index of the first query row (the chunked gather path passes its
     chunk origin so causality/window use global positions); ``q_offset=0`` is the whole-sequence case.
 
-    When ``cfg.head_selectors`` is set, dispatch is **per head**: each head uses its own kind's
-    selection (:func:`_select_keep_per_head`), and the returned ``keep[:, h]`` equals the uniform keep
-    for ``head_selectors[h]``. ``head_selectors=None`` (default) is the uniform path below, unchanged.
+    When ``cfg.head_specs`` is set (M5), dispatch is **per head with per-head params**: each head uses
+    its own ``HeadSpec``'s (kind, params) selection (:func:`_select_keep_per_head_specs`). Else when
+    ``cfg.head_selectors`` is set (M4), dispatch is per head by *kind* (shared params,
+    :func:`_select_keep_per_head`): the returned ``keep[:, h]`` equals the uniform keep for
+    ``head_selectors[h]``. Both None (default) is the uniform path below, unchanged.
     """
+    if cfg.head_specs is not None:
+        return _select_keep_per_head_specs(q, k, scale, cfg, q_offset, index)
     if cfg.head_selectors is not None:
         return _select_keep_per_head(q, k, scale, cfg, q_offset, index)
     if cfg.selector == "ashape":
@@ -371,6 +479,32 @@ def assign_head_selectors(
     first_ok = mx.argmax(within.astype(mx.int32), axis=0)   # [H] first True row (0 if none → fallback)
     choice = mx.where(any_ok, first_ok, c - 1).astype(mx.int32)
     return tuple(cand_kinds[int(i)] for i in choice.tolist())
+
+
+def assign_head_specs(
+    errors: mx.array, costs: mx.array, candidates: list[HeadSpec], budget: float
+) -> tuple[HeadSpec, ...]:
+    """Kernel-aware FLOP-budgeted per-head search → a ``head_specs`` tuple for :class:`XAttnConfig`.
+
+    The **dual** of :func:`assign_head_selectors`: instead of *cheapest within an error tol*, pick per
+    head the **most accurate** candidate whose kernel-aware cost is within a FLOP ``budget`` (MInference's
+    actual setup — the best pattern+params a head can afford). ``errors`` ``[C, H]`` is each candidate's
+    per-head approximation error vs dense; ``costs`` ``[C]`` is each candidate's kernel-aware cost (e.g.
+    measured average kept blocks per query + a per-kind selection-kernel constant), candidates ordered
+    **cheapest → most-accurate**. For each head: among candidates with ``cost ≤ budget`` choose the
+    minimum-error one (ties → the cheaper, since rows ascend in cost); if none is affordable (budget below
+    the cheapest cost), fall back to the globally cheapest candidate. Pure / positional (no model state)
+    so the policy is unit-testable; the per-head ``errors`` and ``costs`` are measured offline on a
+    calibration forward (dense inputs) by the ppl harness.
+    """
+    affordable = (costs <= budget)[:, None]                 # [C, 1] (cost is head-independent)
+    any_aff = mx.any(affordable, axis=0)                    # [1] → broadcasts over heads
+    big = mx.max(errors) + 1.0                              # push unaffordable candidates past every error
+    score = mx.where(affordable, errors, big)              # [C, H]
+    acc = mx.argmin(score, axis=0)                          # [H] most-accurate affordable candidate
+    cheap = mx.argmin(costs)                                # [] globally cheapest (the no-budget fallback)
+    choice = mx.where(any_aff, acc, cheap).astype(mx.int32)  # [H]
+    return tuple(candidates[int(i)] for i in choice.tolist())
 
 
 def additive_mask(
