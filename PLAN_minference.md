@@ -66,7 +66,7 @@ parity-anchored, no rebuild.
 - Gates: dense-path `internlm2_batched_attention_test` still greedy-exact `|Δlogit|=0.00`;
   `xattention_parity`, `pytest tests/`, ruff, compileall, `uv lock --check`, `git diff --check` clean.
 
-### M1 (NEXT) — real-model long-doc ppl sweep (quality cost of the reused substrate)
+### M1 ✅ — real-model long-doc ppl sweep (quality cost of the reused substrate) — DONE
 Goal: measure how much ppl XAttention sparse prefill trades on InternLM2 across a threshold sweep —
 the lossy lever's quality cost on the real bake. Solo GPU, one model resident.
 - **GOTCHA:** `parity/ppl_long.py` is **Kimi-bound** (`KimiTextConfig` / `SourceCheckpoint` /
@@ -83,6 +83,17 @@ the lossy lever's quality cost on the real bake. Solo GPU, one model resident.
   gather path separately if a speed number is wanted (subtract nothing — prefill is the whole point).
 - Gate = a sensible Δppl bar (e.g. ≤ ~1–2% at threshold 0.9 is "free"); commit `internlm2_ppl_sparse.py`
   + record the numbers. This is the quality baseline every later selector is judged against.
+
+**RESULTS (32 layers, 823 tok / 7 blocks):** dense ppl **12.338** (top-1 44.2%) → mask-path Δppl
+t=0.95 **+0.24%**, t=0.90 **+0.31%**, t=0.80 **+2.39%** — threshold 0.9 is **"free"** (≤2% bar),
+knee ~t=0.80. **M1 invariant green:** the `gather=True` speed-path (12.370) == its mask quality-path
+(12.376) to Δppl = 5.9e-3 (< 1%) — same blocks selected, only execution differs. Delivered
+`parity/internlm2_ppl_sparse.py`: streams the int8-g64 bake ONE `_DecoderLayer` resident at a time
+(rule-8) via `InternLM2Artifact` (dequant→bf16 — the packed `mx.quantized_matmul` runtime has no
+`.sparse` hook; int8 weight quant is orthogonal to & ~lossless against the sparse approximation it
+measures), pushing every variant's hidden state through each layer; original prose, `min_seq=0` forces
+sparsity on, `budget=64` default never binds < 8192 tok. Run:
+`uv run --with sentencepiece python -m parity.internlm2_ppl_sparse`.
 
 ### M2+ — MInference selectors (the genuine new work)
 Add MInference's **vertical-slash / A-shape** per-head selection as an *alternative selector* feeding
