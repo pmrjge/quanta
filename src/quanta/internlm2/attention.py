@@ -206,8 +206,16 @@ class InternLM2Attention(nn.Module):
         v = mx.transpose(v, (0, 2, 1, 3))
         return q, k, v
 
-    def __call__(self, x: mx.array, *, cache: KVCache | None = None, use_fast: bool = True,
-                 seq_hint: int | None = None) -> mx.array:
+    def _attn_heads(self, x: mx.array, *, cache: KVCache | None = None, use_fast: bool = True,
+                    seq_hint: int | None = None) -> mx.array:
+        """Per-head attention output ``[B, nh, T, head_dim]`` *before* the ``wo`` projection.
+
+        The body of :meth:`__call__` up to (not including) the output projection — extracted so the
+        per-head offline pattern-assignment search (M4) can read each head's attention output under a
+        given ``self.sparse`` selector and compare it head-by-head to dense, without duplicating the
+        projection / RoPE / dynamic-NTK / GQA-repeat / sparse-dispatch logic. :meth:`__call__` is
+        exactly ``wo(transpose(_attn_heads(x)).reshape(...))`` — a pure extraction, no behavior change.
+        """
         b, t, _ = x.shape
         offset = cache.offset if cache is not None else 0
         seq_len = seq_hint if seq_hint is not None else (offset + t)
@@ -230,17 +238,21 @@ class InternLM2Attention(nn.Module):
         sparse = self.sparse
         is_sparse_prefill = sparse is not None and t == kv_len and t >= sparse.min_seq
         if is_sparse_prefill and sparse.gather:                 # block-gathered execution (speed path)
-            out = gather_sparse_attention(q, kr, vr, self.scale, sparse)
-        elif use_fast:
+            return gather_sparse_attention(q, kr, vr, self.scale, sparse)
+        if use_fast:
             sparse_mask = sparse_prefill_mask(q, kr, self.scale, sparse) if is_sparse_prefill else None
             mask = sparse_mask if sparse_mask is not None else ("causal" if t > 1 else None)
-            out = mx.fast.scaled_dot_product_attention(q, kr, vr, scale=self.scale, mask=mask)
-        else:
-            sparse_mask = sparse_prefill_mask(q, kr, self.scale, sparse) if is_sparse_prefill else None
-            add = sparse_mask if sparse_mask is not None else _causal_mask(t, kv_len, q.dtype)
-            scores = (q @ mx.swapaxes(kr, -1, -2)) * self.scale + add
-            w = mx.softmax(scores.astype(mx.float32), axis=-1).astype(q.dtype)
-            out = w @ vr
-        out = mx.transpose(out, (0, 2, 1, 3))                   # [B, T, H, D]
+            return mx.fast.scaled_dot_product_attention(q, kr, vr, scale=self.scale, mask=mask)
+        sparse_mask = sparse_prefill_mask(q, kr, self.scale, sparse) if is_sparse_prefill else None
+        add = sparse_mask if sparse_mask is not None else _causal_mask(t, kv_len, q.dtype)
+        scores = (q @ mx.swapaxes(kr, -1, -2)) * self.scale + add
+        w = mx.softmax(scores.astype(mx.float32), axis=-1).astype(q.dtype)
+        return w @ vr
+
+    def __call__(self, x: mx.array, *, cache: KVCache | None = None, use_fast: bool = True,
+                 seq_hint: int | None = None) -> mx.array:
+        b, t, _ = x.shape
+        out = self._attn_heads(x, cache=cache, use_fast=use_fast, seq_hint=seq_hint)  # [B, nh, T, D]
+        out = mx.transpose(out, (0, 2, 1, 3))                   # [B, T, nh, D]
         out = out.reshape(b, t, self.nh * self.hd)
         return self.wo(out)

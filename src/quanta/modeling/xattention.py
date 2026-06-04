@@ -22,7 +22,7 @@ long-context memory needs the gathered execution path (deferred).
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import mlx.core as mx
 
@@ -65,6 +65,14 @@ class XAttnConfig:
     local: int = 8  # A-shape local window width in blocks (incl. the diagonal); selector="ashape" only
     vert: int = 8   # vertical-slash: # of vertical key-blocks kept globally; selector="vslash" only
     slash: int = 8  # vertical-slash: # of slash block-offset bands kept globally; selector="vslash" only
+    # --- per-head assignment (M4): route each query head to its OWN selector (offline-assigned). ----
+    # None ⇒ uniform ``selector`` for every head (every path above is byte-for-byte unchanged). When
+    # set, a length-``num_query_heads`` tuple naming each head's selector kind ("xattn"/"ashape"/
+    # "vslash"); ``selector`` is then ignored and ``select_keep`` routes per head — each head's keep is
+    # byte-identical to the uniform keep for its assigned kind (a pure routing layer over the validated
+    # selectors). Heads sharing a kind share that kind's params (``threshold``/``local``/``vert``/
+    # ``slash``); per-head *params* are a later refinement. Built offline by :func:`assign_head_selectors`.
+    head_selectors: tuple[str, ...] | None = None
 
     def __post_init__(self) -> None:
         if self.block % self.stride != 0:
@@ -77,6 +85,13 @@ class XAttnConfig:
             raise ValueError(f"local must be >= 1, got {self.local}")
         if self.vert < 1 or self.slash < 1:
             raise ValueError(f"vert/slash must be >= 1, got vert={self.vert}, slash={self.slash}")
+        if self.head_selectors is not None:
+            if len(self.head_selectors) == 0:
+                raise ValueError("head_selectors must be a non-empty tuple (or None for uniform)")
+            unknown = sorted(set(self.head_selectors) - {"xattn", "ashape", "vslash"})
+            if unknown:
+                raise ValueError(f"head_selectors has unknown selector kind(s) {unknown}; "
+                                 "valid kinds: 'xattn', 'ashape', 'vslash'")
 
 
 # Runtime default sparse config: bounded block-gather XAttention prefill (gather=True,
@@ -233,6 +248,50 @@ def vertical_slash_index(
     return vert_keep, slash_keep, key_mass
 
 
+def _uses_vslash(cfg: XAttnConfig) -> bool:
+    """True iff any head uses the vertical-slash selector — so the caller precomputes its ONE global
+    index. Uniform: ``selector == "vslash"``. Per-head: ``"vslash"`` appears in ``head_selectors``."""
+    if cfg.head_selectors is not None:
+        return "vslash" in cfg.head_selectors
+    return cfg.selector == "vslash"
+
+
+def _select_keep_per_head(
+    q: mx.array, k: mx.array, scale: float, cfg: XAttnConfig, q_offset: int,
+    index: tuple[mx.array, mx.array, mx.array] | None,
+) -> tuple[mx.array, mx.array]:
+    """Per-head selector dispatch → ``(keep, rank)`` ``[B,H,Tq,Tk]`` routing each head to its kind.
+
+    ``cfg.head_selectors`` names each of the ``H`` query heads' selector kind. Computes each *distinct*
+    kind's ``(keep, rank)`` for ALL heads (a bounded loop over the ≤3 selector KINDS present — never a
+    per-head/per-token hot loop, rule 3), stacks them ``[n_kind,B,H,Tq,Tk]``, and selects per head the
+    slice from that head's assigned kind with one ``take_along_axis`` over a ``[1,B,H,Tq,Tk]`` index. So
+    head ``h``'s keep is byte-identical to the uniform keep for ``head_selectors[h]`` — the per-head path
+    adds no new selection math, only routing. Vertical-slash's global ``index`` (threaded by the caller
+    over the whole sequence) is forwarded to the vslash sub-selection so per-head gather == mask.
+    """
+    h = q.shape[1]
+    if len(cfg.head_selectors) != h:
+        raise ValueError(
+            f"head_selectors has {len(cfg.head_selectors)} entries but attention has {h} query heads"
+        )
+    kinds = sorted(set(cfg.head_selectors))            # ≤3 distinct kinds; deterministic order
+    keeps: list[mx.array] = []
+    ranks: list[mx.array] = []
+    for s in kinds:                                    # bounded over selector KINDS, not heads
+        sub = replace(cfg, head_selectors=None, selector=s)
+        kp, rk = select_keep(q, k, scale, sub, q_offset, index if s == "vslash" else None)
+        keeps.append(kp)
+        ranks.append(rk.astype(mx.float32))
+    stacked_keep = mx.stack(keeps, axis=0)             # [n_kind, B, H, Tq, Tk]
+    stacked_rank = mx.stack(ranks, axis=0)
+    pick = mx.array([kinds.index(s) for s in cfg.head_selectors], dtype=mx.int32)  # [H] kind index
+    ind = mx.broadcast_to(pick.reshape(1, 1, h, 1, 1), (1, *stacked_keep.shape[1:]))
+    keep = mx.take_along_axis(stacked_keep, ind, axis=0)[0]
+    rank = mx.take_along_axis(stacked_rank, ind, axis=0)[0]
+    return keep, rank
+
+
 def select_keep(
     q: mx.array, k: mx.array, scale: float, cfg: XAttnConfig, q_offset: int = 0,
     index: tuple[mx.array, mx.array, mx.array] | None = None,
@@ -256,7 +315,13 @@ def select_keep(
 
     ``q_offset`` is the global block index of the first query row (the chunked gather path passes its
     chunk origin so causality/window use global positions); ``q_offset=0`` is the whole-sequence case.
+
+    When ``cfg.head_selectors`` is set, dispatch is **per head**: each head uses its own kind's
+    selection (:func:`_select_keep_per_head`), and the returned ``keep[:, h]`` equals the uniform keep
+    for ``head_selectors[h]``. ``head_selectors=None`` (default) is the uniform path below, unchanged.
     """
+    if cfg.head_selectors is not None:
+        return _select_keep_per_head(q, k, scale, cfg, q_offset, index)
     if cfg.selector == "ashape":
         bsz, h = q.shape[0], q.shape[1]
         tq = (q.shape[2] + cfg.block - 1) // cfg.block
@@ -284,6 +349,28 @@ def select_keep(
         return keep, rank
     scores = block_scores(q, k, scale, cfg.block, cfg.stride)
     return select_blocks(scores, cfg.threshold, q_offset), scores
+
+
+def assign_head_selectors(
+    errors: mx.array, cand_kinds: list[str], tol: float
+) -> tuple[str, ...]:
+    """Offline per-head pattern assignment → a ``head_selectors`` tuple for :class:`XAttnConfig`.
+
+    ``errors`` ``[C, H]`` is each candidate selector's per-head approximation error vs dense attention,
+    with candidate rows ordered **cheapest-kernel → most-accurate** (``cand_kinds[c]`` names row ``c``'s
+    selector kind). For each head, route it to the *cheapest* candidate whose error ≤ ``tol`` (the
+    MInference principle — the lightest pattern that still recalls that head's attention); if none
+    qualifies, fall back to the last (most-accurate) candidate. Pure / positional (no model state) so
+    the policy is unit-testable; the per-head ``errors`` are measured offline on a calibration forward
+    (dense inputs) by the ppl harness. ``mx.argmax`` over the boolean within-tol column returns the
+    FIRST (cheapest) qualifying candidate.
+    """
+    c = errors.shape[0]
+    within = errors <= tol                             # [C, H]
+    any_ok = mx.any(within, axis=0)                    # [H]
+    first_ok = mx.argmax(within.astype(mx.int32), axis=0)   # [H] first True row (0 if none → fallback)
+    choice = mx.where(any_ok, first_ok, c - 1).astype(mx.int32)
+    return tuple(cand_kinds[int(i)] for i in choice.tolist())
 
 
 def additive_mask(
@@ -317,9 +404,9 @@ def sparse_prefill_mask(
             f"sparse_prefill_mask [B,H,T,S] ~= {gb:.1f} GB (T={t}, heads={h}) exceeds "
             f"max_alloc_gb={cfg.max_alloc_gb}; enable XAttnConfig.gather=True for long context."
         )
-    # vertical-slash needs ONE global pattern (from the last query block's probe); xattn/ashape
-    # select locally so they pass index=None and select inside select_keep.
-    index = vertical_slash_index(q, k, scale, cfg) if cfg.selector == "vslash" else None
+    # vertical-slash (uniform or per-head) needs ONE global pattern (from the last query block's probe);
+    # xattn/ashape select locally so they pass index=None and select inside select_keep.
+    index = vertical_slash_index(q, k, scale, cfg) if _uses_vslash(cfg) else None
     keep, _ = select_keep(q, k, scale, cfg, 0, index)
     return additive_mask(keep, t, s, cfg.block, q.dtype)
 
@@ -368,8 +455,8 @@ def gather_sparse_attention(
     # vertical-slash builds ONE global pattern from the last query block's probe (over the *unpadded*
     # q/k, so the probe is the last REAL block) and applies it to every chunk — computed once here,
     # not per chunk, so all chunks select identically (that is what keeps gather == mask). xattn and
-    # ashape select locally per chunk (index stays None).
-    index = vertical_slash_index(q, k, scale, cfg) if cfg.selector == "vslash" else None
+    # ashape select locally per chunk (index stays None). Per-head: fires when ANY head uses vslash.
+    index = vertical_slash_index(q, k, scale, cfg) if _uses_vslash(cfg) else None
 
     outs: list[mx.array] = []
     for c0 in range(0, nb, cb):

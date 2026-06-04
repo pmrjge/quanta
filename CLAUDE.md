@@ -17,7 +17,7 @@ That is the mistake this project exists to not repeat.
 
 ## Active task (transient — full handover in PLAN_minference.md)
 
-**In flight: InternLM2.5 sparse-prefill (MInference family) — M3 ✅, M4 next.** Handover
+**In flight: InternLM2.5 sparse-prefill (MInference family) — M4 ✅, M5 next.** Handover
 **`PLAN_minference.md`**. Reuse the validated block-sparse substrate (`quanta.modeling.xattention`,
 `gather_sparse_attention`/`sparse_prefill_mask`, `threshold=1.0`==dense); M0 wired a `self.sparse`
 hook into `InternLM2Attention` (default None = dense byte-unchanged). M1 measured XAttention's lossy
@@ -34,8 +34,19 @@ execution via a `"vslash"` `select_keep` branch + precomputed global `index` thr
 chunk (so gather==mask); model-free `parity/internlm2_vslash_test.py` (causal/anchor/twin) + real-model
 gate: vslash keep-all **== dense EXACTLY**, gather==mask @v3s3, measured cost **v3s3 +3.01% / v2s2
 +7.29%** (lossiest of the three at this 7-block doc — vertical-slash is a long-context, per-head-assigned
-pattern; integration green is the point, not winning at 7 blocks). M4 next = **per-head offline pattern
-assignment** (route each head to the cheapest selector that holds quality), ppl-gated vs M1/M2/M3.
+pattern; integration green is the point, not winning at 7 blocks). **M4 made the selector per-head**: a
+`head_selectors` tuple on `XAttnConfig` (None = uniform, byte-unchanged) routing each query head to its
+own kind via `_select_keep_per_head` (bounded loop over the ≤3 KINDS, not heads → one `take_along_axis`;
+each head's keep == the uniform keep for its kind — pure routing); offline policy `assign_head_selectors`
+(cheapest candidate within `tol`, else accurate fallback); a parity-preserving `InternLM2Attention.
+_attn_heads` extraction so the ppl harness measures per-head error vs dense. Model-free
+`parity/internlm2_perhead_test.py` (policy + routing-exactness + mixed-keep-all==dense + gather==mask +
+validation) + real-model gate: **perhead mixed keep-all == dense EXACTLY**, gather==mask (8.88e-3),
+measured **+0.40% ppl** with the offline router assigning **86% xattn / 14% A-shape / 0% vslash** (Σ
+32×32 heads) — buys back A-shape-L2's +3.76% → +0.40% (≈ best uniform xattn +0.31%) while running 14% of
+heads on the cheaper static kernel; vslash 0% at 7 blocks (long-context pattern, per M3). M5 next =
+**per-head *params*** (not just kind) + kernel-aware FLOP-budgeted search + key-chunk the vslash probe
+for long context, ppl-gated vs M4.
 
 Prior InternLM2.5 **EAGLE spec-decode** track is **COMPLETE** (M0–M3, `ec0f6f3`; **1.42× lossless @
 k=2** via drafter quantization — memory `project_internlm2_eagle.md`). The earlier batched-decode /

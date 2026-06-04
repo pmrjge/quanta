@@ -171,16 +171,72 @@ the gate's job is correct integration (anchor + twin green) + an honest cost mea
 7 blocks. M1/M2 reproduced bit-identically in the same run (xattn t=0.9 +0.31% / gather==mask 5.9e-3;
 ashape L=4 +0.58% / gather==mask 2.2e-3), confirming the `index` refactor did not regress them.
 
-### M4+ — per-head offline pattern assignment (remaining)
-- **Per-head offline pattern assignment** (kernel-aware search) is the MInference setup step: give
-  each head the cheapest pattern (A-shape / vertical-slash / block-sparse) that holds its quality —
-  this is where vertical-slash earns its place (assigned only to the heads it suits, not forced on
-  every head as the M3 ppl gate does). Can start fixed-per-head and refine. The selectors are now
-  plug-compatible (`XAttnConfig.selector`), so per-head assignment is a routing layer over them: the
-  `self.sparse` hook becomes a per-head list/array of configs (or a head→selector map) the attention
-  module dispatches over. Each assignment scheme = its own milestone + ppl gate (vs the M1/M2/M3
-  baselines). A natural long-context follow-up: key-chunk the vertical-slash probe (currently one
-  `max_alloc_gb`-guarded matmul) so it scales past the gate's short doc to 100K+ where vslash wins.
+### M4 ✅ — per-head offline pattern assignment — DONE
+Made the selector **per head**: an offline search routes each query head to the cheapest selector kind
+that still recalls its attention, and `select_keep` dispatches per head over the validated M1/M2/M3
+selectors. The per-head path is a pure **routing layer** — it adds no new selection math: head `h`'s
+kept-block mask is byte-identical to the uniform mask for `head_selectors[h]`. Smallest-diff design:
+- a `head_selectors: tuple[str,…] | None` field on `XAttnConfig` (None ⇒ uniform `selector`, every path
+  byte-for-byte unchanged; when set, a length-`num_query_heads` tuple of kinds — heads sharing a kind
+  share that kind's params). `_select_keep_per_head` computes each *distinct* kind's keep/rank for ALL
+  heads (a bounded loop over the ≤3 KINDS present — never a per-head/per-token hot loop, rule 3), stacks
+  `[n_kind,B,H,Tq,Tk]`, and selects per head with one `take_along_axis`. vslash's global `index` is
+  threaded to its sub-selection so per-head gather == mask. `_uses_vslash` fires the index precompute
+  when ANY head uses vslash. xattn/ashape/vslash **uniform** paths byte-for-byte unchanged.
+- `assign_head_selectors(errors[C,H], cand_kinds, tol)` — the offline policy: route each head to the
+  cheapest candidate (rows ordered cheap→accurate by kernel cost) whose per-head error ≤ `tol`, else the
+  most-accurate fallback. Pure/positional ⇒ unit-testable.
+- `InternLM2Attention._attn_heads` — a **parity-preserving extraction** of `__call__`'s body up to (not
+  including) the `wo` projection (`__call__` == `wo(transpose(_attn_heads(x)).reshape(…))`), so the ppl
+  harness can read each head's attention output under a given selector and compare it to dense without
+  duplicating projection / RoPE / dynamic-NTK / GQA-repeat / sparse-dispatch.
+
+Deliverables:
+- `src/quanta/modeling/xattention.py`: `XAttnConfig.head_selectors` (+ validation), `_uses_vslash`,
+  `_select_keep_per_head`, `select_keep` per-head dispatch, `assign_head_selectors`; both execution
+  paths' index precompute via `_uses_vslash`.
+- `src/quanta/internlm2/attention.py`: `_attn_heads` extraction; slimmed `__call__` (pure, no behavior
+  change — verified bit-identical by the M0/M2/M3 model-free gates that drive the public `__call__`).
+- `parity/internlm2_perhead_test.py` (NEW, model-free, fp32, T=500, real `InternLM2Attention`):
+  `assign_head_selectors` policy (cheapest-within-tol / fallback / boundary) + routing exactness
+  (mixed `keep[:,h]` == uniform keep for head `h`'s kind) + uniform-as-per-head == uniform (0.00) +
+  MIXED keep-all == dense, mask **(0.00)** & gather (5e-8) + gather==mask (4e-8) + sparsity-active +
+  budget-capped + min_seq-gated + causal-safe + validation (unknown kind / length mismatch rejected).
+  Run: `uv run python -m parity.internlm2_perhead_test`.
+- `parity/internlm2_ppl_sparse.py` (EXTENDED): per-layer offline assignment derived on the DENSE
+  stream's input (per-head L2 error of each candidate vs dense → cheapest within `tol=0.02`; candidates
+  ashape L=2 / vslash v2s2 / xattn t=0.9, cheap→accurate by kernel cost, fallback xattn) + `perhead` /
+  `perhead gat` (derived) + `perhead anchor` (fixed mixed keep-all) variants + M4 gates + a realized
+  selector-mix readout, alongside the M1/M2/M3 gates (re-validated unchanged in the same solo run).
+- Gates: M0 `internlm2_xattn_test` + M2 `internlm2_ashape_test` + M3 `internlm2_vslash_test` +
+  `xattention_parity` still green (uniform paths unchanged); `internlm2_perhead_test` green;
+  pytest/ruff/compileall/`uv lock --check`/`git diff --check` clean.
+
+**RESULTS (32 layers, 823 tok / 7 blocks; same bake & doc as M1/M2/M3):** dense ppl **12.3379** (top-1
+44.2%). **perhead mixed keep-all == dense EXACTLY (Δppl 0.00)** — the per-head parity anchor (routing is
+exact regardless of which kinds mix). **perhead gather==mask: Δ=8.88e-3 (0.072% rel < 1%)** — the M4
+twin. Measured: **perhead Δppl +0.40%** with the offline router assigning (Σ 32 layers × 32 heads =
+1024) **86% of heads → xattn, 14% → the cheap static A-shape kernel, 0% → vslash**. The router buys back
+nearly all of A-shape-L2's loss (**+3.76% → +0.40%**, approaching the best uniform xattn t=0.9 +0.31%)
+while still running 14% of heads on the cheaper positional kernel — the MInference promise: cheap where
+it suffices, accurate where needed, at bounded quality. vslash earning **0%** at 7 blocks is consistent
+with M3 (vertical-slash is a long-context pattern; it never beats the cheaper ashape *or* the accurate
+xattn fallback at this short doc). M1/M2/M3 reproduced bit-identically in the same run (xattn t=0.9
++0.31% / twin 5.94e-3; ashape keep-all 0.00, L=4 +0.58% / twin 2.16e-3; vslash keep-all 0.00, v3s3
++3.01% / twin 2.76e-2), confirming the `head_selectors` field + `_attn_heads` extraction regressed
+nothing.
+
+### M5+ — per-head *params* + long-context (remaining)
+- **Per-head params, not just kind** (the "refine" of M4's shared-per-kind params): generalize
+  `head_selectors` so each head can carry its OWN params (different `local`/`vert`/`slash`/`threshold`),
+  and replace the fixed `tol` with MInference's actual **kernel-aware FLOP-budgeted search** (pick the
+  per-head pattern+params minimizing approximation error under a target kept-block budget). Its own
+  milestone + ppl gate vs M4.
+- **Long-context probe**: key-chunk the vertical-slash probe (currently one `max_alloc_gb`-guarded
+  matmul) so it scales past the gate's short doc to 100K+ where vslash earns assignments (at 7 blocks it
+  takes 0%). Pair with a real wall-clock **gather-path prefill bench** — the actual FLOP/memory speedup
+  (the mask path measures quality only; with fast SDPA + an additive block mask MLX still computes the
+  full QKᵀ).
 
 ---
 
