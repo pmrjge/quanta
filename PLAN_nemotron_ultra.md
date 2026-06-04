@@ -10,9 +10,13 @@ parity-first pipeline.
 
 ## Decisions (user, this session)
 
-1. Nemotron experts **int4-GPTQ** — keep the proven `nemotron/quant_policy.py`, **not** AWQ.
-   GPTQ error-feedback is the stronger lever on a *bf16* source (the "AWQ≈no-help" finding was an
-   int4-source artifact); it is already built and baked on the 120B-Super sibling.
+1. Nemotron experts **int4-AWQ g64** — user pivot this session. NB the earlier "int4-GPTQ, already
+   baked on Super" premise was **wrong**: `bake_nemotron` only implements AWQ/RTN (no GPTQ path is
+   wired into the Nemotron bake), and Super actually shipped plain int4 **RTN** (manifest: `awq_packed`,
+   s=1). Finding #38 had flagged AWQ as +75% e2e on the relu² down-proj, but the U2 slice de-risk
+   (`parity/nemotron_ultra_awq_slice_test.py`) shows that collapse does **not** reproduce at Ultra scale
+   (AWQ helps up-proj 0.806 / ties down-proj 0.984; the α-grid rejects the degenerate scales). RTN stays
+   the known-good fallback; U3 teacher-forced ppl is the e2e arbiter.
 2. Mellum **int8 (AWQ)** — user choice. int8-from-bf16 is near-lossless, so AWQ here is
    belt-and-suspenders (harmless; `bake/awq.py` exists).
 3. **One model resident at a time** — honors the OOM-safety rule; the agentic loop swaps
@@ -79,11 +83,21 @@ port; closest template `src/quanta/qwen35/`.
   Files: `parity/nemotron_ultra_layer_parity.py`, `src/quanta/nemotron/mamba_mixer.py`.
   > Note: `nemotron_layers_test.py`'s *attention* prefill==decode assertion (2e-3) is pre-existing-stale
   > vs the int8 `KVCache` default (#133) — ~5.3e-3, unrelated to U1; flagged for a separate cleanup.
-- **U2 — full int4-GPTQ + int8 bake**, layer-streamed (rule 8), via `nemotron/bake.py`
-  (cf. `parity/run_bake_nemotron_int4g64.py`); calibration + routing-capture over 512 experts top-22
-  (Woodbury for under-covered experts). Self-contained artifact (config + manifest + tokenizer +
-  relative shards) → `~/models/NVIDIA-Nemotron-3-Ultra-550B-A55B-quanta_int4g64`. Gate: loads +
-  manifest in-artifact only. **Hours; run solo (OOM hazard).**
+- **U2 de-risk ✅ — AWQ slice diagnostic.** `parity/nemotron_ultra_awq_slice_test.py` streams Ultra
+  layers 0–1 (layer 1 = first MoE; NO 21.5 GiB expert stack materialized — gate+fc1 only) and runs, per
+  warm expert, a **held-out** activation-weighted recon test (fit the AWQ scale on 70% of the expert's
+  routed rows, measure error on the held-out 30%) for AWQ vs RTN. Result: finding #38's relu² down-proj
+  AWQ collapse does **not** reproduce at Ultra — AWQ *helps* up-proj (ratio 0.806) and *ties* down-proj
+  (0.984, 23/24 experts AWQ≤RTN); relu² channel sparsity 99.74% (the #38 precondition) is present but
+  AWQ's α-grid rejects the degenerate scales (range ≈1, not ≈1e6). Caveat: L1-only + activation-weighted
+  recon (not e2e ppl). **AWQ cleared.**
+- **U2 — full int4-AWQ g64 + int8 bake**, layer-streamed (rule 8), via `bake_nemotron(..., expert_method=
+  "awq", group_size=64)` (cf. `parity/run_bake_nemotron.py`, the AWQ driver); the AWQ pass captures the
+  per-MoE-layer latent + routing (`nemotron/calibrate.py`) over ~2–4K agentic-corpus tokens, then
+  grid-scales each expert's up/down. Self-contained artifact (config + manifest + tokenizer + relative
+  shards) → `~/models/NVIDIA-Nemotron-3-Ultra-550B-A55B-quanta_int4awq_g64`. Gate: loads + manifest
+  in-artifact only. **Hours; run solo (OOM hazard).** RTN (`expert_method="rtn"`) the known-good fallback
+  if U3 ppl regresses.
 - **U3 — teacher-forced ppl + top-1** vs bf16 reference on real prose (stop set {2, 11}). Gate: sane.
 - **U4 — optimizations**, each behind a flag and ppl-equivalent: native **MTP spec-decode**
   (`spec.py`/`mtp.py`), **paged-KV** on the 12 attn layers (port #153 loop-kill), packed int4 experts

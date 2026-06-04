@@ -20,8 +20,9 @@ That is the mistake this project exists to not repeat.
 **In flight (PIVOT, this session): Nemotron-3-Ultra-550B (main agent) + Mellum2-12B (orchestrator)
 agentic stack.** Handover **`PLAN_nemotron_ultra.md`**. Quantize Nemotron-Ultra (hybrid
 Mamba2+attn+MoE, `nemotron_h` — already supported; the 120B-Super sibling is already baked int4) as
-**int4-GPTQ experts + int8 dense + bf16 core** (keep the proven `nemotron/quant_policy.py`, NOT AWQ —
-GPTQ is the stronger lever on a bf16 source), then Mellum2 (`mellum`, a new port) as **int8**; **one
+**int4-AWQ experts + int8 dense + bf16 core** (user pivoted experts → AWQ this session; the prior
+"int4-GPTQ" label was never wired into the Nemotron bake — Super actually shipped plain int4 RTN — and
+the U2 slice de-risk below clears AWQ at Ultra scale), then Mellum2 (`mellum`, a new port) as **int8**; **one
 model resident at a time**; drive Ultra first. **U0 ✅** — config adapter (`_hybrid_pattern`
 normalises the newer explicit-`layers_block_type` schema, which omits `num_hidden_layers`) +
 fit-check: Ultra parses, the derived split reproduces the explicit list bit-for-bit, the quant policy
@@ -38,8 +39,16 @@ group-wise** (variance over `d_inner//n_groups`, NOT full `d_inner` — `Zamba2R
 a full-width `nn.RMSNorm` — *self-consistent* (prefill==decode) so the old self-consistency-only test
 never caught it, but **42% off** the reference. Fixed via a new group-wise `MambaRMSNormGated`
 (`mamba_mixer.py`, forward-only — corrects the **already-baked Super-120B** too; bf16 `norm.weight`
-unchanged, no re-bake; Super ppl should be re-measured under the fix). **U2 next** = full int4-GPTQ +
-int8 bake (layer-streamed, hours, solo) → `…-quanta_int4g64`. The InternLM2.5 MInference track below
+unchanged, no re-bake; Super ppl should be re-measured under the fix). **U2 de-risk ✅** — slice
+diagnostic `parity/nemotron_ultra_awq_slice_test.py` (Ultra L1, the first MoE; streams layers 0–1, NO
+21.5 GiB expert stack materialized): per warm expert, held-out activation-weighted recon error, AWQ vs
+RTN. Finding #38's relu² down-proj AWQ collapse **does NOT reproduce at Ultra** — AWQ *helps* up-proj
+(held-out ratio 0.806) and *ties* down-proj (0.984, 23/24 experts AWQ≤RTN); the relu² sparsity
+precondition is present (99.74% near-zero channels) but AWQ's grid rejects the degenerate scales (range
+≈1, not ≈1e6, so the folded `1/s` never blows up). Caveat: L1-only + activation-weighted recon ("far
+more e2e-predictive than raw recon" per `bake/calibrate.py`, but NOT e2e ppl — U3 is the arbiter).
+**U2 next** = full int4-AWQ g64 + int8 bake (layer-streamed, hours, solo) → `…-quanta_int4awq_g64`
+(RTN the known-good fallback if U3 ppl regresses). The InternLM2.5 MInference track below
 is **paused at M6 ✅ (M7 deferred)**, not abandoned.
 
 **Paused: InternLM2.5 sparse-prefill (MInference family) — M6 ✅, M7 next.** Handover
