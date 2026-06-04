@@ -26,9 +26,21 @@ model resident at a time**; drive Ultra first. **U0 ✅** — config adapter (`_
 normalises the newer explicit-`layers_block_type` schema, which omits `num_hidden_layers`) +
 fit-check: Ultra parses, the derived split reproduces the explicit list bit-for-bit, the quant policy
 covers all 51,023 tensors (rule #6), and the mix is resident at **289.7 GiB ≤ 490.4** (200.7 GiB
-headroom) — `parity/nemotron_ultra_fit_test.py`. **U1 next** = 2–3 layer numeric parity vs a
-transformers `NemotronHForCausalLM` reference at Ultra scale (one mamba / one attention / one moe).
-The InternLM2.5 MInference track below is **paused at M6 ✅ (M7 deferred)**, not abandoned.
+headroom) — `parity/nemotron_ultra_fit_test.py`. **U1 ✅** — per-layer numeric parity vs an
+**independent transformers `NemotronH*` reference** at full Ultra scale, layer-streamed (rule 8: one
+real layer resident, the moe's ~21.5 GiB expert stacks the peak), `parity/nemotron_ultra_layer_parity.py`:
+**mamba** our `MambaMixer` vs `NemotronHMamba2Mixer` (fp32, Δ 3.1e-04), **attn** ours vs transformers'
+`apply_rotary_pos_emb`+`eager_attention_forward` (Δ 4.5e-06), **moe** router top-22 set+weights vs
+`route_tokens_to_experts` (set-exact, w Δ 1.2e-07 — our `noaux_tc` sigmoid routing is provably exact)
++ experts/latent/shared vs inline-dense (Δ 7e-04) + chunk-invariant. **The gate caught a real
+forward-path bug** (the kind CLAUDE.md's thesis warns about): the Mamba-2 **gated RMSNorm is
+group-wise** (variance over `d_inner//n_groups`, NOT full `d_inner` — `Zamba2RMSNormGated`); ours was
+a full-width `nn.RMSNorm` — *self-consistent* (prefill==decode) so the old self-consistency-only test
+never caught it, but **42% off** the reference. Fixed via a new group-wise `MambaRMSNormGated`
+(`mamba_mixer.py`, forward-only — corrects the **already-baked Super-120B** too; bf16 `norm.weight`
+unchanged, no re-bake; Super ppl should be re-measured under the fix). **U2 next** = full int4-GPTQ +
+int8 bake (layer-streamed, hours, solo) → `…-quanta_int4g64`. The InternLM2.5 MInference track below
+is **paused at M6 ✅ (M7 deferred)**, not abandoned.
 
 **Paused: InternLM2.5 sparse-prefill (MInference family) — M6 ✅, M7 next.** Handover
 **`PLAN_minference.md`**. Reuse the validated block-sparse substrate (`quanta.modeling.xattention`,

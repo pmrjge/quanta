@@ -37,6 +37,36 @@ def _softplus(x: mx.array) -> mx.array:  # numerically stable
     return mx.maximum(x, 0) + mx.log1p(mx.exp(-mx.abs(x)))
 
 
+class MambaRMSNormGated(nn.Module):
+    """Mamba-2 gated RMSNorm (Zamba2 / NemotronH ``Zamba2RMSNormGated``): gate the SSD output by
+    ``silu(z)``, then RMS-normalize **within each of ``n_groups`` channel groups** — the variance is
+    over ``d_inner // n_groups`` channels, **not** the full ``d_inner``.
+
+    The reference applies the group structure (``group_size = d_inner // n_groups``, ``group_count =
+    n_groups``) because the SSD itself is grouped (B/C share ``n_groups`` groups). A plain full-width
+    ``nn.RMSNorm`` here is *self-consistent* (prefill==decode) but silently diverges from the
+    transformers mixer by ~40% — caught by ``parity/nemotron_ultra_layer_parity.py`` (the old
+    ``nemotron_layers_test`` only checked self-consistency, never a numeric reference). The per-group
+    normalization uses the fused ``mx.fast.rms_norm`` over the group axis (weight applied after, like
+    the reference: ``self.weight * normalize_per_group(y * silu(z))``)."""
+
+    def __init__(self, d_inner: int, n_groups: int, eps: float) -> None:
+        super().__init__()
+        if d_inner % n_groups != 0:
+            raise ValueError(f"d_inner {d_inner} not divisible by n_groups {n_groups}")
+        self.weight = mx.ones((d_inner,))
+        self.n_groups = n_groups
+        self.group_size = d_inner // n_groups
+        self.eps = eps
+
+    def __call__(self, y: mx.array, z: mx.array) -> mx.array:
+        b, t, d = y.shape
+        h = (y.astype(mx.float32) * _silu(z.astype(mx.float32))).reshape(b, t, self.n_groups, self.group_size)
+        ones = mx.ones((self.group_size,), dtype=mx.float32)  # per-group RMS, weight applied after
+        h = mx.fast.rms_norm(h, ones, self.eps).reshape(b, t, d).astype(y.dtype)
+        return self.weight * h
+
+
 class MambaMixer(nn.Module):
     def __init__(self, cfg: NemotronHConfig) -> None:
         super().__init__()
@@ -47,7 +77,7 @@ class MambaMixer(nn.Module):
         self.d_inner, self.conv_dim = cfg.mamba_d_inner, cfg.mamba_conv_dim
         self.in_proj = nn.Linear(cfg.hidden_size, cfg.mamba_in_proj_dim, bias=False)
         self.out_proj = nn.Linear(self.d_inner, cfg.hidden_size, bias=False)
-        self.norm = nn.RMSNorm(self.d_inner, eps=cfg.norm_eps)  # gated (gate applied before norm)
+        self.norm = MambaRMSNormGated(self.d_inner, cfg.mamba_n_groups, cfg.norm_eps)  # group-wise
         self.conv_weight = mx.zeros((self.conv_dim, self.k))  # depthwise (C,K); loader squeezes (C,1,K)
         self.conv_bias = mx.zeros((self.conv_dim,))
         self.A_log = mx.zeros((self.h,))
@@ -126,7 +156,7 @@ class MambaMixer(nn.Module):
                 ys.append(y_t[:, None])
             y = ys[0] if t == 1 else mx.concatenate(ys, axis=1)
         y = y.reshape(b, t, self.d_inner)
-        y = self.norm(y * _silu(z))  # gated RMSNorm: gate before norm+weight
+        y = self.norm(y, z)  # group-wise gated RMSNorm (gate=silu(z) applied inside, per n_groups)
         return self.out_proj(y), state, conv_state
 
     def _prefill(self, xs, dt, a, bm, cm, state):

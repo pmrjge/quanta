@@ -57,9 +57,28 @@ port; closest template `src/quanta/qwen35/`.
   reproduces the explicit list bit-for-bit, **quant policy covers all 51,023 tensors** (rule #6),
   and the mix **fits 289.7 GiB ≤ 490.4** (200.7 GiB headroom). Super (old schema) backward-compat
   green. Files: `src/quanta/nemotron/config.py`, `parity/nemotron_ultra_fit_test.py`.
-- **U1 — 2–3 layer numeric parity** vs a `transformers` `NemotronHForCausalLM` reference (one mamba,
-  one attention, one moe), fp32 residual diff, layer-streamed. Reuse `nemotron_layers_test.py` /
-  `nemotron_moe_test.py` / `nemotron_ssd_kernel_test.py` patterns at Ultra scale. Gate: Δ < fp tol.
+- **U1 ✅ — per-layer numeric parity vs an independent transformers `NemotronH*` reference**, at full
+  Ultra scale, layer-streamed (rule 8: one real layer resident; the moe's ~21.5 GiB bf16 expert stacks
+  the peak — the 1023 GiB whole model is never loaded, and the transformers MoE's 512 experts stay on
+  the `meta` device for a router-only cross-check). `parity/nemotron_ultra_layer_parity.py`:
+    - **mamba** our `MambaMixer` prefill vs `NemotronHMamba2Mixer` (naive CPU path), fp32 — **Δ 3.1e-04**;
+    - **attn** our `NemotronAttention` (naive) vs transformers' own `apply_rotary_pos_emb` +
+      `eager_attention_forward` + o_proj (rope θ=10000, GQA 64/2), fp32 — **Δ 4.5e-06**;
+    - **moe** router top-22 **set + weights** vs `route_tokens_to_experts` — **set-exact, w Δ 1.2e-07**
+      (our `noaux_tc` sigmoid+bias routing is provably exact); experts/latent/shared vs an inline dense
+      per-token/per-expert reference — **Δ 7e-04**; token-chunk invariant (Δ 0). transformers/torch are
+      reference-only (offline, rule #5).
+    - **BUG CAUGHT (the parity-first payoff):** the Mamba-2 **gated RMSNorm is group-wise** — variance
+      over `d_inner // n_groups` channels (`Zamba2RMSNormGated`, `group_size = intermediate_size //
+      n_groups`), **not** the full `d_inner`. Our mixer used a full-width `nn.RMSNorm`: *self-consistent*
+      (prefill==decode 1.2e-06) so the old self-consistency-only `nemotron_layers_test` never caught it,
+      but **42% off** the transformers reference. Fixed with a new `MambaRMSNormGated` (group-wise, fused
+      `mx.fast.rms_norm` per group, weight after) in `src/quanta/nemotron/mamba_mixer.py`. **Forward-only**
+      — the bf16 `norm.weight` is unchanged, so it also corrects the **already-baked Super-120B** with no
+      re-bake (Super ppl/quality should be re-measured under the fix; it was previously measured buggy).
+  Files: `parity/nemotron_ultra_layer_parity.py`, `src/quanta/nemotron/mamba_mixer.py`.
+  > Note: `nemotron_layers_test.py`'s *attention* prefill==decode assertion (2e-3) is pre-existing-stale
+  > vs the int8 `KVCache` default (#133) — ~5.3e-3, unrelated to U1; flagged for a separate cleanup.
 - **U2 — full int4-GPTQ + int8 bake**, layer-streamed (rule 8), via `nemotron/bake.py`
   (cf. `parity/run_bake_nemotron_int4g64.py`); calibration + routing-capture over 512 experts top-22
   (Woodbury for under-covered experts). Self-contained artifact (config + manifest + tokenizer +
