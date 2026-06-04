@@ -89,11 +89,17 @@ def _check_index() -> None:
     k = mx.random.normal((1, h, T, d)).astype(mx.float32)
     scale = cfg.attn_scale
 
-    vert_keep, slash_keep, key_mass = vertical_slash_index(q, k, scale, _vs(2, 2, gather=False))
-    assert vert_keep.shape == (1, h, NB) and vert_keep.dtype == mx.bool_, "vert_keep shape/dtype"
-    assert slash_keep.shape == (1, h, NB) and slash_keep.dtype == mx.bool_, "slash_keep shape/dtype"
-    assert key_mass.shape == (1, h, NB), "key_mass shape"
+    # M6: vertical_slash_index returns PARAM-INDEPENDENT masses (key_mass [B,H,Tk], slash_mass [B,H,Tq]);
+    # the top-vert/slash cut moved into select_keep, so the masses must NOT depend on cfg.vert/cfg.slash
+    # (different vert/slash → identical masses → a per-head spec can re-cut them with its own params).
+    key_mass, slash_mass = vertical_slash_index(q, k, scale, _vs(2, 2, gather=False))
+    assert key_mass.shape == (1, h, NB), f"key_mass shape {key_mass.shape}"
+    assert slash_mass.shape == (1, h, NB), f"slash_mass shape {slash_mass.shape}"
     assert bool(mx.all(mx.isfinite(key_mass)).item()), "key_mass must be finite"
+    assert bool(mx.all(mx.isfinite(slash_mass)).item()), "slash_mass must be finite"
+    km2, sm2 = vertical_slash_index(q, k, scale, _vs(NB, NB, gather=False))   # different vert/slash
+    assert float(mx.max(mx.abs(key_mass - km2))) == 0.0, "key_mass depends on cfg.vert — not param-independent"
+    assert float(mx.max(mx.abs(slash_mass - sm2))) == 0.0, "slash_mass depends on cfg.slash — not param-independent"
 
     i = mx.arange(NB)[:, None]
     j = mx.arange(NB)[None, :]
@@ -110,7 +116,7 @@ def _check_index() -> None:
     keepall, _ = select_keep(q, k, scale, _vs(NB, NB, gather=False))
     diff = int(mx.sum(keepall != causal[None, None]).item())
     assert diff == 0, f"vert=slash=n_blocks must equal the full causal mask, off by {diff} cells"
-    print("vertical_slash_index causal / diag+sink-forced / keep-all==causal   OK")
+    print("vertical_slash_index param-independent masses / causal / diag+sink-forced / keep-all==causal   OK")
 
 
 def run() -> None:

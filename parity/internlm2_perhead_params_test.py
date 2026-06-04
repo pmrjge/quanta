@@ -29,9 +29,10 @@ Two independently-checkable pieces, both gated here model-free (no weights neede
       6. the budget cap engages under a mixed assignment (force-keeps sink+diagonal, bounded shape),
       7. ``min_seq > T`` gates sparsity off entirely,
       8. perturbing the final token cannot change an earlier query block's output (no future leakage),
-      9. validation — a vslash spec whose vert/slash disagrees with the config is rejected (the global
-         probe index is shared); setting both head_specs and head_selectors is rejected; a non-HeadSpec
-         entry is rejected; a head_specs/heads length mismatch is rejected at use.
+      9. validation — a vslash spec whose vert/slash differs from the config is now ALLOWED (M6: the
+         probe returns param-independent masses, so heads sharing it can keep different vert/slash);
+         setting both head_specs and head_selectors is rejected; a non-HeadSpec entry is rejected; a
+         head_specs/heads length mismatch is rejected at use.
 
 The assignment's *quality* (which heads earn which params, and the ppl it trades) is measured on the
 real bake in ``parity/internlm2_ppl_sparse.py`` (CLAUDE.md: sparse attention is ppl-gated, never
@@ -205,12 +206,10 @@ def run() -> None:
     print(f"causal: perturb last tok, Δ blk0          max|Δ| = {d7:.2e}  (expected 0)")
     assert d7 < 1e-6, f"perturbing the final token changed block 0 ({d7}) — future leakage"
 
-    # 8. validation: vslash-pin / both-set / non-HeadSpec rejected at config build; length mismatch at use.
-    try:
-        XAttnConfig(head_specs=(HeadSpec("vslash", vert=2, slash=2),), vert=3, slash=3)
-        raise AssertionError("XAttnConfig accepted a vslash HeadSpec whose vert/slash != config")
-    except ValueError:
-        pass
+    # 8. validation: per-head vslash params are now ALLOWED (M6 — the probe returns param-independent
+    #    masses, so a vslash spec need not match the config's vert/slash); both-set / non-HeadSpec /
+    #    length mismatch are still rejected.
+    XAttnConfig(head_specs=(HeadSpec("vslash", vert=2, slash=2),), vert=3, slash=3)  # M6: accepted (no pin)
     try:
         XAttnConfig(head_specs=(HeadSpec("xattn"),) * NH, head_selectors=("xattn",) * NH)
         raise AssertionError("XAttnConfig accepted both head_specs and head_selectors")
@@ -226,7 +225,7 @@ def run() -> None:
         raise AssertionError("per-head-specs dispatch accepted a head_specs/heads length mismatch")
     except ValueError:
         pass
-    print("validation: vslash-pin + both-set + non-HeadSpec + length mismatch rejected   OK")
+    print("validation: per-head vslash params allowed (no pin) + both-set + non-HeadSpec + length mismatch   OK")
 
     print("PASS — InternLM2 per-head params: policy budget-correct; routing exact (incl. same-kind "
           "different params); uniform-as-per-head-specs == uniform; mixed keep-all == dense (mask & "

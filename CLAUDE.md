@@ -17,7 +17,7 @@ That is the mistake this project exists to not repeat.
 
 ## Active task (transient — full handover in PLAN_minference.md)
 
-**In flight: InternLM2.5 sparse-prefill (MInference family) — M5 ✅, M6 next.** Handover
+**In flight: InternLM2.5 sparse-prefill (MInference family) — M6 ✅, M7 next.** Handover
 **`PLAN_minference.md`**. Reuse the validated block-sparse substrate (`quanta.modeling.xattention`,
 `gather_sparse_attention`/`sparse_prefill_mask`, `threshold=1.0`==dense); M0 wired a `self.sparse`
 hook into `InternLM2Attention` (default None = dense byte-unchanged). M1 measured XAttention's lossy
@@ -58,9 +58,19 @@ incl. same-kind-different-params + mixed-keep-all==dense + gather==mask + valida
 per-head-kind +0.40% AND best uniform xattn +0.31%** — with the FLOP-budgeted search (budget=4 blocks)
 assigning **75% ashape:L4 / 23% xattn:t0.9 / 1% vslash / 1% xattn:t0.95** (Σ 32×32 heads); per-head params
 let 75% of heads run the cheap static kernel while each still gets its most-accurate-affordable approx, so
-the aggregate beats any uniform — the MInference thesis. M6 next = **long-context vertical-slash probe**
-(key-chunk it + thread a param-independent probe so per-head vslash *params* vary too) + a wall-clock
-**gather-path prefill bench**, ppl-gated vs M5.
+the aggregate beats any uniform — the MInference thesis. **M6 made per-head *vslash params* vary** (lifted
+M5's vslash-pin): `vertical_slash_index` now returns **param-independent** masses `(key_mass, slash_mass)`
+and the top-`vert`/`slash` cut moved into `select_keep`, so two heads read the ONE global probe yet cut
+DIFFERENT vert/slash from the shared masses (`__post_init__` pin removed; M3/M4/M5 vslash *selections*
+byte-identical — same masses + same top-k, relocated). Model-free `parity/internlm2_vslash_perhead_test.py`
+(two vslash heads at different vert/slash each == its uniform spec & keep different blocks; config-vert/slash
+irrelevance; mixed keep-all==dense; gather==mask) + real-model gate (ppl harness search grid gains a 2nd
+vslash param v2s2+v3s3): **perhd-p keep-all == dense EXACTLY**, gather==mask (7.45e-4), measured **+0.04% ppl
+— beats M5's +0.15%** with the FLOP-budgeted search assigning **73% ashape:L4 / 22% xattn:t0.9 / 4%
+vslash:v3s3 / 1% xattn:t0.95** (4% of heads now run the WIDER vslash, vs M5's 1% — per-head vslash params pay
+off even at 7 blocks; M1–M5 reproduced bit-identically). M7 next = **key-chunk the long-context probe**
+(accumulate the param-independent masses over key chunks so it scales to 100K+; single-shot stays the
+short-doc default) + a wall-clock **gather-path prefill bench**, ppl-gated vs M6.
 
 Prior InternLM2.5 **EAGLE spec-decode** track is **COMPLETE** (M0–M3, `ec0f6f3`; **1.42× lossless @
 k=2** via drafter quantization — memory `project_internlm2_eagle.md`). The earlier batched-decode /

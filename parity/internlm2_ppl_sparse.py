@@ -1,5 +1,5 @@
 """InternLM2.5 long-doc sparse-prefill ppl gate — M1 (XAttention) + M2 (A-shape) + M3 (vertical-slash)
-+ M4 (per-head kind) + M5 (per-head params).
++ M4 (per-head kind) + M5 (per-head params) + M6 (per-head vslash params).
 
 Measures the **quality cost** of block-sparse prefill on the real int8-g64 InternLM2.5-7B bake,
 per selector, against the dense teacher (ppl / top-1 / Δppl%):
@@ -25,10 +25,14 @@ per selector, against the dense teacher (ppl / top-1 / Δppl%):
   its own ``HeadSpec`` (kind + params), and the offline policy becomes a **kernel-aware FLOP-budgeted
   search** (:func:`assign_head_specs`): per head, the most accurate candidate (kind, params) whose cost
   (measured mean kept blocks via ``_attn_keep_counts`` + a per-kind selection-kernel constant) fits a
-  FLOP budget. The candidate grid spans multiple param-points per kind (ashape L2/L4, xattn t0.90/t0.95,
-  vslash v2s2), so two heads of the same kind can land on different params. Same anchors as M4 (a MIXED
-  keep-all == dense; a gather twin); the derived Δppl + realized (kind, params) mix are the measured
-  result.
+  FLOP budget. The candidate grid spans multiple param-points per kind, so two heads of the same kind can
+  land on different params. Same anchors as M4 (a MIXED keep-all == dense; a gather twin); the derived
+  Δppl + realized (kind, params) mix are the measured result.
+* **M6 — per-head vslash params**: removes M5's vslash-pin. The vertical-slash probe
+  (:func:`vertical_slash_index`) now returns **param-independent** masses and the top-``vert``/``slash``
+  cut is applied per spec in :func:`select_keep`, so two heads can read the ONE global probe yet keep
+  different vert/slash. The M5 search grid here gains a 2nd vslash param-point (v2s2 **and** v3s3): a
+  derived ``head_specs`` may now mix them per head, with no config-level vert/slash. Same anchors/twin.
 
 Sparse attention is **lossy ⇒ ppl-gated, never numeric-parity-gated** (CLAUDE.md rule 4). This is
 the quality baseline every later MInference selector (M2+) is judged against. Two things it proves
@@ -237,19 +241,20 @@ def run(n_layers: int | None = None, max_tokens: int = 1024) -> None:
                             local=nblk, vert=nblk, slash=nblk, min_seq=0, gather=False)
     ph_labels = ["perhead anchor", "perhead", "perhead gat"]
 
-    # M5: per-head PARAMS. The candidate grid spans multiple param-points per kind (ashape L2/L4, vslash
-    # v2s2, xattn t0.90/t0.95), so two heads of the same kind can land on DIFFERENT params. Per layer
-    # (below) each candidate's per-head error vs dense AND its kernel-aware FLOP cost (mean kept blocks +
-    # per-kind kernel constant) are measured on the dense calibration forward; candidates are sorted
-    # cheap→accurate; ``assign_head_specs`` picks per head the most accurate one that fits ``ph2_budget``
-    # blocks (else the cheapest). The single vslash candidate is v2s2, so every derived head_specs config
-    # carries vert=slash=2 (the shared global probe index; pin-validated). A MIXED keep-all per-head-specs
-    # assignment is the parity anchor (== dense); a gather twin checks the M5 invariant. The derived Δppl
-    # + realized (kind,params) mix are the measured result (not pass/fail).
+    # M5/M6: per-head PARAMS. The candidate grid spans multiple param-points per kind (ashape L2/L4,
+    # vslash v2s2/v3s3, xattn t0.90/t0.95), so two heads of the same kind can land on DIFFERENT params —
+    # including two vslash params (M6: the probe returns param-independent masses, so a derived head_specs
+    # may mix v2s2 and v3s3 freely — no pin). Per layer (below) each candidate's per-head error vs dense
+    # AND its kernel-aware FLOP cost (mean kept blocks + per-kind kernel constant) are measured on the
+    # dense calibration forward; candidates are sorted cheap→accurate; ``assign_head_specs`` picks per head
+    # the most accurate one that fits ``ph2_budget`` blocks (else the cheapest). A MIXED keep-all
+    # per-head-specs assignment is the parity anchor (== dense); a gather twin checks the invariant. The
+    # derived Δppl + realized (kind,params) mix are the measured result (not pass/fail).
     ph2_cand = [
         HeadSpec("ashape", local=2),
         HeadSpec("ashape", local=4),
         HeadSpec("vslash", vert=2, slash=2),
+        HeadSpec("vslash", vert=3, slash=3),     # M6: a 2nd vslash param-point — enables per-head vslash params
         HeadSpec("xattn", threshold=0.90),
         HeadSpec("xattn", threshold=0.95),
     ]
@@ -300,10 +305,11 @@ def run(n_layers: int | None = None, max_tokens: int = 1024) -> None:
         ph_gat_cfg = XAttnConfig(block=128, stride=16, head_selectors=assign, min_seq=0,
                                  gather=True, **ph_params)
 
-        # M5: per-head PARAMS — reuse the SAME dense calibration (dense_heads/den). Per candidate measure
-        # per-head output relerr AND kernel-aware cost (mean kept blocks + per-kind kernel constant), sort
-        # cheap→accurate (so policy ties break to the cheaper), then budget-search the per-head (kind,
-        # params). The vslash candidate is v2s2 ⇒ the derived configs carry vert=slash=2 (pin-validated).
+        # M5/M6: per-head PARAMS — reuse the SAME dense calibration (dense_heads/den). Per candidate
+        # measure per-head output relerr AND kernel-aware cost (mean kept blocks + per-kind kernel
+        # constant), sort cheap→accurate (so policy ties break to the cheaper), then budget-search the
+        # per-head (kind, params). M6: two vslash param-points (v2s2/v3s3) may be mixed per head — the
+        # probe masses are param-independent, so the derived config needs no config-level vert/slash.
         errs2, costs2 = [], []
         for sp2 in ph2_cand:
             uc = _uni(sp2)
@@ -318,8 +324,9 @@ def run(n_layers: int | None = None, max_tokens: int = 1024) -> None:
         assign2 = assign_head_specs(errs_o, costs_o, cand_o, ph2_budget)   # tuple[HeadSpec]*nh
         for sp2 in assign2:
             dist2[_spec_label(sp2)] += 1
-        ph2_mask_cfg = XAttnConfig(block=128, stride=16, head_specs=assign2, vert=2, slash=2,
-                                   min_seq=0, gather=False)
+        # M6: no config vert/slash — the probe masses are param-independent, so a derived head_specs may
+        # mix v2s2 and v3s3 and each vslash head cuts its own params from the one shared probe.
+        ph2_mask_cfg = XAttnConfig(block=128, stride=16, head_specs=assign2, min_seq=0, gather=False)
         ph2_gat_cfg = replace(ph2_mask_cfg, gather=True)
 
         for vi, (_, sp) in enumerate(variants):
@@ -416,9 +423,9 @@ def run(n_layers: int | None = None, max_tokens: int = 1024) -> None:
     n_assign = sum(dist.values())
     mix = "  ".join(f"{k} {dist[k]}/{n_assign} ({100 * dist[k] / n_assign:.0f}%)" for k in cand_kinds)
 
-    # M5 per-head-params gates: a MIXED keep-all per-head-specs assignment == dense (the parity anchor)
-    # and the derived assignment's gather==mask (the M5 twin) are hard checks; the derived Δppl + the
-    # realized (kind,params) mix are the measured result (recorded, not pass/fail).
+    # M5/M6 per-head-params gates: a MIXED keep-all per-head-specs assignment == dense (the parity anchor)
+    # and the derived assignment's gather==mask (the twin) are hard checks; the derived Δppl + the realized
+    # (kind,params) mix — which under M6 can include two vslash params — are the measured result.
     ph2_anchor_ppl = ppls["perhd-p anchor"]
     ph2_mask, ph2_gat = ppls["perhd-p"], ppls["perhd-p gat"]
     ph2_anchor_ok = abs(ph2_anchor_ppl - dense) / dense < 0.01    # mixed keep-all == dense
@@ -452,8 +459,8 @@ def run(n_layers: int | None = None, max_tokens: int = 1024) -> None:
           and v_anchor and v_twin and v_sane and ph_anchor_ok and ph_twin and ph_sane
           and ph2_anchor_ok and ph2_twin and ph2_sane)
     print(f"\n{'PASS' if ok else 'FAIL'}  (xattn t=0.90 {'FREE' if free else 'NOT free'}; A-shape + "
-          f"vertical-slash + per-head kind + per-head params integrated — keep-all anchored, "
-          f"gather==mask, cost recorded)")
+          f"vertical-slash + per-head kind + per-head params (incl. vslash) integrated — keep-all "
+          f"anchored, gather==mask, cost recorded)")
     if not ok:
         raise SystemExit(1)
 

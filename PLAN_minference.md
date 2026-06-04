@@ -280,16 +280,63 @@ realized. M1/M2/M3/M4 reproduced bit-identically in the same run (xattn t=0.9 +0
 ashape L=4 +0.58% / twin 2.16e-3; vslash v3s3 +3.01% / twin 2.76e-2; M4 perhead +0.40% / anchor 0.00 /
 twin 8.88e-3 / mix 86/14/0), confirming the `head_specs` field + `_attn_qkv` extraction regressed nothing.
 
-### M6+ — long-context probe + wall-clock bench (remaining)
-- **Long-context vertical-slash probe**: key-chunk the probe (currently one `max_alloc_gb`-guarded
-  matmul) so it scales past the gate's short doc to 100K+ where vslash earns assignments (at 7 blocks it
-  takes ~0–1%). Thread a param-INDEPENDENT probe (per-key-block + per-offset masses) so per-head vslash
-  *params* (vert/slash) can also vary (the M5 deferral) while gather still == mask. Its own milestone +
-  ppl gate.
-- **Gather-path prefill bench**: a real wall-clock measurement of the `gather=True` speed path — the
-  actual FLOP/memory win (the mask path measures quality only; with fast SDPA + an additive block mask
-  MLX still computes the full QKᵀ). Pair it with the long-context probe so vslash's long-range payoff is
-  measured where it lands.
+### M6 ✅ — per-head *vslash params* (param-independent probe) — DONE
+Removed M5's vslash-pin: each head can now carry its OWN vertical-slash ``vert``/``slash`` (not just its
+own ashape/xattn params), so the per-head search reaches a strictly larger menu. The lever is making the
+online probe **param-independent**: :func:`vertical_slash_index` now returns the raw masses
+``(key_mass [B,H,Tk], slash_mass [B,H,Tq])`` instead of a baked top-``vert``/``slash`` keep, and the top-k
+cut moves into :func:`select_keep` (read from ``cfg.vert``/``cfg.slash``). Two heads read the ONE global
+probe (threaded once over the whole sequence — that is what keeps gather == mask) yet cut **different**
+vert/slash from the shared masses. Pure routing, exactly like M4/M5: head ``h``'s keep is byte-identical to
+the uniform vslash keep for its own vert/slash. Smallest-diff design:
+- ``vertical_slash_index`` → ``(key_mass, slash_mass)`` (param-independent; the mass computation is
+  byte-for-byte the M3 path — only the in-probe top-k is removed). ``select_keep``'s ``"vslash"`` branch now
+  does the top-``cfg.vert``/``cfg.slash`` cut from the threaded masses (so each per-head spec applies its
+  own params); ``_select_keep_per_head_specs`` already passes ``sp.vert``/``sp.slash`` per spec ⇒ per-head
+  vslash params fall out. The ``XAttnConfig.__post_init__`` vslash-pin is **removed** (a vslash ``HeadSpec``
+  no longer has to match the config's vert/slash). xattn/ashape paths byte-for-byte unchanged; the
+  uniform/M3/M4/M5 vslash *selections* are byte-identical (same masses + same top-k, just relocated).
+- `parity/internlm2_vslash_perhead_test.py` (NEW, model-free, fp32, T=500, real `InternLM2Attention`):
+  routing exactness with **two vslash heads at DIFFERENT vert/slash** (each == its uniform spec; the two
+  keep different blocks ⇒ the params bite) + config-vert/slash-irrelevance (masses param-independent) +
+  uniform-vslash-as-per-head == uniform + MIXED keep-all (2 vslash params + ashape + xattn) == dense (mask
+  & gather) + gather==mask + sparsity-active + min_seq-gated + causal-safe.
+  Run: `uv run python -m parity.internlm2_vslash_perhead_test`.
+- `parity/internlm2_vslash_test.py` (UPDATED): `_check_index` now asserts the masses are
+  **param-independent** (identical across cfg.vert/slash). `parity/internlm2_perhead_params_test.py`
+  (UPDATED): the M5 vslash-pin rejection becomes "per-head vslash params now allowed".
+- `parity/internlm2_ppl_sparse.py` (EXTENDED): the M5 per-head-params search grid gains a 2nd vslash
+  param-point (v2s2 **and** v3s3); the derived ``head_specs`` drops its config vert/slash (param-
+  independent); the realized mix readout records per-head vslash params.
+- Gates: M0 xattn + M2 ashape + M3 vslash + M4 perhead + M5 perhead-params + `xattention_parity` still
+  green (all prior selections byte-identical); `internlm2_vslash_perhead_test` green; pytest/ruff/
+  compileall/`uv lock --check`/`git diff --check` clean.
+
+**RESULTS (32 layers, 823 tok / 7 blocks; same bake & doc as M1–M5):** dense ppl **12.3379** (top-1
+44.2%). **perhd-p mixed keep-all == dense EXACTLY (Δppl 0.00)** — the per-head-vslash-params parity anchor.
+**perhd-p gather==mask: Δ=7.45e-4 (<1%)** — the M6 twin. Measured: **perhd-p Δppl +0.04%** — **better than
+M5's +0.15%** (which itself beat the best uniform xattn t=0.9 +0.31%) — because the now-reachable 2nd vslash
+param lets the FLOP-budgeted search (budget=4 blocks) assign (Σ 32×32 = 1024) **ashape:L4 747 (73%),
+xattn:t0.9 230 (22%), vslash:v3s3 39 (4%), xattn:t0.95 8 (1%)**: 4% of heads now run the WIDER vslash:v3s3
+(vs M5's 1% at v2s2), and routing those heads to their better-fitting vslash pattern buys the aggregate
+down further. Per-head vslash *params* pay off even at this short 7-block doc — the long-context payoff
+(where vertical-slash is designed to shine) awaits M7's chunked probe + wall-clock bench. M1–M5's other
+streams reproduced bit-identically in the same run (xattn t=0.9 +0.31% / twin 5.94e-3; ashape L=4 +0.58% /
+twin 2.16e-3; vslash v3s3 +3.01% / v2s2 +7.29% / keep-all 0.00 / twin 2.76e-2; M4 perhead +0.40% / anchor
+0.00 / twin 8.88e-3 / mix 86/14/0), confirming the param-independent-masses refactor regressed nothing.
+
+### M7 — key-chunk the long-context probe + gather-path wall-clock bench (remaining)
+- **Long-context vertical-slash probe**: key-chunk the probe (currently one ``max_alloc_gb``-guarded
+  ``[B,H,lp,S]`` matmul + an ``[B,H,lp,t]`` slash gather) so it scales past the gate's short doc to 100K+
+  where vertical-slash earns real assignments (at 7 blocks it already earns 4% via M6's per-head params,
+  but its design payoff is long-range). Build on M6's param-independent masses: accumulate ``key_mass`` /
+  ``slash_mass`` over key chunks (online softmax; keep the single-shot ``mx.softmax`` path as the default so
+  the short-doc gate stays byte-identical, chunk only when the probe would exceed ``max_alloc_gb``) and
+  model-free-gate chunked masses ≈ single-shot + chunked keep-all == dense + chunked gather == mask.
+- **Gather-path prefill bench**: a real wall-clock measurement of the ``gather=True`` speed path — the
+  actual FLOP/memory win (the mask path measures quality only; with fast SDPA + an additive block mask MLX
+  still computes the full QKᵀ). Pair it with the long-context probe so vertical-slash's long-range payoff
+  is measured where it lands. Its own milestone + ppl gate vs M6.
 
 ---
 

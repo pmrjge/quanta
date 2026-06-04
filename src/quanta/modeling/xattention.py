@@ -41,12 +41,12 @@ class HeadSpec:
     bounded per-spec loop in :func:`_select_keep_per_head_specs` (rule 3 — the loop is over DISTINCT
     specs, never heads).
 
-    ``vslash`` params are **shared, not per-head**: the global probe index is computed once over the
-    whole sequence and threaded into every gather chunk (that is what keeps gather == mask), so a
-    ``vslash`` spec's ``vert``/``slash`` must equal the enclosing config's (validated in
-    :meth:`XAttnConfig.__post_init__`, fail-loud). Per-head ``vslash`` param variation awaits the
-    long-context probe-chunking milestone, which reworks the probe to thread param-independent masses.
-    ``ashape``/``xattn`` select locally per spec, so their params are freely per-head here.
+    All three kinds carry **freely per-head** params. ``vslash`` shares the one global probe (computed
+    once over the whole sequence and threaded into every gather chunk — that is what keeps gather ==
+    mask), but the probe now returns param-INDEPENDENT masses (:func:`vertical_slash_index`) and the
+    top-``vert`` / top-``slash`` cut is applied per spec in :func:`select_keep`, so two heads can read
+    the same probe yet keep different ``vert``/``slash``. ``ashape``/``xattn`` select locally per spec.
+    (Earlier the probe baked the top-k in, forcing one vslash vert/slash per config; that pin is gone.)
     """
 
     kind: str = "xattn"
@@ -113,9 +113,10 @@ class XAttnConfig:
     # a length-``num_query_heads`` tuple of :class:`HeadSpec` (kind + that kind's params), taking
     # precedence over ``head_selectors`` (setting both is rejected). ``select_keep`` dispatches per head
     # via :func:`_select_keep_per_head_specs` — each head's keep is byte-identical to the uniform keep for
-    # its spec (pure routing). vslash specs must share this config's ``vert``/``slash`` (the global probe
-    # index is threaded once — see :class:`HeadSpec`); ashape/xattn params are freely per-head. Built
-    # offline by :func:`assign_head_specs` (kernel-aware FLOP-budgeted search).
+    # its spec (pure routing). All kinds' params are freely per-head: the vslash probe returns
+    # param-independent masses and the per-head top-``vert``/``slash`` cut is applied in
+    # :func:`select_keep`, so heads sharing the one global probe can still keep different vert/slash.
+    # Built offline by :func:`assign_head_specs` (kernel-aware FLOP-budgeted search).
     head_specs: tuple[HeadSpec, ...] | None = None
 
     def __post_init__(self) -> None:
@@ -145,13 +146,10 @@ class XAttnConfig:
             for sp in self.head_specs:
                 if not isinstance(sp, HeadSpec):
                     raise ValueError(f"head_specs entries must be HeadSpec, got {type(sp).__name__}")
-                # vslash's global probe index is shared/threaded ⇒ per-head vslash params are not
-                # supported yet; a vslash spec must match this config's vert/slash (fail loud, rule 6).
-                if sp.kind == "vslash" and (sp.vert != self.vert or sp.slash != self.slash):
-                    raise ValueError(
-                        f"vslash HeadSpec vert/slash ({sp.vert}/{sp.slash}) must match the config's "
-                        f"({self.vert}/{self.slash}) — the global probe index is shared. Per-head vslash "
-                        "param variation awaits the long-context probe-chunking milestone.")
+                # NOTE: vslash specs may now carry per-head vert/slash. The global probe returns
+                # param-INDEPENDENT masses (:func:`vertical_slash_index`) and the top-vert/slash cut is
+                # applied per spec in :func:`select_keep`, so two heads share one probe yet keep
+                # different vert/slash — the config's vert/slash no longer constrain a vslash spec.
 
 
 # Runtime default sparse config: bounded block-gather XAttention prefill (gather=True,
@@ -238,26 +236,31 @@ def ashape_keep(tq: int, tk: int, q_offset: int, local: int) -> mx.array:
 
 def vertical_slash_index(
     q: mx.array, k: mx.array, scale: float, cfg: XAttnConfig
-) -> tuple[mx.array, mx.array, mx.array]:
-    """MInference vertical-slash index from an online probe of the LAST query block (MInference §3).
+) -> tuple[mx.array, mx.array]:
+    """MInference vertical-slash **probe masses** from the LAST query block (MInference §3).
 
-    Runs the *last* (real) query block's attention over all keys, then decomposes that probe two
-    ways to pick a single GLOBAL block pattern that is then applied to every query block:
+    Runs the *last* (real) query block's attention over all keys, then decomposes that probe into two
+    **param-independent** masses — the raw per-key-block and per-block-offset attention mass — from
+    which the vertical-slash keep is selected. The top-``vert`` / top-``slash`` cut does NOT live here;
+    it is applied in :func:`select_keep` from these masses, so a head can apply its OWN ``vert``/``slash``
+    to the one shared probe (that is what lets per-head vslash *params* vary while every head still reads
+    a single global probe — gather == mask):
 
-    * **vertical** — per-key-*column* mass summed over the probe queries, pooled to key blocks; the
-      top-``cfg.vert`` key blocks are kept as vertical stripes (columns everyone attends). Sink block
-      0 is excluded from the top-k (it is force-kept anyway), so the budget is spent on real columns.
-    * **slash** — per-token-*offset* mass (query-pos − key-pos) summed over the probe, pooled to
-      block-offsets; the top-``cfg.slash`` block-offsets are kept as diagonal bands. Offset 0 (the
-      diagonal) is excluded (force-kept). A token-offset δ is binned to block-offset ``δ // block``.
+    * **vertical** — ``key_mass[b,h,kb]`` = per-key-*column* attention mass summed over the probe
+      queries, pooled to key blocks. :func:`select_keep` keeps the top-``vert`` of these (vertical
+      stripes — columns everyone attends); sink block 0 is force-kept separately.
+    * **slash** — ``slash_mass[b,h,o]`` = per-token-*offset* mass (query-pos − key-pos) summed over the
+      probe, pooled to block-offsets ``o = δ // block``. :func:`select_keep` keeps the top-``slash`` of
+      these (diagonal bands); offset 0 (the diagonal) is force-kept separately.
 
-    Returns ``(vert_keep [B,H,Tk] bool, slash_keep [B,H,Tq] bool, key_mass [B,H,Tk] float)`` — the two
-    boolean selections plus the per-key-block probe mass, reused as the gather-budget priority. The
-    probe is one ``[B,H,lp,S]`` attention matrix (``lp`` = last-block size ≤ ``block``); a plain
-    ``q@kᵀ`` matmul (not ``mx.fast.sdpa``) because the *attention weights* are needed, not the output.
-    Guarded by ``max_alloc_gb`` (fail loud, never OOM). Data-dependent but built ONCE from the last
-    block — a prefill-only pattern (decode stays dense); the per-(query,key) execution mask the
-    selection feeds is still strictly causal, so no future *content* leaks into earlier positions.
+    Returns ``(key_mass [B,H,Tk] float, slash_mass [B,H,Tq] float)`` — the two raw masses, no
+    thresholding (``key_mass`` doubles as the gather-budget priority). The probe is one ``[B,H,lp,S]``
+    attention matrix (``lp`` = last-block size ≤ ``block``); a plain ``q@kᵀ`` matmul (not
+    ``mx.fast.sdpa``) because the *attention weights* are needed, not the output. Guarded by
+    ``max_alloc_gb`` (fail loud, never OOM — the key-chunked long-context probe is a later milestone).
+    Data-dependent but built ONCE from the last block (a prefill-only pattern; decode stays dense); the
+    per-(query,key) execution mask the selection feeds is still strictly causal, so no future *content*
+    leaks into earlier positions.
     """
     bsz, h, t, _ = q.shape
     s = k.shape[2]
@@ -281,17 +284,13 @@ def vertical_slash_index(
     sc = mx.where(kpos <= qpos, sc, NEG_INF)                  # causal
     a = mx.softmax(sc.astype(mx.float32), axis=-1)           # [B,H,lp,S] probe attention
 
-    # vertical: column mass over probe queries → per-key-block; sink (block 0) out of the top-k.
+    # vertical: per-key-block column mass over the probe queries (param-independent — no top-k here).
     col = _pad_to(a.sum(axis=2), blk, axis=2)                # [B,H,tk*blk]
     key_mass = col.reshape(bsz, h, tk, blk).sum(axis=3)      # [B,H,tk]
-    kk = mx.arange(tk)[None, None, :]
-    vscore = mx.where(kk == 0, NEG_INF, key_mass)
-    vrank = mx.argsort(mx.argsort(-vscore, axis=-1), axis=-1)  # rank of each block (0 = largest)
-    vert_keep = vrank < min(cfg.vert, tk)                    # [B,H,tk] bool
 
-    # slash: token-offset mass (qpos − kpos) → per block-offset; diagonal (offset 0) out of the top-k.
-    # gather a[r, p0+r-δ] for each probe row r and offset δ — the offset-δ key of that row — then
-    # sum over r. One gather + one sum (no per-token loop); invalid (non-causal) entries zeroed.
+    # slash: per-block-offset mass (qpos − kpos), param-independent (no top-k here). gather a[r, p0+r-δ]
+    # for each probe row r and offset δ — the offset-δ key of that row — then sum over r. One gather +
+    # one sum (no per-token loop); invalid (non-causal) entries zeroed; pooled to block-offsets δ//block.
     n_off = t
     r = mx.arange(lp)[:, None]
     dl = mx.arange(n_off)[None, :]
@@ -300,12 +299,8 @@ def vertical_slash_index(
     gi = mx.broadcast_to(mx.clip(c_idx, 0, s - 1)[None, None], (bsz, h, lp, n_off))
     g = mx.where(valid[None, None], mx.take_along_axis(a, gi, axis=-1), 0.0)  # [B,H,lp,n_off]
     slash_tok = _pad_to(g.sum(axis=2), blk, axis=2)          # [B,H,tq*blk]
-    slash_off = slash_tok.reshape(bsz, h, tq, blk).sum(axis=3)   # [B,H,tq] per block-offset
-    oo = mx.arange(tq)[None, None, :]
-    sscore = mx.where(oo == 0, NEG_INF, slash_off)
-    srank = mx.argsort(mx.argsort(-sscore, axis=-1), axis=-1)
-    slash_keep = srank < min(cfg.slash, tq)                  # [B,H,tq] bool
-    return vert_keep, slash_keep, key_mass
+    slash_mass = slash_tok.reshape(bsz, h, tq, blk).sum(axis=3)   # [B,H,tq] per block-offset
+    return key_mass, slash_mass
 
 
 def _uses_vslash(cfg: XAttnConfig) -> bool:
@@ -321,7 +316,7 @@ def _uses_vslash(cfg: XAttnConfig) -> bool:
 
 def _select_keep_per_head(
     q: mx.array, k: mx.array, scale: float, cfg: XAttnConfig, q_offset: int,
-    index: tuple[mx.array, mx.array, mx.array] | None,
+    index: tuple[mx.array, mx.array] | None,
 ) -> tuple[mx.array, mx.array]:
     """Per-head selector dispatch → ``(keep, rank)`` ``[B,H,Tq,Tk]`` routing each head to its kind.
 
@@ -357,7 +352,7 @@ def _select_keep_per_head(
 
 def _select_keep_per_head_specs(
     q: mx.array, k: mx.array, scale: float, cfg: XAttnConfig, q_offset: int,
-    index: tuple[mx.array, mx.array, mx.array] | None,
+    index: tuple[mx.array, mx.array] | None,
 ) -> tuple[mx.array, mx.array]:
     """Per-head **param** dispatch → ``(keep, rank)`` ``[B,H,Tq,Tk]`` routing each head to its spec.
 
@@ -367,9 +362,9 @@ def _select_keep_per_head_specs(
     size, never a per-head/per-token hot loop, rule 3), stacks them ``[n_spec,B,H,Tq,Tk]``, and selects
     per head the slice from that head's spec with one ``take_along_axis``. So head ``h``'s keep is
     byte-identical to the uniform keep for ``head_specs[h]``'s (kind, params) — pure routing, no new
-    selection math. The vslash global ``index`` (threaded by the caller; all vslash specs share this
-    config's vert/slash, enforced at config build) is forwarded to vslash sub-selections so per-head
-    gather == mask.
+    selection math. The vslash global ``index`` (param-independent masses, threaded by the caller) is
+    forwarded to vslash sub-selections; each vslash spec cuts its OWN top-``vert``/``slash`` from the
+    shared masses (so two heads can keep different vert/slash) while per-head gather == mask.
     """
     h = q.shape[1]
     specs = cfg.head_specs
@@ -398,7 +393,7 @@ def _select_keep_per_head_specs(
 
 def select_keep(
     q: mx.array, k: mx.array, scale: float, cfg: XAttnConfig, q_offset: int = 0,
-    index: tuple[mx.array, mx.array, mx.array] | None = None,
+    index: tuple[mx.array, mx.array] | None = None,
 ) -> tuple[mx.array, mx.array]:
     """Selector dispatch → ``(keep, rank)`` block masks ``[B, H, Tq, Tk]`` for ``cfg.selector``.
 
@@ -411,11 +406,13 @@ def select_keep(
       pre-selector path** (``select_blocks(block_scores(…))``), so XAttention quality is unchanged.
     * ``"ashape"`` — positional sink + ``local``-block window; ``rank`` is block recency (key-block
       index ``j``), so a binding budget keeps the nearest-to-diagonal local blocks.
-    * ``"vslash"`` — global vertical key-blocks ∪ slash block-offset bands from a last-block probe
-      (:func:`vertical_slash_index`). The pattern is GLOBAL, so the caller computes it once over the
-      whole sequence and threads it in via ``index`` (the chunked gather path reuses the same global
-      index for every chunk — that is what keeps gather == mask). ``rank`` is the per-key-block probe
-      mass. When ``index`` is None it is computed here from ``(q, k)`` (the whole-sequence case).
+    * ``"vslash"`` — global vertical key-blocks ∪ slash block-offset bands from a last-block probe.
+      The probe (:func:`vertical_slash_index`) returns param-independent ``(key_mass, slash_mass)``; the
+      top-``cfg.vert`` / top-``cfg.slash`` cut is applied HERE, so a per-head vslash spec can read the one
+      shared probe yet keep its OWN vert/slash. The masses are GLOBAL, so the caller computes them once
+      over the whole sequence and threads them in via ``index`` (every chunked gather call re-cuts the
+      same masses — that is what keeps gather == mask). ``rank`` is the per-key-block mass. When ``index``
+      is None the masses are computed here from ``(q, k)`` (the whole-sequence case).
 
     ``q_offset`` is the global block index of the first query row (the chunked gather path passes its
     chunk origin so causality/window use global positions); ``q_offset=0`` is the whole-sequence case.
@@ -444,11 +441,25 @@ def select_keep(
         tk = (k.shape[2] + blk - 1) // blk
         if index is None:
             index = vertical_slash_index(q, k, scale, cfg)
-        vert_keep, slash_keep, key_mass = index
+        key_mass, slash_mass = index
+        # Cut the top-``cfg.vert`` vertical key-blocks (sink block 0 excluded — force-kept) and the
+        # top-``cfg.slash`` block-offset bands (offset 0, the diagonal, excluded — force-kept) HERE from
+        # the shared, param-independent masses — so a per-head vslash spec applies its OWN vert/slash to
+        # the one global probe (the masses are byte-identical across heads; only the cut differs).
+        nkb = key_mass.shape[-1]                                # global # key blocks
+        kk = mx.arange(nkb)[None, None, :]
+        vscore = mx.where(kk == 0, NEG_INF, key_mass)
+        vrank = mx.argsort(mx.argsort(-vscore, axis=-1), axis=-1)   # rank of each block (0 = largest)
+        vert_keep = vrank < min(cfg.vert, nkb)                  # [B,H,nkb] bool
+        noff = slash_mass.shape[-1]                             # global # block-offsets
+        oo = mx.arange(noff)[None, None, :]
+        sscore = mx.where(oo == 0, NEG_INF, slash_mass)
+        srank = mx.argsort(mx.argsort(-sscore, axis=-1), axis=-1)
+        slash_keep = srank < min(cfg.slash, noff)              # [B,H,noff] bool
         i = mx.arange(q_offset, q_offset + tq)[:, None]
         j = mx.arange(tk)[None, :]
         causal = j <= i
-        off = mx.clip((i - j).astype(mx.int32), 0, slash_keep.shape[-1] - 1)   # [tq,tk] block-offset
+        off = mx.clip((i - j).astype(mx.int32), 0, noff - 1)    # [tq,tk] block-offset
         slsh = mx.take(slash_keep, off, axis=-1)                # [B,H,tq,tk] slash band membership
         vert = vert_keep[:, :, None, :tk]                       # [B,H,1,tk] broadcast over query rows
         forced = (j == i) | (j == 0)                            # diagonal (local) + sink (block 0)
