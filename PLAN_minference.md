@@ -95,17 +95,45 @@ measures), pushing every variant's hidden state through each layer; original pro
 sparsity on, `budget=64` default never binds < 8192 tok. Run:
 `uv run --with sentencepiece python -m parity.internlm2_ppl_sparse`.
 
-### M2+ — MInference selectors (the genuine new work)
-Add MInference's **vertical-slash / A-shape** per-head selection as an *alternative selector* feeding
-the SAME `gather_sparse_attention` execution, ppl-gated against dense + XAttn (M1 baseline):
-- A-shape = attention sink (block 0) + local window — already partially expressible via the forced
-  `(j==0)|(j==i)` blocks in `select_blocks`; a dedicated A-shape selector is a thin config.
-- Vertical-slash = specific key *columns* (vertical lines) attended by all queries + diagonal/slash
-  bands. This is token-column-level, not pure block — needs its own index construction (online
-  estimation from the last query block's attention, MInference §3). Block-sparse pattern maps directly
-  onto `select_blocks`-style block selection.
-- Per-head offline pattern assignment (kernel-aware search) is the MInference setup step; can start
-  with a fixed per-head pattern and refine. Each selector lands as its own milestone + ppl gate.
+### M2 ✅ — A-shape selector (MInference) — DONE
+Added MInference's **A-shape** selection (attention sink block 0 + a `local`-block causal window — the
+StreamingLLM pattern) as an *alternative selector* feeding the SAME validated block-gather /
+additive-mask execution. Smallest-diff design: a `selector` discriminant on `XAttnConfig` (`"xattn"`
+default ⇒ **byte-for-byte the pre-selector path**; `"ashape"` new) + a `local` window field,
+dispatched by a new `select_keep(q,k,scale,cfg,q_offset) -> (keep, rank)` that **both**
+`sparse_prefill_mask` and `gather_sparse_attention` now call. A-shape selects positionally (no
+scoring): `ashape_keep` = `{0} ∪ {i-local+1..i}`; `rank` = block recency so a binding budget keeps
+the nearest-to-diagonal local blocks. The MLA keepers' hook (`quanta.modeling.attention`) and the
+InternLM2 hook get the selector for free — unchanged signatures, default selector preserves behavior.
+- `src/quanta/modeling/xattention.py`: `XAttnConfig.{selector,local}` (+ validation), `ashape_keep`,
+  `select_keep`; rerouted both execution paths. `xattn` path verified byte-for-byte unchanged.
+- `parity/internlm2_ashape_test.py` (NEW, model-free, fp32, T=500, real `InternLM2Attention`):
+  `ashape_keep` closed-form (sink+window, q_offset-shifted) exact; keep-all (local≥n_blocks) mask
+  **== dense EXACTLY (0.00)** + gather 5e-8; A-shape **gather==mask** at L=1 (4e-8); tight window
+  drops blocks (8e-2); budget cap engages; `min_seq>T` gates off (0.00); perturb-last-token leaves
+  block 0 unchanged (0.00 — no future leak). Run: `uv run python -m parity.internlm2_ashape_test`.
+- `parity/internlm2_ppl_sparse.py` (EXTENDED): A-shape variants (keep-all anchor, L=4, L=2, L=4
+  gather twin) + gates alongside the M1 xattn gates (re-validated unchanged in the same solo run).
+- Gates: M0 `internlm2_xattn_test` + `xattention_parity` still green (xattn unchanged);
+  `internlm2_ashape_test` green; pytest/ruff/compileall/`uv lock --check`/`git diff --check` clean.
+
+**RESULTS (32 layers, 823 tok / 7 blocks; same bake & doc as M1):** dense ppl **12.3379** (top-1
+44.2%). **A-shape keep-all == dense EXACTLY (Δppl 0.00)** — real-model parity anchor. **A-shape
+gather==mask @ L=4: Δppl 2.2e-3 (<1%)** — M2 invariant. Measured static-window cost: **L=4 (512-tok
+window) +0.58%**, **L=2 (256-tok window) +3.76%** — A-shape is cheaper-but-lossier than XAttention
+(t=0.9 +0.31%), exactly as MInference characterizes it (assigned per-head, not used at every head).
+M1 xattn reproduced bit-identically in the same run (t=0.90 +0.31%, gather==mask 5.9e-3), confirming
+the `select_keep` refactor did not regress the validated path.
+
+### M3+ — vertical-slash selector + per-head pattern assignment (remaining)
+- **Vertical-slash** = specific key *columns* (vertical lines) attended by all queries + diagonal/slash
+  bands. Token-column-level, not pure block — needs its own index construction (online estimation
+  from the last query block's attention, MInference §3); the block-sparse pattern maps onto
+  `select_keep`-style selection. Lands as its own milestone + ppl gate (vs the M1/M2 baselines).
+- **Per-head offline pattern assignment** (kernel-aware search) is the MInference setup step: give
+  each head the cheapest pattern (A-shape / vertical-slash / block-sparse) that holds its quality.
+  Can start fixed-per-head and refine. The selectors are now plug-compatible (`XAttnConfig.selector`),
+  so per-head assignment is a routing layer over them. Each selector/assignment = its own milestone.
 
 ---
 

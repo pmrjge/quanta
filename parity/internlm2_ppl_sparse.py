@@ -1,8 +1,14 @@
-"""InternLM2.5 long-doc sparse-prefill ppl gate — M1 of the MInference sparse-prefill track.
+"""InternLM2.5 long-doc sparse-prefill ppl gate — M1 (XAttention) + M2 (A-shape) selectors.
 
-Measures the **quality cost** of XAttention block-sparse prefill on the real int8-g64
-InternLM2.5-7B bake across a threshold sweep: dense vs XAttention (the additive-mask path for
-the quality number, plus the block-gather speed-path twin), reporting ppl / top-1 / Δppl%.
+Measures the **quality cost** of block-sparse prefill on the real int8-g64 InternLM2.5-7B bake,
+per selector, against the dense teacher (ppl / top-1 / Δppl%):
+
+* **M1 — XAttention** (antidiagonal nucleus): a ``threshold`` sweep; the additive-mask path is the
+  quality number, the block-gather path its speed-path twin.
+* **M2 — A-shape** (MInference: attention sink block 0 + a ``local``-block window, static/positional):
+  the keep-all variant (``local = n_blocks``) is the parity anchor (== dense), L=4/L=2 the tightening
+  windows whose cost is measured, plus an L=4 gather twin. A-shape feeds the **same** execution as
+  XAttention — only the block-*selection* differs (``XAttnConfig.selector``).
 
 Sparse attention is **lossy ⇒ ppl-gated, never numeric-parity-gated** (CLAUDE.md rule 4). This is
 the quality baseline every later MInference selector (M2+) is judged against. Two things it proves
@@ -129,6 +135,20 @@ def run(n_layers: int | None = None, max_tokens: int = 1024) -> None:
     variants.append(("xattn t=0.90 gat", XAttnConfig(block=128, stride=16, threshold=0.9,
                                                      min_seq=0, gather=True)))
 
+    # M2: A-shape selector (MInference) — sink (block 0) + a ``local``-block causal window, fed
+    # through the SAME execution (only XAttnConfig.selector differs). keep-all (local = n_blocks)
+    # keeps every causal block ⇒ == dense (the real-model parity anchor); L=4 (512 tok) / L=2 (256
+    # tok) are tightening static windows whose ppl cost is measured; the L=4 gather twin checks the
+    # gather speed-path == the mask quality-path on the bake (the M2 invariant).
+    nblk = (len(ids) + 127) // 128
+    variants.append(("ashape keepall", XAttnConfig(block=128, stride=16, selector="ashape",
+                                                   local=nblk, min_seq=0, gather=False)))
+    for lw in (4, 2):
+        variants.append((f"ashape L={lw}", XAttnConfig(block=128, stride=16, selector="ashape",
+                                                       local=lw, min_seq=0, gather=False)))
+    variants.append(("ashape L=4 gat", XAttnConfig(block=128, stride=16, selector="ashape",
+                                                   local=4, min_seq=0, gather=True)))
+
     emb = art.embed()
     h0 = emb[arr][None]                                   # [1, T, H] bf16
     del emb
@@ -180,12 +200,29 @@ def run(n_layers: int | None = None, max_tokens: int = 1024) -> None:
     free = d90 <= 2.0                              # "free" bar: ≤2% Δppl at threshold 0.9
     sane = d90 <= 8.0                              # ceiling: a blown-up selection on real weights fails
 
+    # M2 A-shape gates: keep-all == dense (the real-model parity anchor) and gather==mask (the M2
+    # invariant) are hard correctness checks; the tight-window Δppl is the *measured* cost (recorded,
+    # not pass/fail). A-shape is a STATIC selector — meant to be cheaper-but-lossier and assigned
+    # per-head in MInference, NOT applied at every head — so a "free" bar would be the wrong test;
+    # a_sane only catches a blown-up integration (tightest window must not double ppl).
+    a_keepall = ppls["ashape keepall"]
+    a4_mask, a4_gat, a2_mask = ppls["ashape L=4"], ppls["ashape L=4 gat"], ppls["ashape L=2"]
+    a_anchor = abs(a_keepall - dense) / dense < 0.01     # keep-all (local=n_blocks) == dense
+    a_twin = abs(a4_gat - a4_mask) / a4_mask < 0.01      # A-shape gather speed-path == mask path
+    a_sane = a2_mask < 2.0 * dense                       # tightest window not blown up (bug catch)
+    d_a4 = 100 * (a4_mask - dense) / dense
+    d_a2 = 100 * (a2_mask - dense) / dense
+
     print(f"\n  dense ppl<20: {healthy} ({dense:.3f})   "
           f"gather==mask @0.9 (<1%): {twin} (Δ={abs(gat90 - mask90):.2e})")
-    print(f"  t=0.90 Δppl = {d90:+.2f}%   free(≤2%): {free}   sane(≤8%): {sane}")
-    ok = healthy and twin and sane
-    print(f"\n{'PASS' if ok else 'FAIL'}  "
-          f"(quality baseline recorded; t=0.90 is {'FREE' if free else 'NOT free'})")
+    print(f"  xattn  t=0.90 Δppl = {d90:+.2f}%   free(≤2%): {free}   sane(≤8%): {sane}")
+    print(f"  ashape keep-all==dense (<1%): {a_anchor} (Δ={abs(a_keepall - dense):.2e})   "
+          f"gather==mask @L=4 (<1%): {a_twin} (Δ={abs(a4_gat - a4_mask):.2e})")
+    print(f"  ashape L=4 Δppl = {d_a4:+.2f}%   L=2 Δppl = {d_a2:+.2f}%   "
+          f"(static selector — cost recorded; cf. xattn t=0.9 {d90:+.2f}%)")
+    ok = healthy and twin and sane and a_anchor and a_twin and a_sane
+    print(f"\n{'PASS' if ok else 'FAIL'}  (xattn t=0.90 {'FREE' if free else 'NOT free'}; "
+          f"A-shape integrated — keep-all anchored, gather==mask, cost recorded)")
     if not ok:
         raise SystemExit(1)
 

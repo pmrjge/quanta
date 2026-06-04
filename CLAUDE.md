@@ -17,15 +17,19 @@ That is the mistake this project exists to not repeat.
 
 ## Active task (transient — full handover in PLAN_minference.md)
 
-**In flight: InternLM2.5 sparse-prefill (MInference family) — M1 ✅, M2 next.** Handover
+**In flight: InternLM2.5 sparse-prefill (MInference family) — M2 ✅, M3 next.** Handover
 **`PLAN_minference.md`**. Reuse the validated block-sparse substrate (`quanta.modeling.xattention`,
 `gather_sparse_attention`/`sparse_prefill_mask`, `threshold=1.0`==dense); M0 wired a `self.sparse`
-hook into `InternLM2Attention` (default None = dense byte-unchanged) + model-free gate
-`parity/internlm2_xattn_test.py`. M1 measured the lossy lever's quality cost on the int8-g64 bake
-(`parity/internlm2_ppl_sparse.py`, solo GPU): XAttention prefill @ threshold 0.9 costs **+0.31% ppl**
-(t=0.95 +0.24%, knee at t=0.80 +2.39%) — "free"; gather speed-path == mask quality-path (Δppl<0.01).
-M2 next = layer MInference's vertical-slash / A-shape selectors onto the SAME gather execution,
-ppl-gated against this M1 baseline.
+hook into `InternLM2Attention` (default None = dense byte-unchanged). M1 measured XAttention's lossy
+lever on the int8-g64 bake (`parity/internlm2_ppl_sparse.py`, solo GPU): prefill @ threshold 0.9 costs
+**+0.31% ppl** (knee t=0.80 +2.39%) — "free"; gather speed-path == mask quality-path. **M2 added
+MInference's A-shape selector** (sink block 0 + `local`-block window) onto the SAME execution via a
+`selector` discriminant on `XAttnConfig` (`"xattn"` default byte-unchanged; `"ashape"` new) +
+`select_keep` dispatch (`xattn` path byte-for-byte preserved) + model-free gate
+`parity/internlm2_ashape_test.py`: A-shape keep-all **== dense EXACTLY**, gather==mask, measured cost
+**L=4 (512-tok) +0.58% / L=2 (256-tok) +3.76%** (cheaper-but-lossier than XAttention, per MInference).
+M3 next = the **vertical-slash** selector (key-column index construction, MInference §3) + per-head
+pattern assignment, ppl-gated against the M1/M2 baselines.
 
 Prior InternLM2.5 **EAGLE spec-decode** track is **COMPLETE** (M0–M3, `ec0f6f3`; **1.42× lossless @
 k=2** via drafter quantization — memory `project_internlm2_eagle.md`). The earlier batched-decode /

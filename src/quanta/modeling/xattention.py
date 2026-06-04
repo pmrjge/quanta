@@ -52,12 +52,22 @@ class XAttnConfig:
     # moderate-context quality results). 64 → ≤8192 keys/query. None = uncapped nucleus.
     budget: int | None = 64
     max_alloc_gb: float = 8.0  # chunks sized to fit this; gather fails loud rather than exceed it
+    # --- selector: which block-importance pattern picks the kept set (execution is shared) -------
+    # "xattn"  — antidiagonal block scoring + nucleus selection (the validated default).
+    # "ashape" — MInference A-shape: attention sink (block 0) + a ``local``-block causal window,
+    #            purely positional (no scoring). Static/lossier; MInference assigns it per-head.
+    selector: str = "xattn"
+    local: int = 8  # A-shape local window width in blocks (incl. the diagonal); selector="ashape" only
 
     def __post_init__(self) -> None:
         if self.block % self.stride != 0:
             raise ValueError(f"block {self.block} must be divisible by stride {self.stride}")
         if self.budget is not None and self.budget < 1:
             raise ValueError(f"budget must be >= 1, got {self.budget}")
+        if self.selector not in ("xattn", "ashape"):
+            raise ValueError(f"selector must be 'xattn' or 'ashape', got {self.selector!r}")
+        if self.local < 1:
+            raise ValueError(f"local must be >= 1, got {self.local}")
 
 
 # Runtime default sparse config: bounded block-gather XAttention prefill (gather=True,
@@ -126,6 +136,51 @@ def select_blocks(scores: mx.array, threshold: float, q_offset: int = 0) -> mx.a
     return (keep | forced) & causal
 
 
+def ashape_keep(tq: int, tk: int, q_offset: int, local: int) -> mx.array:
+    """A-shape (StreamingLLM / MInference) block keep-mask ``[Tq, Tk]`` bool — purely positional.
+
+    Query block ``i`` (global index ``q_offset + row``) keeps the **sink** (block 0) and a causal
+    **local window** of the last ``local`` key blocks ending at its own diagonal block — i.e. the
+    blocks ``{0} ∪ {i-local+1, …, i}``. No scores: A-shape is a fixed sink+window pattern (the
+    static MInference selector), not data-dependent nucleus selection. ``local=1`` ⇒ just the
+    diagonal + sink (the tightest A-shape — XAttention's force-kept set with no nucleus blocks).
+    """
+    i = mx.arange(q_offset, q_offset + tq)[:, None]   # [Tq,1] global query-block index
+    j = mx.arange(tk)[None, :]                         # [1,Tk] key-block index
+    causal = j <= i
+    window = (j > i - local) & causal                  # last ``local`` blocks incl. the diagonal
+    return (window | (j == 0)) & causal                # ∪ sink (block 0), re-clamped causal
+
+
+def select_keep(
+    q: mx.array, k: mx.array, scale: float, cfg: XAttnConfig, q_offset: int = 0
+) -> tuple[mx.array, mx.array]:
+    """Selector dispatch → ``(keep, rank)`` block masks ``[B, H, Tq, Tk]`` for ``cfg.selector``.
+
+    ``keep`` is the bool block keep-mask; ``rank`` is the per-block priority used to order the kept
+    blocks when the gather budget cap binds (higher = gathered first). The two selectors share the
+    downstream execution (additive mask / block gather) verbatim — they differ ONLY here:
+
+    * ``"xattn"`` — antidiagonal block scores → nucleus selection; ``rank`` is the score itself, so
+      a binding budget keeps the highest-scoring blocks. This branch is **byte-for-byte the
+      pre-selector path** (``select_blocks(block_scores(…))``), so XAttention quality is unchanged.
+    * ``"ashape"`` — positional sink + ``local``-block window; ``rank`` is block recency (key-block
+      index ``j``), so a binding budget keeps the nearest-to-diagonal local blocks.
+
+    ``q_offset`` is the global block index of the first query row (the chunked gather path passes its
+    chunk origin so causality/window use global positions); ``q_offset=0`` is the whole-sequence case.
+    """
+    if cfg.selector == "ashape":
+        bsz, h = q.shape[0], q.shape[1]
+        tq = (q.shape[2] + cfg.block - 1) // cfg.block
+        tk = (k.shape[2] + cfg.block - 1) // cfg.block
+        keep = mx.broadcast_to(ashape_keep(tq, tk, q_offset, cfg.local)[None, None], (bsz, h, tq, tk))
+        rank = mx.broadcast_to(mx.arange(tk, dtype=mx.float32)[None, None, None, :], (bsz, h, tq, tk))
+        return keep, rank
+    scores = block_scores(q, k, scale, cfg.block, cfg.stride)
+    return select_blocks(scores, cfg.threshold, q_offset), scores
+
+
 def additive_mask(
     keep: mx.array, q_len: int, kv_len: int, block: int, dtype: mx.Dtype
 ) -> mx.array:
@@ -157,8 +212,7 @@ def sparse_prefill_mask(
             f"sparse_prefill_mask [B,H,T,S] ~= {gb:.1f} GB (T={t}, heads={h}) exceeds "
             f"max_alloc_gb={cfg.max_alloc_gb}; enable XAttnConfig.gather=True for long context."
         )
-    scores = block_scores(q, k, scale, cfg.block, cfg.stride)
-    keep = select_blocks(scores, cfg.threshold)
+    keep, _ = select_keep(q, k, scale, cfg, 0)
     return additive_mask(keep, t, s, cfg.block, q.dtype)
 
 
@@ -209,8 +263,7 @@ def gather_sparse_attention(
         m = c1 - c0
         q_chunk = qp[:, :, c0 * blk : c1 * blk, :]  # [B,H,m*blk,d]
 
-        scores = block_scores(q_chunk, kp[:, :, : c1 * blk, :], scale, blk, cfg.stride)  # [B,H,m,c1]
-        keep = select_blocks(scores, cfg.threshold, q_offset=c0)  # [B,H,m,c1]
+        keep, rank = select_keep(q_chunk, kp[:, :, : c1 * blk, :], scale, cfg, c0)  # [B,H,m,c1]
         counts = mx.sum(keep.astype(mx.int32), axis=-1)  # [B,H,m]
         max_k = min(int(mx.max(counts).item()), cap)
         capped = mx.minimum(counts, max_k)  # [B,H,m]
@@ -218,7 +271,7 @@ def gather_sparse_attention(
         ig = mx.arange(c0, c1)[:, None]
         jg = mx.arange(c1)[None, :]
         forced = (jg == ig) | (jg == 0)  # [m,c1] diagonal (global) + sink
-        ord_score = mx.where(forced, inf, mx.where(keep, scores, -inf))
+        ord_score = mx.where(forced, inf, mx.where(keep, rank, -inf))
         idx = mx.argsort(-ord_score, axis=-1)[..., :max_k].astype(mx.int32)  # [B,H,m,max_k]
         valid = mx.arange(max_k)[None, None, None, :] < capped[..., None]  # [B,H,m,max_k]
 
