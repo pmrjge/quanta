@@ -15,9 +15,22 @@ That is the mistake this project exists to not repeat.
 
 ---
 
-## Active task (transient — full handover in PLAN_minference.md)
+## Active task (transient — full handover in PLAN_nemotron_ultra.md)
 
-**In flight: InternLM2.5 sparse-prefill (MInference family) — M6 ✅, M7 next.** Handover
+**In flight (PIVOT, this session): Nemotron-3-Ultra-550B (main agent) + Mellum2-12B (orchestrator)
+agentic stack.** Handover **`PLAN_nemotron_ultra.md`**. Quantize Nemotron-Ultra (hybrid
+Mamba2+attn+MoE, `nemotron_h` — already supported; the 120B-Super sibling is already baked int4) as
+**int4-GPTQ experts + int8 dense + bf16 core** (keep the proven `nemotron/quant_policy.py`, NOT AWQ —
+GPTQ is the stronger lever on a bf16 source), then Mellum2 (`mellum`, a new port) as **int8**; **one
+model resident at a time**; drive Ultra first. **U0 ✅** — config adapter (`_hybrid_pattern`
+normalises the newer explicit-`layers_block_type` schema, which omits `num_hidden_layers`) +
+fit-check: Ultra parses, the derived split reproduces the explicit list bit-for-bit, the quant policy
+covers all 51,023 tensors (rule #6), and the mix is resident at **289.7 GiB ≤ 490.4** (200.7 GiB
+headroom) — `parity/nemotron_ultra_fit_test.py`. **U1 next** = 2–3 layer numeric parity vs a
+transformers `NemotronHForCausalLM` reference at Ultra scale (one mamba / one attention / one moe).
+The InternLM2.5 MInference track below is **paused at M6 ✅ (M7 deferred)**, not abandoned.
+
+**Paused: InternLM2.5 sparse-prefill (MInference family) — M6 ✅, M7 next.** Handover
 **`PLAN_minference.md`**. Reuse the validated block-sparse substrate (`quanta.modeling.xattention`,
 `gather_sparse_attention`/`sparse_prefill_mask`, `threshold=1.0`==dense); M0 wired a `self.sparse`
 hook into `InternLM2Attention` (default None = dense byte-unchanged). M1 measured XAttention's lossy

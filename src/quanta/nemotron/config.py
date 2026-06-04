@@ -1,9 +1,11 @@
-"""Nemotron-H text-model hyperparameters (NVIDIA-Nemotron-3-Super-120B-A12B).
+"""Nemotron-H text-model hyperparameters (NVIDIA-Nemotron-3 family: Super-120B, Ultra-550B).
 
 Parsed from the source ``config.json`` into a frozen dataclass. Pure Python + ``json`` — no
-``torch``/``transformers``/``mlx`` import. Nemotron-H is a hybrid: each of the 88 layers is
-one of ``{mamba, moe, attention}`` selected by ``hybrid_override_pattern`` (letters
-``M``/``E``/``*``). See :mod:`quanta.nemotron.quant_policy` for the per-tensor quant mix and
+``torch``/``transformers``/``mlx`` import. Nemotron-H is a hybrid: each layer is one of
+``{mamba, moe, attention}``. Two checkpoint schemas encode the per-layer split — an older compact
+``hybrid_override_pattern`` letter string (``M``/``E``/``*``) and a newer explicit
+``layers_block_type`` list (which omits ``num_hidden_layers``); :func:`_hybrid_pattern` normalises
+both. See :mod:`quanta.nemotron.quant_policy` for the per-tensor quant mix and
 :mod:`quanta.nemotron.tokenizer` for encode/chat.
 """
 
@@ -15,6 +17,30 @@ from pathlib import Path
 
 # hybrid_override_pattern letters -> layer kind (verified empirically against the weight map)
 _LETTER_TO_KIND = {"M": "mamba", "E": "moe", "*": "attention", "-": "mlp"}
+_KIND_TO_LETTER = {v: k for k, v in _LETTER_TO_KIND.items()}
+
+
+def _hybrid_pattern(cfg: dict, model_dir: str | Path) -> tuple[str, int]:
+    """Normalise the two Nemotron-H checkpoint schemas to ``(hybrid_override_pattern, n_layers)``.
+
+    Older exports (120B-Super) ship a compact ``hybrid_override_pattern`` letter string plus
+    ``num_hidden_layers``; newer exports (550B-Ultra) ship an explicit ``layers_block_type`` list
+    and omit both. Downstream only reads the ``layers_block_type`` property / ``num_hidden_layers``
+    field, so both schemas converge here. Fails loud (rule #6) on an unknown kind or neither schema.
+    """
+    if "hybrid_override_pattern" in cfg:
+        pattern = str(cfg["hybrid_override_pattern"])
+        return pattern, int(cfg.get("num_hidden_layers", len(pattern)))
+    if "layers_block_type" in cfg:
+        kinds = list(cfg["layers_block_type"])
+        try:
+            pattern = "".join(_KIND_TO_LETTER[k] for k in kinds)
+        except KeyError as exc:
+            raise ValueError(f"{model_dir}: unknown layer kind {exc.args[0]!r} in "
+                             f"layers_block_type") from exc
+        return pattern, int(cfg.get("num_hidden_layers", len(kinds)))
+    raise ValueError(f"{model_dir}: config.json has neither 'hybrid_override_pattern' nor "
+                     f"'layers_block_type'")
 
 
 @dataclass(frozen=True)
@@ -107,11 +133,12 @@ class NemotronHConfig:
     def from_pretrained(cls, model_dir: str | Path) -> NemotronHConfig:
         cfg = json.loads((Path(model_dir) / "config.json").read_text())
         eos = cfg["eos_token_id"]
+        pattern, n_layers = _hybrid_pattern(cfg, model_dir)
         return cls(
             vocab_size=int(cfg["vocab_size"]),
             hidden_size=int(cfg["hidden_size"]),
-            num_hidden_layers=int(cfg["num_hidden_layers"]),
-            hybrid_override_pattern=str(cfg["hybrid_override_pattern"]),
+            num_hidden_layers=n_layers,
+            hybrid_override_pattern=pattern,
             num_attention_heads=int(cfg["num_attention_heads"]),
             num_key_value_heads=int(cfg["num_key_value_heads"]),
             head_dim=int(cfg["head_dim"]),
