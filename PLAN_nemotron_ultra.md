@@ -216,6 +216,23 @@ port; closest template `src/quanta/qwen35/`.
       compiled T>1 verify graph; serving throughput needs the already-built batched (B>1) tree-verify**
       (`spec_generate_tree` / `batch_verify` / `NemotronBatchedResidentModel`) — the MTP-M3-perf
       follow-ups.
+    - **MTP-M3-perf (B) ✅ — bf16-drafter quality-ceiling counterfactual.**
+      `parity/nemotron_mtp_bf16_drafter_bench.py` (solo, ~330 GiB: the int4-RTN backbone **unchanged** +
+      the **un-quantized bf16 source `mtp.*` head**, built via M0's `_mtp_tensors`/`_fill_module` into a
+      default bf16 `NemotronMTP` — *not* a dequantized int4 head; dequantizing the sidecar would only
+      return the lossy int4 values, so we load the real bf16 source weights). Re-runs the IDENTICAL M3
+      economics + `draft_topk × k` sweep with the int4 numbers printed side-by-side (Δaccept). **Result:**
+      the perfect-quality drafter tops out at **0.79× greedy** (8.8 tok/s, `draft_topk=8 k=1`) — *tied*
+      with the int4 head's 0.79× and **below** the predicted 0.88–1.26× band. Δaccept(bf16−int4) ≈ **0**:
+      +0.00 at `draft_topk ≥ 4` (bit-identical accept 1.50 / 1.60 / 1.81), only +0.10 at the degenerate
+      `draft_topk=2`. So the int4 quantization tax on accept-rate is **negligible** — the int4-RTN drafter
+      already drafts as well as the bf16 ceiling for this workload (M1's 12.5% top-1 logit disagreement
+      lands on low-confidence positions that don't dominate accepted-token mass; `t_draft(bf16)`
+      5.5–6.6 ms is even slightly *higher* than int4's ~5 ms, still « `t_main` 88.8 ms). Together with M3's
+      *lighter*-drafter direction (worse via accept), this **brackets the drafter as near-inert at B=1**
+      from both sides and confirms the **compiled T>1 verify graph (part A)** as the sole B=1 lever.
+      Losslessness unaffected (M2 — the int4-RTN main model verifies every draft; `match`/divergence
+      reported as INFO, never asserted).
   - **U4 remaining streams** (each behind a flag, ppl-equivalent, not started): paged-KV on the 12 attn
     layers, batched decode + Mamba-state batching.
 

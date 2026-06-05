@@ -137,7 +137,17 @@ amortization (a closed-form `(t_verify+t_draft+reject·t_main)/mean_accept` pred
 ~1%). Reproduces M2 exactly (full-topk k=1 first-diverges at 24/48, the bf16 ULP near-tie; the bench
 reports `match` as INFO, never asserts — M2 owns the losslessness proof). **>1× at B=1 needs a compiled
 T>1 verify graph; serving throughput needs the already-built batched (B>1) tree-verify** — the
-MTP-M3-perf follow-ups. Other U4 streams (not started): paged-KV on the 12 attn layers, batched decode + Mamba-state
+MTP-M3-perf follow-ups. **MTP-M3-perf (B) ✅** — bf16-drafter quality-ceiling counterfactual
+(`parity/nemotron_mtp_bf16_drafter_bench.py`, solo ~330 GiB: int4 backbone **unchanged** + the
+**un-quantized bf16 source `mtp.*` head** via M0's loader — *not* a dequantized int4 head; identical M3
+economics+sweep): the perfect-quality drafter lands at **0.79× greedy** (8.8 tok/s) — *tied* with int4,
+**below** the 0.88–1.26× prediction band — with Δaccept(bf16−int4) ≈ **0** (+0.00 at draft_topk≥4,
+bit-identical accept 1.50/1.60/1.81; only +0.10 at the degenerate topk=2). The int4 quant tax on
+accept-rate is **negligible** (the int4-RTN head already drafts as well as bf16 here — M1's 12.5% top-1
+logit disagreement sits on low-confidence positions that don't dominate accepted-token mass; t_draft(bf16)
+5.5–6.6 ms is even *higher* than int4's ~5, still « t_main). With M3's *lighter*-drafter direction (worse
+via accept) this **brackets the drafter as near-inert at B=1** — the compiled T>1 verify graph (part A) is
+the sole B=1 lever. Other U4 streams (not started): paged-KV on the 12 attn layers, batched decode + Mamba-state
 batching. The InternLM2.5 MInference track below is **paused at M6 ✅ (M7 deferred)**, not abandoned.
 
 **Paused: InternLM2.5 sparse-prefill (MInference family) — M6 ✅, M7 next.** Handover
