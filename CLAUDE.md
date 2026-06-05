@@ -147,8 +147,23 @@ accept-rate is **negligible** (the int4-RTN head already drafts as well as bf16 
 logit disagreement sits on low-confidence positions that don't dominate accepted-token mass; t_draft(bf16)
 5.5–6.6 ms is even *higher* than int4's ~5, still « t_main). With M3's *lighter*-drafter direction (worse
 via accept) this **brackets the drafter as near-inert at B=1** — the compiled T>1 verify graph (part A) is
-the sole B=1 lever. Other U4 streams (not started): paged-KV on the 12 attn layers, batched decode + Mamba-state
-batching. The InternLM2.5 MInference track below is **paused at M6 ✅ (M7 deferred)**, not abandoned.
+the sole B=1 lever left to test. **MTP-M3-perf (A) ✅** — compiled the T>1 spec-VERIFY graph (new
+`NemotronResidentModel.compile_verify`, default off → eager/byte-unchanged, rule 4; the guard fires only on a
+Mamba *continuation* — some `conv` populated — never on fresh/chunked-suffix prefill, so prefill is
+byte-identical), gated **output-equivalent** (`parity/nemotron_ultra_compiled_verify_parity.py`, solo:
+compiled T>1 verify == eager on {logits, hidden, ssm, conv, follow-on T=1} for k∈{1,2,3}, **worst Δ 0.00e+00
+— bit-identical**; `mx.compile` is pure fuse on the branch-3 per-token-step graph). Bench
+(`parity/nemotron_mtp_compiled_verify_bench.py`, solo ~313 GiB, eager-then-compiled in ONE process): the
+compiled verify is only **1.08–1.10× faster than eager** (T=2/3/4 134→124 / 169→156 / 203→184 ms; still
+1.42–2.11× t_main=87.4 vs eager's 1.54–2.32×) — the eager T>1 verify was already a single, mostly
+launch-amortized forward (NOT the per-token T==1 decode loop greedy runs), so `mx.compile` kernel-fusion has
+little to remove. Best B=1 spec **0.79× → 0.84× greedy** (9.0→9.6 tok/s, `draft_topk=8 k=1`, accept 1.60) — a
+real lift, **still <1×**. Reproduces M2 exactly (`acc==` every config; full-topk k=1 first-diverges 24/48 =
+the bf16 ULP near-tie, else 48/48; `match` INFO, M2 owns losslessness). **So plain `mx.compile` is NOT the
+>1× B=1 lever** — crossing 1× needs a **fused multi-token verify kernel** (one kernel for the whole T-step
+mamba+moe, deeper than auto-fusion) or the already-built **batched (B>1) tree-verify** (throughput, not
+single-stream latency). Other U4 streams (not started): paged-KV on the 12 attn layers, batched decode +
+Mamba-state batching. The InternLM2.5 MInference track below is **paused at M6 ✅ (M7 deferred)**, not abandoned.
 
 **Paused: InternLM2.5 sparse-prefill (MInference family) — M6 ✅, M7 next.** Handover
 **`PLAN_minference.md`**. Reuse the validated block-sparse substrate (`quanta.modeling.xattention`,

@@ -162,6 +162,12 @@ class NemotronResidentModel:
         mx.eval(self.embed_w, self.norm_f, self.lm_head_w)
         self.art.release()
         self._cmix: dict[int, object] | None = None  # lazy per-block compiled decode mixers
+        # Opt-in (default off → eager verify, rule 4): also route the T>1 spec-VERIFY continuation
+        # through the compiled fused mamba/moe mixers (not just the T==1 decode). The eager T>1 verify
+        # is the single-stream B=1 spec-decode bottleneck (1.5–2.3× t_main — the compiled fused graph
+        # was T==1-only); compiling it is the MTP-M3 (A) speed lever. Output-equivalent (mx.compile
+        # only fuses) — gated in parity/nemotron_ultra_compiled_verify_parity.py.
+        self.compile_verify = False
 
     @property
     def num_layers(self) -> int:
@@ -239,11 +245,20 @@ class NemotronResidentModel:
         caches = caches if caches is not None else [None] * n
         ssm = ssm if ssm is not None else [None] * n
         conv = conv if conv is not None else [None] * n
-        cmix = self._decode_mixers() if (compiled and h.shape[1] == 1) else None
+        # Compiled fused mixers run the proven T==1 decode path, plus (opt-in via ``compile_verify``,
+        # default off) the T>1 spec-VERIFY continuation — both run the SAME branch-3 per-token-step
+        # mamba + T-agnostic moe the eager path runs, so mx.compile (fuse-only) keeps them output-
+        # equivalent. ``verify`` fires only on a continuation (some Mamba ``conv`` populated; a fresh
+        # prefill — all-None conv — always stays eager) and never on the chunked-suffix prefill
+        # (branch 2), so prefill is byte-unchanged; mx.compile auto-keys a fused trace per T (=k+1).
+        decode = compiled and h.shape[1] == 1
+        verify = (compiled and self.compile_verify and h.shape[1] > 1
+                  and not mamba_chunked_cont and any(c is not None for c in conv))
+        cmix = self._decode_mixers() if (decode or verify) else None
         capture_set = set(int(i) for i in capture_layers) if capture_layers else None
         caps: dict[int, mx.array] = {} if capture_set is not None else None  # type: ignore[assignment]
         for i, blk in enumerate(self.layers):
-            if cmix is not None and blk.kind == "mamba":
+            if cmix is not None and blk.kind == "mamba" and (decode or conv[i] is not None):
                 y, ssm[i], conv[i] = cmix[i](blk.norm(h), ssm[i], conv[i])
                 h = h + y
             elif cmix is not None and blk.kind == "moe":

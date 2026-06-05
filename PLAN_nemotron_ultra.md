@@ -230,9 +230,29 @@ port; closest template `src/quanta/qwen35/`.
       lands on low-confidence positions that don't dominate accepted-token mass; `t_draft(bf16)`
       5.5–6.6 ms is even slightly *higher* than int4's ~5 ms, still « `t_main` 88.8 ms). Together with M3's
       *lighter*-drafter direction (worse via accept), this **brackets the drafter as near-inert at B=1**
-      from both sides and confirms the **compiled T>1 verify graph (part A)** as the sole B=1 lever.
-      Losslessness unaffected (M2 — the int4-RTN main model verifies every draft; `match`/divergence
+      from both sides and confirms the **compiled T>1 verify graph (part A)** as the sole B=1 lever left to
+      test. Losslessness unaffected (M2 — the int4-RTN main model verifies every draft; `match`/divergence
       reported as INFO, never asserted).
+    - **MTP-M3-perf (A) ✅ — compiled the T>1 spec-VERIFY graph.** New
+      `NemotronResidentModel.compile_verify` (default off → eager, byte-unchanged, rule 4) routes the T>1
+      verify *continuation* through the SAME compiled fused mamba/moe mixers as the T==1 decode; the guard
+      fires only when a Mamba `conv` is populated (a continuation) and never on fresh or chunked-suffix
+      prefill, so prefill stays eager/byte-identical and `mx.compile` auto-keys a fused trace per T (=k+1).
+      Gated **output-equivalent** (`parity/nemotron_ultra_compiled_verify_parity.py`, solo ~306 GiB:
+      compiled T>1 verify == eager on {logits, last-hidden, ssm, conv, follow-on T==1 token} for k∈{1,2,3},
+      **worst Δ 0.00e+00 — bit-identical**; `mx.compile` is pure fuse on the branch-3 per-token-step graph,
+      the only numeric risk). Bench (`parity/nemotron_mtp_compiled_verify_bench.py`, solo ~313 GiB,
+      eager-then-compiled in ONE process so the comparison isn't cross-run): the compiled verify is only
+      **1.08–1.10× faster than eager** — t_verify T=2/3/4 134→124 / 169→156 / 203→184 ms, still 1.42–2.11×
+      `t_main`=87.4 (vs eager's 1.54–2.32×). The eager T>1 verify was already a single, mostly
+      launch-amortized forward (NOT the per-token T==1 decode loop greedy runs), so kernel-launch fusion has
+      little to remove. **Result: best B=1 spec 0.79× → 0.84× greedy** (9.0 → 9.6 tok/s, `draft_topk=8 k=1`,
+      accept 1.60) — a real lift but **still <1×**. Reproduces M2 exactly (`acc==` every config; full-topk
+      k=1 first-diverges at 24/48 = the bf16 ULP near-tie, else 48/48; `match` is INFO, M2 owns the
+      losslessness proof). **So plain `mx.compile` is NOT the >1× B=1 lever** — crossing 1× at B=1 needs a
+      **fused multi-token verify kernel** (one kernel for the whole T-step mamba+moe, deeper than
+      `mx.compile` auto-fusion); serving throughput goes to the already-built **batched (B>1) tree-verify**
+      (`spec_generate_tree` / `batch_verify` / `NemotronBatchedResidentModel`).
   - **U4 remaining streams** (each behind a flag, ppl-equivalent, not started): paged-KV on the 12 attn
     layers, batched decode + Mamba-state batching.
 
