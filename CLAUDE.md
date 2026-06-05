@@ -162,8 +162,26 @@ real lift, **still <1×**. Reproduces M2 exactly (`acc==` every config; full-top
 the bf16 ULP near-tie, else 48/48; `match` INFO, M2 owns losslessness). **So plain `mx.compile` is NOT the
 >1× B=1 lever** — crossing 1× needs a **fused multi-token verify kernel** (one kernel for the whole T-step
 mamba+moe, deeper than auto-fusion) or the already-built **batched (B>1) tree-verify** (throughput, not
-single-stream latency). Other U4 streams (not started): paged-KV on the 12 attn layers, batched decode +
-Mamba-state batching. The InternLM2.5 MInference track below is **paused at M6 ✅ (M7 deferred)**, not abandoned.
+single-stream latency). **MTP-M4 ✅** — first batched **tree-verify** with the *real* baked MTP head (the
+prior Super gate used a random-init head → every `W^D` path sat at the ~1/W accept floor, no fan-out to
+amortize): `parity/nemotron_ultra_tree_spec.py` (solo ~313 GiB), `spec_generate_tree(batched=True)` over the
+int4-RTN backbone + int4 sidecar, no runtime change (`batched=True` already existed, model-free-gated).
+**PARITY (rule 4) PASS** — batched==sequential **BIT-IDENTICAL** (W=2 D=2, 32 tok; the bf16 batched-moe-reorder
+≥0.99 tolerance wasn't even needed), so the `B=W^D` one-`gather_qmm`-over-all-paths verify is output-equivalent
+to the naive per-path verify; losslessness reproduces M2 exactly (both tree paths 30/32 vs greedy, first-div
+pos 24 = the same bf16 ULP near-tie). **The trained head fans out as designed** — tree accept **1.96/3 (W2D2)
+→ 2.35/3 (W4D2)** vs the k-chain's 1.81 (the random head could never show this). **BUT the `W^D`
+weight-amortization thesis FAILS at B=1**: `bat/seq` **0.89–0.99×** (batched is *not* faster than sequential —
+marginally slower) and the whole tree is **0.07–0.19× greedy** — the *worst* B=1 path measured, far below the
+M3 k-chain (0.79×) and (A) compiled-verify (0.84×). Why: `batch_step` amortizes only the MoE (one `gather_qmm`
+over `[B,1,hidden]`) but **48/108 layers are MoE — the other 60 (Mamba-2 + attn) run per-stream in a bounded
+B-loop**, so B paths cost ~B× the *dominant* SSM/attn work and cancel the MoE win (the same M3 lesson: on this
+hybrid the experts are NOT the single dominator). **So tree-verify is a serving-throughput (multi-stream B>1)
+lever, not a single-stream B=1 latency lever** — and even for throughput the per-stream Mamba loop caps the
+amortization on a hybrid. The decisive B=1 latency lever stays a **fused multi-token verify kernel**; the B>1
+win wants genuine **multi-stream decode** (independent requests, not path-replication) + Mamba-state batching.
+Other U4 streams (not started): paged-KV on the 12 attn layers, batched decode + Mamba-state batching. The
+InternLM2.5 MInference track below is **paused at M6 ✅ (M7 deferred)**, not abandoned.
 
 **Paused: InternLM2.5 sparse-prefill (MInference family) — M6 ✅, M7 next.** Handover
 **`PLAN_minference.md`**. Reuse the validated block-sparse substrate (`quanta.modeling.xattention`,

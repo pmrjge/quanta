@@ -253,6 +253,32 @@ port; closest template `src/quanta/qwen35/`.
       **fused multi-token verify kernel** (one kernel for the whole T-step mamba+moe, deeper than
       `mx.compile` auto-fusion); serving throughput goes to the already-built **batched (B>1) tree-verify**
       (`spec_generate_tree` / `batch_verify` / `NemotronBatchedResidentModel`).
+    - **MTP-M4 ✅ — batched tree-verify on the REAL baked MTP head (first trained-head measurement).** The
+      prior tree-verify real gate (`parity/nemotron_batched_tree_verify_real.py`) ran on Super-120B with a
+      RANDOM-init MTP (0 `mtp.*` keys), so every `W^D` draft path sat at the ~1/W accept floor — no fan-out
+      to amortize. MTP-M1 baked the real Ultra sidecar (1040 `mtp.*`), so `parity/nemotron_ultra_tree_spec.py`
+      (solo ~313 GiB) is the FIRST tree-verify with a trained head: `spec_generate_tree(batched=True)` over
+      the int4-RTN backbone + int4 sidecar, no runtime change (`batched=True` already exists, model-free-
+      gated). **PARITY (rule 4) PASS** — `batched=True == batched=False` **BIT-IDENTICAL** (W=2 D=2, 32 tok;
+      the bf16 batched-moe-reorder ≥0.99 tolerance wasn't even needed), so the `B=W^D`
+      one-`gather_qmm`-over-all-paths verify is output-equivalent to the naive per-path verify (rule 4/6).
+      Losslessness reproduces M2 exactly (both tree paths 30/32 vs greedy, first-div pos 24 = the same bf16
+      ULP near-tie M2 owns). **The trained head fans out as designed** — tree mean_accept **1.96/3 (W2D2) →
+      2.35/3 (W4D2)** vs the k-chain's 1.81 (the random-head gate could never show fan-out). **BUT the `W^D`
+      weight-amortization thesis FAILS at B=1:** `bat/seq` **0.89–0.99×** (batched is NOT faster than
+      sequential — marginally slower) and the whole tree is **0.07–0.19× greedy** (W2D2 0.19× / W2D3 0.08× /
+      W4D2 0.07×) — the WORST B=1 path measured, far below the M3 k-chain (0.79×) and the (A) compiled-verify
+      (0.84×). Root cause: `batch_step` amortizes only the MoE (one `gather_qmm` over `[B,1,hidden]`) but
+      **48/108 layers are MoE — the other 60 (Mamba-2 + attn) run per-stream in a bounded B-loop**, so B paths
+      cost ~B× the *dominant* SSM/attn work and cancel the MoE win (the settled M3 finding: on this hybrid the
+      experts are NOT the single dominator). **So tree-verify is a serving-throughput (multi-stream B>1)
+      lever, not a single-stream B=1 latency lever** — and even for throughput the per-stream Mamba loop caps
+      amortization on a hybrid. The B=1 latency lever stays a **fused multi-token verify kernel**; the B>1 win
+      wants genuine **multi-stream decode** (independent requests, not path-replication) + Mamba-state
+      batching. Logic was already model-free-gated (`nemotron_batched_tree_verify_test.py`: batched==
+      sequential incl. replica fidelity/divergence; `nemotron_tree_spec_test.py`: tree==greedy for any MTP
+      quality) — MTP-M4 adds the WEIGHT-level parity + the real-head economics the headless artifact made
+      impossible.
   - **U4 remaining streams** (each behind a flag, ppl-equivalent, not started): paged-KV on the 12 attn
     layers, batched decode + Mamba-state batching.
 
