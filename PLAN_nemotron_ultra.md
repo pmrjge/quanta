@@ -196,10 +196,26 @@ port; closest template `src/quanta/qwen35/`.
       criterion** (a single near-tie flip cascades chaotically) — the gate verifies the logic is bit-exact
       (gate 7) + the **first** divergence (the only valid-prefix position) is a near-tie; a
       large-margin/low-rank first divergence FAILS as a logic bug.
-    - **MTP-M3 next (perf, not started)** — single-stream eager spec is ~0.5–0.8× greedy (the 512-expert
-      MTP draft cost dominates at B=1). Speed levers: `draft_topk` (lighter drafter), compiled decode, the
-      already-built batched/tree verify; re-point `nemotron_mtp_k_bench` to `build_resident_mtp` + Ultra
-      and measure wall-clock speedup.
+    - **MTP-M3 ✅ — perf: wall-clock spec-vs-greedy on the real head.** Re-pointed
+      `parity/nemotron_mtp_k_bench.py` to `build_resident_mtp` + the Ultra backbone (solo, ~313 GiB
+      wired); loads the model + baked sidecar once and sweeps both runtime speed levers —
+      `draft_topk ∈ {2,4,8,full(22)}` × `k ∈ {1,2,3}` — against the production **compiled** greedy
+      baseline, with economics probes (`t_main` / `t_verify` / `t_draft`) printed so a sub-1× result is
+      actionable. **Result:** single-stream B=1 lossless spec tops out at **0.79× greedy**
+      (`draft_topk=8 k=1`, 8.9 vs 11.2 tok/s, mean_accept 1.60/2); full sweep **0.44–0.79×**, k=1 best at
+      every topk. Lands in the pre-stated 0.5–0.8× band — but the probes **refute the assumed cause**: the
+      512-expert draft is *not* the dominator (`t_draft ≈ 5 ms` flat across draft_topk « `t_main` 88.9 ms
+      ⇒ `draft_topk` is near-inert as a *speed* lever; it only moves accept quality 1.45→1.60 at k=1). The
+      tax is the **compiled-decode asymmetry** — greedy runs the compiled T=1 fused mamba/moe graph
+      (88.9 ms/tok) but spec's T=k+1 verify falls to **eager** (`t_verify` 1.54/1.94/2.33× t_main at
+      T=2/3/4) — plus the hybrid partial-reject 2nd main forward (the un-sliceable Mamba `(ssm,conv)`
+      re-run, ≈0.4×t_main/round); together they outweigh the 1.60-tok/round amortization (a closed-form
+      `(t_verify + t_draft + reject·t_main)/mean_accept` predicts the measured sweep to ~1%). Reproduces
+      M2 exactly (full-topk k=1 first-diverges at 24/48 — the bf16 ULP near-tie — else 48/48; the bench
+      reports `match` as INFO, never asserts: M2 owns the losslessness proof). **>1× at B=1 needs a
+      compiled T>1 verify graph; serving throughput needs the already-built batched (B>1) tree-verify**
+      (`spec_generate_tree` / `batch_verify` / `NemotronBatchedResidentModel`) — the MTP-M3-perf
+      follow-ups.
   - **U4 remaining streams** (each behind a flag, ppl-equivalent, not started): paged-KV on the 12 attn
     layers, batched decode + Mamba-state batching.
 

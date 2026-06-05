@@ -123,10 +123,21 @@ real-weight criterion** (CLAUDE.md: *test behavior with parity, not greedy gener
 near-tie flip cascades chaotically). The honest gate: **logic is bit-exact (gate 7); on real weights spec
 is bit-identical up to the first divergence, and that first divergence (the only valid-prefix position)
 must be a verified near-tie** — a large-margin/low-rank first divergence would FAIL as a logic bug.
-Caveat: **single-stream eager spec is ~0.5–0.8× greedy** (the 512-expert MTP draft cost dominates at
-B=1); the speed levers — `draft_topk` (lighter drafter), compiled decode, the already-built batched/tree
-verify — are the **MTP-M3 perf** follow-up (`nemotron_mtp_k_bench` needs re-pointing to `build_resident_mtp`
-+ Ultra). Other U4 streams (not started): paged-KV on the 12 attn layers, batched decode + Mamba-state
+**MTP-M3 ✅** (perf — `parity/nemotron_mtp_k_bench.py` re-pointed to `build_resident_mtp` + the Ultra
+backbone, wall-clock spec-vs-**compiled**-greedy, solo ~313 GiB): single-stream B=1 lossless spec tops
+out at **0.79× greedy** (`draft_topk=8 k=1`, 8.9 vs 11.2 tok/s, mean_accept 1.60/2; full sweep
+`draft_topk∈{2,4,8,22}×k∈{1,2,3}` = **0.44–0.79×**, k=1 best at every topk) — in CLAUDE.md's pre-stated
+0.5–0.8× band but **the assumed cause is wrong**: the economics probes show the 512-expert draft is *not*
+the dominator (`t_draft ≈ 5 ms` flat across draft_topk « `t_main` 88.9 ms ⇒ `draft_topk` is near-inert as
+a *speed* lever, it only moves accept quality). The tax is the **compiled-decode asymmetry** — greedy
+runs the compiled T=1 fused mamba/moe graph (88.9 ms/tok) but spec's T=k+1 verify falls to **eager**
+(`t_verify` 1.54/1.94/2.33× t_main at T=2/3/4) — plus the hybrid partial-reject 2nd main forward
+(un-sliceable Mamba `(ssm,conv)` re-run, ≈0.4×t_main/round); together they outweigh the 1.60-tok/round
+amortization (a closed-form `(t_verify+t_draft+reject·t_main)/mean_accept` predicts the measured sweep to
+~1%). Reproduces M2 exactly (full-topk k=1 first-diverges at 24/48, the bf16 ULP near-tie; the bench
+reports `match` as INFO, never asserts — M2 owns the losslessness proof). **>1× at B=1 needs a compiled
+T>1 verify graph; serving throughput needs the already-built batched (B>1) tree-verify** — the
+MTP-M3-perf follow-ups. Other U4 streams (not started): paged-KV on the 12 attn layers, batched decode + Mamba-state
 batching. The InternLM2.5 MInference track below is **paused at M6 ✅ (M7 deferred)**, not abandoned.
 
 **Paused: InternLM2.5 sparse-prefill (MInference family) — M6 ✅, M7 next.** Handover
