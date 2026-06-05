@@ -4,7 +4,7 @@ A two-model agentic stack on one M3 Ultra (≤ 490.4 GiB), quantized through `qu
 parity-first pipeline.
 
 - **Main agent:** `NVIDIA-Nemotron-3-Ultra-550B-A55B` — hybrid Mamba2 + attention + MoE
-  (`model_type: nemotron_h`) → **int4-AWQ g64 experts + int8 dense + bf16 core** (U2 ✅ baked).
+  (`model_type: nemotron_h`) → **int4-RTN g64 experts + int8 dense + bf16 core** (U3 ✅ — RTN beat AWQ e2e).
 - **Orchestrator:** `JetBrains/Mellum2-12B-A2.5B-Thinking` — sliding-window + full-attn MoE
   (`model_type: mellum`) → **int8 (AWQ)**.
 
@@ -15,8 +15,10 @@ parity-first pipeline.
    wired into the Nemotron bake), and Super actually shipped plain int4 **RTN** (manifest: `awq_packed`,
    s=1). Finding #38 had flagged AWQ as +75% e2e on the relu² down-proj, but the U2 slice de-risk
    (`parity/nemotron_ultra_awq_slice_test.py`) shows that collapse does **not** reproduce at Ultra scale
-   (AWQ helps up-proj 0.806 / ties down-proj 0.984; the α-grid rejects the degenerate scales). RTN stays
-   the known-good fallback; U3 teacher-forced ppl is the e2e arbiter.
+   (AWQ helps up-proj 0.806 / ties down-proj 0.984; the α-grid rejects the degenerate scales). **U3
+   RESOLVED → int4-RTN ships:** at the 1024-token teacher-forced arbiter AWQ regressed **+24.3%** (recon
+   mispredicted — recon ≠ e2e) while RTN held **+0.3%**, so finding #38 reproduced e2e and the RTN
+   fallback is the shipped expert method (AWQ retired).
 2. Mellum **int8 (AWQ)** — user choice. int8-from-bf16 is near-lossless, so AWQ here is
    belt-and-suspenders (harmless; `bake/awq.py` exists).
 3. **One model resident at a time** — honors the OOM-safety rule; the agentic loop swaps
@@ -47,11 +49,12 @@ port; closest template `src/quanta/qwen35/`.
 
 ## Memory (one-at-a-time)
 
-- Ultra int4-AWQ g64 mix **336 GiB resident** (U2-measured, `du` of the baked artifact: int4-AWQ
-  routed ~290 + int8 dense + bf16 core). Headroom **154 GiB** for KV + activations. (NB the U0 fit
-  projection of 289.7 GiB under-counted — it tracked the routed int4-g64 portion only; reconcile
-  `nemotron_ultra_fit_test.py`, non-blocking since 336 ≤ 490.4 fits.) Only **12 / 108** layers carry
-  growing KV — the 48 Mamba layers have **O(1)** state (a real long-context win at 256K).
+- Ultra **int4-RTN g64** mix **306 GiB resident** (U3-shipped; `du` of the baked artifact: int4 routed
+  + int8 dense + bf16 core — **30 GiB under the retired AWQ 336**, since RTN stores bf16 vs AWQ's fp32
+  expert scales). Headroom **184 GiB** for KV + activations. (NB the U0 fit projection of 289.7 GiB
+  under-counted — it tracked the routed int4-g64 portion only; reconcile `nemotron_ultra_fit_test.py`,
+  non-blocking since 306 ≤ 490.4 fits.) Only **12 / 108** layers carry growing KV — the 48 Mamba layers
+  have **O(1)** state (a real long-context win at 256K).
 - Mellum int8 ≈ 11.5 GiB.
 
 ## Roadmap
@@ -103,7 +106,21 @@ port; closest template `src/quanta/qwen35/`.
   shards**, tokenizer in-artifact, manifest `format=quanta` 49,983 tensors; coverage = all 108 layers,
   512 up + 512 down experts/moe-layer, embeddings/lm_head/norm_f present. **Resident 336 GiB** (≤490.4,
   154 GiB headroom). RTN (`expert_method="rtn"`) the known-good fallback if U3 ppl regresses.
-- **U3 — teacher-forced ppl + top-1** vs bf16 reference on real prose (stop set {2, 11}). Gate: sane.
+- **U3 ✅ — teacher-forced ppl + top-1, the AWQ-vs-RTN e2e arbiter → SHIP int4-RTN.**
+  `parity/nemotron_ultra_ppl.py` ran three sequential rule-8 streamed forwards (bf16 → int4-AWQ →
+  int4-RTN, each freed before the next so one is resident) over a held-out **1024-token** prose corpus
+  (≈10× the noisy 109-tok pilot; original expository text, held out from the agentic calib set):
+  **bf16 ppl 3.835 / acc 0.651**; **int4-AWQ ppl 4.766 / acc 0.604 / Δ +24.3% / agree 0.811**;
+  **int4-RTN ppl 3.845 / acc 0.644 / Δ +0.3% / agree 0.964**. RTN is ~lossless; **AWQ regresses hard** —
+  **finding #38 reproduced e2e** (the relu² down-proj AWQ tax got *worse* with more tokens, +11.2%→
+  +24.3%; the U2 slice de-risk's "AWQ ties/helps" was recon-only + L1-only, and recon does NOT predict
+  e2e — settled finding). **Shipping int4-RTN** (`expert_method="rtn"`): clears the gate (Δ +0.3% < 5%,
+  agree 0.964 > 0.90), same 4-bit footprint, **306 GiB resident (30 GiB < the AWQ 336** — RTN stores
+  bf16 expert scales vs AWQ's fp32; `awq_quantize` doesn't forward `scale_dtype`). AWQ retired for
+  Nemotron experts. Bake `parity/run_bake_nemotron_ultra_int4rtn_g64.py` (data-free experts, **0.10h
+  solo**, warm_experts 0 = the RTN signature; audited inventory-identical to AWQ — 198,111 index keys,
+  49,983 manifest tensors, format=quanta, 39 shards, tokenizer in-artifact). Files:
+  `parity/run_bake_nemotron_ultra_int4rtn_g64.py`, `parity/nemotron_ultra_ppl.py`.
 - **U4 — optimizations**, each behind a flag and ppl-equivalent: native **MTP spec-decode**
   (`spec.py`/`mtp.py`), **paged-KV** on the 12 attn layers (port #153 loop-kill), packed int4 experts
   + `gather_qmm` (already in `moe.py`), batched decode + Mamba-state batching (`batched_runtime.py`).

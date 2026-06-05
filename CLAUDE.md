@@ -20,10 +20,10 @@ That is the mistake this project exists to not repeat.
 **In flight (PIVOT, this session): Nemotron-3-Ultra-550B (main agent) + Mellum2-12B (orchestrator)
 agentic stack.** Handover **`PLAN_nemotron_ultra.md`**. Quantize Nemotron-Ultra (hybrid
 Mamba2+attn+MoE, `nemotron_h` — already supported; the 120B-Super sibling is already baked int4) as
-**int4-AWQ experts + int8 dense + bf16 core** (user pivoted experts → AWQ this session; the prior
-"int4-GPTQ" label was never wired into the Nemotron bake — Super actually shipped plain int4 RTN — and
-the U2 slice de-risk below clears AWQ at Ultra scale), then Mellum2 (`mellum`, a new port) as **int8**; **one
-model resident at a time**; drive Ultra first. **U0 ✅** — config adapter (`_hybrid_pattern`
+**int4-RTN experts + int8 dense + bf16 core** (user pivoted experts → AWQ mid-session and the U2 slice
+de-risk cleared AWQ on *recon*, but **U3's e2e ppl arbiter retired AWQ → int4-RTN ships** — recon ≠ e2e,
+see below), then Mellum2 (`mellum`, a new port) as **int8**; **one model resident at a time**; drive
+Ultra first. **U0 ✅** — config adapter (`_hybrid_pattern`
 normalises the newer explicit-`layers_block_type` schema, which omits `num_hidden_layers`) +
 fit-check: Ultra parses, the derived split reproduces the explicit list bit-for-bit, the quant policy
 covers all 51,023 tensors (rule #6), and the mix is resident at **289.7 GiB ≤ 490.4** (200.7 GiB
@@ -54,9 +54,17 @@ refs in index/manifest/config, weight_map relative, 42/42 shards, tokenizer in-a
 `format=quanta` 49,983 tensors, all 108 layers + 512 up/512 down experts/moe + embed/head/norm_f);
 **resident 336 GiB** (≤490.4, 154 GiB headroom — NB exceeds the U0 289.7 projection, which tracked only
 the routed int4-g64 portion and under-counted the int8 dense + bf16 core; reconcile
-`nemotron_ultra_fit_test.py`, non-blocking). **U3 next** = teacher-forced ppl + top-1 vs the bf16
-reference (stop {2,11}) — the AWQ-vs-RTN e2e arbiter (RTN `expert_method="rtn"` the known-good fallback
-if U3 regresses). The InternLM2.5 MInference track below is **paused at M6 ✅ (M7 deferred)**, not abandoned.
+`nemotron_ultra_fit_test.py`, non-blocking). **U3 ✅ → SHIP int4-RTN** (`parity/nemotron_ultra_ppl.py`,
+3 sequential rule-8 streamed forwards over a held-out 1024-tok prose corpus, ≈10× the 109-tok pilot):
+**bf16 ppl 3.835/acc 0.651**, **int4-AWQ 4.766/0.604/Δ +24.3%/agree 0.811**, **int4-RTN 3.845/0.644/Δ
++0.3%/agree 0.964** — RTN ~lossless, **AWQ regresses hard** (the relu² down-proj tax got *worse* with
+more tokens, +11.2%→+24.3%; the U2 recon de-risk could not see it — recon ≠ e2e, settled finding). So
+**finding #38 reproduced e2e** and the RTN fallback ships: `expert_method="rtn"`, data-free bake
+(`parity/run_bake_nemotron_ultra_int4rtn_g64.py`, 0.10h, warm_experts 0; inventory-identical to AWQ),
+same 4-bit footprint, **306 GiB resident (30 GiB < AWQ's 336** — RTN stores bf16 vs AWQ's fp32 expert
+scales). AWQ artifact retired. **U4 next** = optimizations behind flags (MTP spec-decode, paged-KV on
+the 12 attn layers, packed int4 + `gather_qmm`, batched decode + Mamba-state batching). The InternLM2.5
+MInference track below is **paused at M6 ✅ (M7 deferred)**, not abandoned.
 
 **Paused: InternLM2.5 sparse-prefill (MInference family) — M6 ✅, M7 next.** Handover
 **`PLAN_minference.md`**. Reuse the validated block-sparse substrate (`quanta.modeling.xattention`,
