@@ -84,8 +84,22 @@ coverage 1040/1040), diff vs an **independent inline reference** (raw-mx fusion/
 readout + U1-gated standalone mixers) — **logits Δ 0.0 / new_hidden Δ 0.0 (bit-identical)**, rule-8
 streamed (the 512-expert ~21.5 GiB bf16 stack the peak, solo). Gates the head's *structural assembly*;
 the *functional* accept-rate is the separate **MTP-M2** gate (losslessness holds for ANY head quality —
-the main model verifies every draft). **MTP-M1 next** = bake the head (int4-RTN experts + int8 dense +
-bf16 core, same policy; `quant_policy` already classifies `mtp.*`) into a sidecar; **MTP-M2** = loader +
+the main model verifies every draft). **MTP-M1 ✅** — bake the head into a self-contained **sidecar**
+(`…-quanta_int4rtn_g64_mtp`; the immutable backbone artifact is never touched, M2's loader pairs the
+two): same policy as the backbone (int4-RTN experts + int8 dense + bf16 core; `quant_policy` already
+classifies `mtp.*`), new `bake_nemotron_mtp` (bake.py) streams one expert resident (rule 8, 0.08 min,
+data-free RTN warm 0) → **1040/1040** tensors in a single 6.56 GiB shard, audited self-contained (zero
+path leaks, relative refs only, manifest **9 int8 / 7 bf16 / 1024 int4**). Gated solo
+(`parity/nemotron_ultra_mtp_bake_parity.py`, two 21.5 GiB heads loaded **sequentially** — peak one head):
+(1) coverage+format exact vs `classify` (1040/1040, dense/affine_packed/awq_packed), (2) **bit-exact
+faithfulness** — an *independent* in-script RTN `quantize_affine` of the source reproduces the baked
+packed/scale/bias **bit-for-bit** (eh_proj + experts 0/256/511; awq_scale==ones, s=1), (3) **recon
+forward** baked-dequant head vs bf16 head through the *identical* M0-gated `NemotronMTPModule` (bf16
+router ⇒ routing identical on both sides ⇒ the delta is pure quant): **logits Δ 7.0% / new_hidden Δ 7.8%
+< 10%, top-1 agree 0.875** — the inherent int4-g64 expert recon (the bit-exact gate is the tight
+correctness proof; recon is bounded-not-tight), and a *drafter* so it only moves accept-rate, never
+correctness (main model verifies every draft). **MTP-M2 next** = loader (`NemotronMTP` filled from the
+baked sidecar `mtp.*`, a `build_resident_mtp` mirroring `build_resident_block`) +
 resident spec-contract adapter (`offset`/`make_caches`/`truncate`) + real lossless accept-rate gate (spec
 == greedy; mean_accept + speedup, k∈{1,2,3}). Other U4 streams (not started): paged-KV on the 12 attn
 layers, batched decode + Mamba-state batching. The InternLM2.5 MInference track below is **paused at M6 ✅

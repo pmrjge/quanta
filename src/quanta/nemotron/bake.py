@@ -12,9 +12,11 @@ Streamed, one layer resident at a time (rule-8). Per-tensor scheme comes from
 * SSM core + every norm + router + embeddings/head → bf16.
 
 Two streamed passes mirror the Kimi bake: (1) capture per-MoE-layer latent + routing for AWQ;
-(2) write the artifact. The MTP head (``mtp.*``) is out of scope — that's the #40 speculative
-path; the backbone + embeddings/head/norm_f are baked. Runnable on a slice (``n_layers``,
-``expert_subset``) for bounded validation; the full call is the real bake.
+(2) write the artifact. :func:`bake_nemotron` bakes the **backbone** + embeddings/head/norm_f;
+the native MTP draft head (``mtp.*``, the #40 speculative path) is baked separately by
+:func:`bake_nemotron_mtp` into a **sidecar** artifact under the same per-tensor policy, so the
+immutable backbone bundle is never touched. Runnable on a slice (``n_layers``, ``expert_subset``)
+for bounded validation; the full call is the real bake.
 """
 
 from __future__ import annotations
@@ -145,3 +147,71 @@ def bake_nemotron(
     writer.finalize(policy)
     return {"layers": n, "moe_layers": n_moe, "experts_per_layer": len(experts),
             "warm_experts": warm, "expert_method": expert_method}
+
+
+def bake_nemotron_mtp(
+    source: str | Path,
+    out_dir: str | Path,
+    *,
+    group_size: int = 128,
+    expert_method: str = "rtn",
+    scale_dtype: mx.Dtype | None = None,
+) -> dict:
+    """Bake the native MTP draft head (``mtp.layers.0/1.*``) into a self-contained **sidecar**.
+
+    The companion to the backbone artifact for native-MTP self-speculative decode (#40), written as
+    its own bundle (sharded safetensors + index + config + manifest) so the immutable backbone
+    artifact is never mutated — the MTP-M2 loader reads the backbone from one dir and this head from
+    the sidecar. Same per-tensor policy as the backbone (:func:`quant_policy.classify` already covers
+    every ``mtp.*`` tensor): the 512-expert relu^2 latent-MoE (``mtp.layers.1.mixer.experts.*``) →
+    int4; the dense always-on projections (``eh_proj``, attn q/k/v/o, latent fc1/fc2, shared expert)
+    → int8 affine; the fusion/sub-block/final norms + router gate/bias → bf16. Keys match the
+    backbone scheme (``mtp.layers.{0,1}.mixer.*``) so a ``build_resident_mtp`` mirrors
+    :func:`quanta.nemotron.runtime.build_resident_block`.
+
+    RTN only: the head follows the backbone's ship decision (finding #38 — AWQ regresses the relu^2
+    down-proj e2e; RTN is ~lossless at the same 4-bit footprint), and MTP latent calibration capture
+    is not built, so ``expert_method`` must be ``"rtn"`` (fail loud, rule 6). Streamed one expert
+    resident at a time (rule 8 / rule 3 IO loop) — no 21.5 GiB stack is ever materialized. Run solo.
+    """
+    assert expert_method == "rtn", (
+        f"MTP sidecar bakes RTN experts only (finding #38; no MTP calib capture), got {expert_method!r}")
+    cfg = NemotronHConfig.from_pretrained(source)
+    ck = NemotronSourceCheckpoint(source)
+    n_experts = cfg.n_routed_experts
+    mpre = "mtp.layers.1.mixer."
+
+    source_mtp = {k for k in ck.weight_map if k.startswith("mtp.")}
+    assert source_mtp, f"no mtp.* tensors in {source} — not a native-MTP checkpoint"
+    # nonexpert = fusion + attn sub-block + moe-nonexpert + norms; ".experts." excludes the routed
+    # experts but keeps shared_experts ("_experts." not ".experts.") → dense int8 by policy.
+    nonexpert = sorted(k for k in source_mtp if ".experts." not in k)
+
+    writer = ArtifactWriter(out_dir, Path(source) / "config.json")
+    consumed: set[str] = set()
+    for key in nonexpert:  # int8 (eh_proj/qkvo/fc1/fc2/shared) or bf16 (norms/gate/bias) by policy
+        _write_by_policy(writer, key, ck.read(key), group_size, scale_dtype)
+        consumed.add(key)
+    ck.release()
+
+    warm = 0
+    for e in range(n_experts):  # routed relu^2 experts → int4 RTN, one expert resident (rule 8)
+        base = f"{mpre}experts.{e}"
+        up, down = ck.read(f"{base}.up_proj.weight"), ck.read(f"{base}.down_proj.weight")
+        warm += int(_bake_expert(writer, base, up, down, None, None,
+                                 group_size, expert_method, scale_dtype) > 0)
+        consumed |= {f"{base}.up_proj.weight", f"{base}.down_proj.weight"}
+        if e % 32 == 31:
+            ck.release()
+            mx.clear_cache()
+    ck.release()
+
+    orphans = source_mtp - consumed  # rule 6: every source mtp.* tensor has a runtime consumer
+    assert not orphans, f"rule 6: {len(orphans)} mtp tensors unconsumed, e.g. {sorted(orphans)[:5]}"
+
+    policy = {"head": "mtp", "experts": f"int4 {expert_method} g{group_size}",
+              "dense": f"int8 g{group_size}", "norms_router": "bf16",
+              "scales": "bf16" if scale_dtype == mx.bfloat16 else "fp32"}
+    writer.finalize(policy)
+    return {"head": "mtp", "n_experts": n_experts, "warm_experts": warm,
+            "expert_method": expert_method, "tensors": len(consumed)}

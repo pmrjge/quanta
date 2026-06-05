@@ -157,10 +157,24 @@ port; closest template `src/quanta/qwen35/`.
       512-expert ~21.5 GiB bf16 stack the peak, solo). Gates the head's *structural assembly*; the
       *functional* accept-rate is the separate MTP-M2 gate (losslessness holds for any head quality —
       the main model verifies every draft, rule 4).
-    - **MTP-M1 next** — bake the head: int4-RTN experts + int8 dense + bf16 core (same policy as the
-      backbone; `quant_policy` already classifies `mtp.*`), into a sidecar of the int4-RTN artifact;
-      gate baked-head forward ≈ bf16-head forward (recon).
-    - **MTP-M2** — loader (`NemotronMTP` from the baked `mtp.*`) + resident spec-contract adapter on
+    - **MTP-M1 ✅ — bake the head into an int4-RTN sidecar + recon gate.** New `bake_nemotron_mtp`
+      (`bake.py`) bakes the head as a self-contained **sidecar** bundle
+      `…-quanta_int4rtn_g64_mtp` (driver `parity/run_bake_nemotron_ultra_mtp_int4rtn_g64.py`) — same
+      policy as the backbone (int4-RTN experts + int8 dense + bf16 core; `quant_policy` already
+      classifies `mtp.*`), its own bundle so the immutable backbone artifact is untouched (M2's loader
+      pairs the two). Streamed one expert resident (rule 8, **no 21.5 GiB stack**; 0.08 min, data-free
+      RTN warm 0) → **1040/1040** tensors, single 6.56 GiB shard, audited self-contained (zero path
+      leaks, relative refs, manifest **9 int8 / 7 bf16 / 1024 int4**). Gated solo
+      `parity/nemotron_ultra_mtp_bake_parity.py` (two 21.5 GiB heads loaded **sequentially**, peak one):
+      (1) coverage+format exact vs `classify` (1040/1040), (2) **bit-exact faithfulness** — an
+      independent in-script RTN `quantize_affine` reproduces the baked packed/scale/bias **bit-for-bit**
+      (eh_proj int8 + experts 0/256/511 int4; awq_scale==ones ⇒ s=1), (3) **recon forward** baked-dequant
+      vs bf16 head through the *identical* M0-gated `NemotronMTPModule` (bf16 router ⇒ routing identical ⇒
+      delta is pure quant): **logits Δ 7.0% / new_hidden Δ 7.8% < 10%, top-1 agree 0.875** (the inherent
+      int4-g64 expert recon — the bit-exact gate is the tight proof; recon is bounded, and a *drafter*
+      moves only accept-rate, never correctness).
+    - **MTP-M2 next** — loader (`NemotronMTP` filled from the baked sidecar `mtp.*`, a
+      `build_resident_mtp` mirroring `build_resident_block`) + resident spec-contract adapter on
       `NemotronResidentModel` (`offset` / `make_caches` / `truncate`); real lossless accept-rate gate:
       `spec_generate(_k)` output == greedy on real prose, report mean_accept + decode speedup for
       k ∈ {1, 2, 3}.
