@@ -32,8 +32,10 @@ bit-exact); on partial acceptance (``j < k``) we restore the snapshot AND re-run
 just the accepted prefix ``[cur, d_1, ..., d_j]`` to advance state to the committed offset. The
 re-run also re-grows the (truncated-back) KV cache to the committed length, so the post-round state
 is bit-exact. ``j == k`` (perfect chain) avoids the re-run; ``j == 0`` (all rejected) re-runs only
-``[cur]``. For ``k == 1`` :func:`spec_generate_k` delegates to :func:`spec_generate` so the
-parity-tested single-step path is unchanged.
+``[cur]``. For ``k == 1`` :func:`spec_generate_k` delegates to :func:`spec_generate`, which applies
+the **same** snapshot/restore + ``[cur]`` re-run on a rejected draft **when the model carries Mamba
+state** (``ssm is not None``) — so the single-step path is lossless on the hybrid too; a stub /
+pure-attention model (``ssm is None``) keeps the original KV-only single-step path verbatim.
 
 Consumed contracts (siblings — not reimplemented here):
 
@@ -114,7 +116,12 @@ def spec_generate(model, mtp, embed: mx.array, head: mx.array, prompt_ids,
     embedding ``[vocab, hidden]`` and LM-head ``[vocab, hidden]`` matrices (the MTP fuses
     ``embed[token]`` and reads out through ``head``); ``prompt_ids``: the prompt token ids. ``eos_id``
     may be an ``int`` or a collection of stop ids. ``stats['mean_accept']`` is the mean number of
-    tokens emitted per main-model forward (1 = the MTP never helped, 2 = every draft accepted)."""
+    tokens emitted per main-model forward (1 = the MTP never helped, 2 = every draft accepted).
+
+    Hybrid-safe: when the model carries Mamba recurrence (``ssm is not None``, threaded via
+    :meth:`make_caches`), a rejected draft is rolled out of the un-sliceable ``(ssm, conv)`` summary by
+    restoring the pre-verify snapshot + re-running ``[cur]`` (the KV cache slices losslessly on its
+    own). A stub / pure-attention model (``ssm is None``) takes the original KV-only path unchanged."""
     last = model.cfg.num_hidden_layers - 1   # capture the final main-layer hidden (the MTP feature)
     prompt_ids = list(prompt_ids)
     if not prompt_ids:
@@ -139,9 +146,19 @@ def spec_generate(model, mtp, embed: mx.array, head: mx.array, prompt_ids,
         dlog, _ = mtp(prev_hidden, token_emb, head)                    # [1,1,vocab]
         draft = int(mx.argmax(dlog[0, 0]).item())
 
+        # Snapshot the (un-sliceable) Mamba recurrence BEFORE the verify consumes [cur, draft], so a
+        # REJECTED draft can be rolled out of the recurrent summary on a hybrid model. The KV cache
+        # slices losslessly (``_rollback``); the Mamba ``(ssm, conv)`` state is a summary of every
+        # consumed token and cannot be sliced — restore the snapshot + re-run [cur] (the same
+        # snapshot/restore/re-run :func:`spec_generate_k` uses for k>=2, specialized to k=1). A stub
+        # / pure-attention model (``ssm is None``) keeps the original KV-only single-step path verbatim.
+        ssm_pre = list(ssm) if ssm is not None else None
+        conv_pre = list(conv) if conv is not None else None
+        pre_offset = q + 1
+
         # --- verify both in ONE main forward over [cur, draft] at offset q+1 ---
         vlog, vcaps = _forward(model, mx.array([cur, draft]), caches=caches, ssm=ssm, conv=conv,
-                               offset=q + 1, capture_layers=(last,))
+                               offset=pre_offset, capture_layers=(last,))
         bpred = mx.argmax(vlog[0], axis=-1)             # [2]; bpred[0]=greedy@q+2, bpred[1]=greedy@q+3
         mx.eval(bpred) if vcaps is None else mx.eval(bpred, vcaps[last])
         b0, b1 = int(bpred[0].item()), int(bpred[1].item())
@@ -153,10 +170,25 @@ def spec_generate(model, mtp, embed: mx.array, head: mx.array, prompt_ids,
         out.append(bonus)
         accept_lens.append(j + 1)
 
-        # roll the decode state back to keep only [cur] + j accepted drafts; drop the rest so the
-        # state is bit-identical to never having fed the rejected draft.
-        _rollback(model, caches, (q + 1) + (j + 1))
-        prev_hidden = vcaps[last][j][None, None]        # main hidden at the last accepted position
+        if ssm_pre is not None and j == 0:
+            # hybrid + rejected draft: restore the pre-verify recurrent state, roll the KV back to the
+            # pre-verify offset, and re-run [cur] so the Mamba summary + KV advance to exactly the
+            # committed position (the rejected draft never enters the un-sliceable recurrent state).
+            for i in range(len(ssm)):
+                ssm[i] = ssm_pre[i]
+            for i in range(len(conv)):
+                conv[i] = conv_pre[i]
+            _rollback(model, caches, pre_offset)
+            rlog, rcaps = _forward(model, mx.array([cur]), caches=caches, ssm=ssm, conv=conv,
+                                   offset=pre_offset, capture_layers=(last,))
+            mx.eval(rlog) if rcaps is None else mx.eval(rlog, rcaps[last])
+            prev_hidden = rcaps[last][-1][None, None]   # main hidden at the committed (cur) position
+        else:
+            # original single-step path — KV slices losslessly (stub / pure-attention model), or the
+            # draft was accepted (j==1: both [cur, draft] are committed, the verify state already
+            # matches the committed offset, so the truncate is a no-op).
+            _rollback(model, caches, (q + 1) + (j + 1))
+            prev_hidden = vcaps[last][j][None, None]    # main hidden at the last accepted position
         q = q + 1 + j
         cur = bonus
         if bonus in stop or (j == 1 and draft in stop):

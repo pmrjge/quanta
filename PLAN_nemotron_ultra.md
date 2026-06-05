@@ -173,11 +173,33 @@ port; closest template `src/quanta/qwen35/`.
       delta is pure quant): **logits Δ 7.0% / new_hidden Δ 7.8% < 10%, top-1 agree 0.875** (the inherent
       int4-g64 expert recon — the bit-exact gate is the tight proof; recon is bounded, and a *drafter*
       moves only accept-rate, never correctness).
-    - **MTP-M2 next** — loader (`NemotronMTP` filled from the baked sidecar `mtp.*`, a
-      `build_resident_mtp` mirroring `build_resident_block`) + resident spec-contract adapter on
-      `NemotronResidentModel` (`offset` / `make_caches` / `truncate`); real lossless accept-rate gate:
-      `spec_generate(_k)` output == greedy on real prose, report mean_accept + decode speedup for
-      k ∈ {1, 2, 3}.
+    - **MTP-M2 ✅ — native MTP spec-decode wired into the resident loop + real lossless gate.**
+      (1) Loader `build_resident_mtp` (`runtime.py`) fills `NemotronMTP` from the sidecar `mtp.*` —
+      packed-int4 experts via `gather_qmm` + int8 dense `QuantizedLinear` + bf16 core, mirroring
+      `build_resident_block`. (2) Resident spec adapter on `NemotronResidentModel`: `make_caches` (the
+      `(caches, ssm, conv)` triple, `max_rollback=8`), `truncate` (KV only; the Mamba `(ssm,conv)`
+      summary can't be sliced — the spec loop owns it), `offset` (accepted-and-ignored; the KV cache
+      tracks position). (3) **The gate caught a real k=1 hybrid bug:** `spec_generate` (k=1) never rolled
+      the un-sliceable Mamba recurrence back on a *rejected* draft (only `spec_generate_k` k≥2 did) — so
+      k=1 corrupted `(ssm,conv)` on the hybrid. Fixed: on reject, snapshot/restore `(ssm,conv)` + re-run
+      `[cur]` (gated on `ssm is not None`; the stub/pure-attention path is byte-identical). Gated
+      **bit-exact model-free** (`nemotron_mtp_spec_test` gate 7: a Mamba-carrying stub whose argmax
+      depends on a running recurrent state, so a non-rolled-back rejected draft would diverge — spec ==
+      greedy with the rollback branch firing). **Real gate**
+      (`parity/nemotron_ultra_mtp_resident_spec.py`, solo, 306 GiB backbone + 6.56 GiB sidecar resident,
+      eager, 64-tok prose → 48 tok): **k=2/k=3 EXACT (bit-identical 48/48)**; **k=1 bit-identical 24/48
+      then a confirmed bf16 ULP near-tie** (spec's token is greedy's **rank-2** runner-up, **margin
+      0.125 ≈ 1 ULP** on greedy's own step path) after which the two *valid* greedy trajectories
+      chaos-diverge. mean_accept **1.52/2, 1.81/3, 1.81/4**. **Settled finding:** on a bf16 Mamba hybrid
+      the spec VERIFY forward (T>1) and a T=1 decode differ by ~1 bf16 ULP (`path_ulp`=0.1875 — attention
+      `mask=None`-vs-`causal` + the recurrence), so **"spec == T=1 greedy" is the wrong real-weight
+      criterion** (a single near-tie flip cascades chaotically) — the gate verifies the logic is bit-exact
+      (gate 7) + the **first** divergence (the only valid-prefix position) is a near-tie; a
+      large-margin/low-rank first divergence FAILS as a logic bug.
+    - **MTP-M3 next (perf, not started)** — single-stream eager spec is ~0.5–0.8× greedy (the 512-expert
+      MTP draft cost dominates at B=1). Speed levers: `draft_topk` (lighter drafter), compiled decode, the
+      already-built batched/tree verify; re-point `nemotron_mtp_k_bench` to `build_resident_mtp` + Ultra
+      and measure wall-clock speedup.
   - **U4 remaining streams** (each behind a flag, ppl-equivalent, not started): paged-KV on the 12 attn
     layers, batched decode + Mamba-state batching.
 

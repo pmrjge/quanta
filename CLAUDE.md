@@ -98,12 +98,36 @@ forward** baked-dequant head vs bf16 head through the *identical* M0-gated `Nemo
 router ⇒ routing identical on both sides ⇒ the delta is pure quant): **logits Δ 7.0% / new_hidden Δ 7.8%
 < 10%, top-1 agree 0.875** — the inherent int4-g64 expert recon (the bit-exact gate is the tight
 correctness proof; recon is bounded-not-tight), and a *drafter* so it only moves accept-rate, never
-correctness (main model verifies every draft). **MTP-M2 next** = loader (`NemotronMTP` filled from the
-baked sidecar `mtp.*`, a `build_resident_mtp` mirroring `build_resident_block`) +
-resident spec-contract adapter (`offset`/`make_caches`/`truncate`) + real lossless accept-rate gate (spec
-== greedy; mean_accept + speedup, k∈{1,2,3}). Other U4 streams (not started): paged-KV on the 12 attn
-layers, batched decode + Mamba-state batching. The InternLM2.5 MInference track below is **paused at M6 ✅
-(M7 deferred)**, not abandoned.
+correctness (main model verifies every draft). **MTP-M2 ✅** = native MTP spec-decode wired into the
+resident loop + real lossless gate. (1) **Loader** `build_resident_mtp` (`runtime.py`) fills
+`NemotronMTP` from the baked sidecar `mtp.*` — packed-int4 experts via `gather_qmm` + int8 dense
+`QuantizedLinear` + bf16 core — mirroring `build_resident_block`. (2) **Resident spec adapter** on
+`NemotronResidentModel`: `make_caches` (the `(caches, ssm, conv)` triple, `max_rollback=8`), `truncate`
+(KV only — the Mamba `(ssm,conv)` summary can't be sliced, the spec loop handles it), `offset`
+(accepted-and-ignored; the KV cache tracks position). (3) **The gate caught a real k=1 hybrid bug** (the
+CLAUDE.md thesis again): `spec_generate` (k=1) never rolled the un-sliceable Mamba recurrence back on a
+*rejected* draft (only `spec_generate_k` k≥2 did) — so k=1 corrupted the `(ssm,conv)` summary on the
+hybrid. Fixed: on reject, snapshot/restore `(ssm,conv)` + re-run `[cur]` (gated on `ssm is not None`; the
+stub/pure-attn path is byte-identical), gated **bit-exact model-free** (`nemotron_mtp_spec_test` gate 7 —
+a Mamba-carrying stub whose argmax depends on a running recurrent state, so a non-rolled-back rejected
+draft would diverge: spec==greedy with the rollback branch firing). **Real gate**
+(`parity/nemotron_ultra_mtp_resident_spec.py`, solo, 306 GiB backbone + 6.56 GiB sidecar resident,
+eager): `spec_generate_k` k∈{1,2,3} vs greedy on 64-tok prose → 48 tok. **k=2/k=3 EXACT (bit-identical
+48/48)**; **k=1 bit-identical 24/48 then a *confirmed* bf16 ULP near-tie** (spec's token is greedy's
+**rank-2** runner-up, **margin 0.125 ≈ 1 ULP** on greedy's own per-token step path) after which the two
+*valid* greedy trajectories chaos-diverge. mean_accept **1.52/2, 1.81/3, 1.81/4** (the real trained head
+drafts well). **Settled finding (new):** on a bf16 **Mamba hybrid** the spec VERIFY forward (T>1) and a
+T=1 decode differ by ~1 bf16 ULP (`path_ulp`=0.1875 — attention `mask=None`-vs-`causal` + the recurrence;
+the Mamba-mixer chunked-vs-step note is the same class), so **"spec == T=1 greedy" is the wrong
+real-weight criterion** (CLAUDE.md: *test behavior with parity, not greedy generation* — a single ULP
+near-tie flip cascades chaotically). The honest gate: **logic is bit-exact (gate 7); on real weights spec
+is bit-identical up to the first divergence, and that first divergence (the only valid-prefix position)
+must be a verified near-tie** — a large-margin/low-rank first divergence would FAIL as a logic bug.
+Caveat: **single-stream eager spec is ~0.5–0.8× greedy** (the 512-expert MTP draft cost dominates at
+B=1); the speed levers — `draft_topk` (lighter drafter), compiled decode, the already-built batched/tree
+verify — are the **MTP-M3 perf** follow-up (`nemotron_mtp_k_bench` needs re-pointing to `build_resident_mtp`
++ Ultra). Other U4 streams (not started): paged-KV on the 12 attn layers, batched decode + Mamba-state
+batching. The InternLM2.5 MInference track below is **paused at M6 ✅ (M7 deferred)**, not abandoned.
 
 **Paused: InternLM2.5 sparse-prefill (MInference family) — M6 ✅, M7 next.** Handover
 **`PLAN_minference.md`**. Reuse the validated block-sparse substrate (`quanta.modeling.xattention`,

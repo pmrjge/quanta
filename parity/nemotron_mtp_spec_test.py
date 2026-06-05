@@ -25,6 +25,11 @@ handed (the real MTP signature passes the embedding *vector*, not the id). Asser
   (6) ``spec_generate_k(k=2/k=3)`` is bit-identical to greedy for perfect AND wrong MTP, with
       ``mean_accept`` → ``k+1`` on perfect (every chained draft accepted) and ≈ 1 on wrong (verify
       arbitrates losslessly regardless), and eos stops match greedy's stop.
+  (7) on a HYBRID (Mamba-carrying) stub main model — whose next-token argmax depends on a running
+      recurrent state, so a rejected draft left in the un-sliceable ``(ssm, conv)`` summary would
+      diverge — ``spec_generate`` (k=1) stays bit-identical to greedy because its ``ssm is not None``
+      branch restores the pre-verify snapshot + re-runs ``[cur]`` to roll the rejected draft out of the
+      recurrent state (the rollback branch is asserted to actually fire), and eos stops match too.
 
     uv run --with numpy python -m parity.nemotron_mtp_spec_test
 
@@ -124,6 +129,51 @@ class _StubMainModel:
         return logits, {last: feat}
 
 
+class _HybridStubModel:
+    """Deterministic stub of a **hybrid (Mamba-carrying)** main model: the next-token argmax depends on
+    a running recurrent state ``s`` (the sum of every consumed token), so a rejected draft left in the
+    un-sliceable ``(ssm, conv)`` summary (no rollback) shifts ``s`` and changes the logits — breaking
+    ``spec==greedy``. The decisive model-free gate for :func:`spec_generate`'s hybrid k=1 Mamba
+    snapshot/restore/re-run branch. ``make_caches`` returns a ``(cache, [s], [None])`` triple with a
+    **non-None** ``ssm`` so the spec loop takes the hybrid branch; ``__call__`` advances ``s`` in place
+    per consumed token (the spec loop snapshots/restores that list on a rejected draft).
+
+    ``g(t, s) = (t + STEP + s) % VOCAB`` is well-defined given the committed history, so the plain
+    greedy reference (which steps the same model) is deterministic — and any state corruption shows up
+    as a divergence from it."""
+
+    def __init__(self) -> None:
+        self.cfg = SimpleNamespace(num_hidden_layers=NL)
+        self.num_layers = NL
+        self.calls: list[tuple[tuple[int, ...], int]] = []
+        self.cache: _StubCache | None = None
+        self.ssm: list | None = None
+
+    def make_caches(self) -> tuple:
+        self.cache = _StubCache()
+        self.ssm = [mx.array(0.0)]                          # the running recurrent state s (one "mamba layer")
+        return self.cache, self.ssm, [None]
+
+    def __call__(self, token_ids, *, caches=None, ssm=None, conv=None, offset=0, capture_layers=None):
+        ids = [int(x) for x in (token_ids.tolist() if isinstance(token_ids, mx.array) else token_ids)]
+        self.calls.append((tuple(ids), offset))
+        if caches is not None and hasattr(caches, "append"):
+            caches.append(len(ids))
+        s = float(ssm[0].item()) if ssm is not None else 0.0
+        rows = []
+        for t in ids:
+            s += t                                          # consume a token -> advance the recurrent state
+            rows.append(_row((t + STEP + int(s)) % VOCAB))  # history-DEPENDENT next-token argmax
+        if ssm is not None:
+            ssm[0] = mx.array(s)                            # write back in place (the spec loop snapshots it)
+        logits = mx.stack(rows)[None]                       # [1, T, vocab]
+        if not capture_layers:
+            return logits
+        last = max(capture_layers)
+        feat = mx.broadcast_to(mx.arange(len(ids), dtype=mx.float32)[:, None], (len(ids), HIDDEN))
+        return logits, {last: feat}
+
+
 class _PerfectMTP:
     """A drafter that always predicts the main model's greedy token from the handed ``token_emb`` (the
     one-hot embedding of the just-seen token) → every draft is accepted → mean_accept rises to 2 at
@@ -167,6 +217,29 @@ def _greedy_reference(model: _StubMainModel, prompt, max_new: int, eos_id=None) 
     q = len(prompt) - 1
     while len(out) < max_new and cur not in stop:
         logits = model(mx.array([cur]), caches=caches, offset=q + 1)
+        q += 1
+        cur = int(mx.argmax(logits[0, -1]).item())
+        out.append(cur)
+    out = out[:max_new]
+    if stop:
+        for k, tok in enumerate(out):
+            if tok in stop:
+                return out[: k + 1]
+    return out
+
+
+def _greedy_reference_hybrid(model: _HybridStubModel, prompt, max_new: int, eos_id=None) -> list[int]:
+    """Plain greedy decode on the hybrid stub (threading the ``(ssm, conv)`` recurrence) — the
+    bit-identity target for :func:`spec_generate` on a Mamba-carrying model. One token per forward,
+    argmax each step, terminate at the first eos (inclusive)."""
+    stop = set() if eos_id is None else ({int(eos_id)} if isinstance(eos_id, int) else {int(s) for s in eos_id})
+    caches, ssm, conv = model.make_caches()
+    logits = model(mx.array(prompt), caches=caches, ssm=ssm, conv=conv, offset=0)
+    cur = int(mx.argmax(logits[0, -1]).item())
+    out = [cur]
+    q = len(prompt) - 1
+    while len(out) < max_new and cur not in stop:
+        logits = model(mx.array([cur]), caches=caches, ssm=ssm, conv=conv, offset=q + 1)
         q += 1
         cur = int(mx.argmax(logits[0, -1]).item())
         out.append(cur)
@@ -327,6 +400,28 @@ def run() -> None:
         ok = ok and good
         print(f"  [{'OK' if good else 'FAIL'}] eos k={K} stops: perfect={spec_kpe == greedy_e} "
               f"wrong={spec_kwe == greedy_e}")
+
+    # --- hybrid (Mamba-carrying) main model: spec_generate's k=1 (ssm is not None) Mamba rollback ----
+    # (7) On a hybrid stub whose next-token argmax depends on a running recurrent state, a rejected
+    #     draft left in the un-sliceable (ssm, conv) summary would shift the state and diverge from
+    #     greedy. The WrongMTP forces a rejected draft (j=0) nearly every round, so the snapshot/restore
+    #     + [cur] re-run branch is exercised; spec_generate must STILL be bit-identical to greedy.
+    greedy_h = _greedy_reference_hybrid(_HybridStubModel(), prompt, MAXN, eos_id=None)
+    mh = _HybridStubModel()
+    spec_h, st_h = spec_generate(mh, _WrongMTP(), EMBED, HEAD, prompt, max_new=MAXN, eos_id=None)
+    rolled = len(mh.cache.truncations) > 0          # the hybrid rollback branch was actually entered
+    good = spec_h == greedy_h and rolled
+    ok = ok and good
+    print(f"  [{'OK' if good else 'FAIL'}] hybrid k=1 Mamba rollback: spec==greedy={spec_h == greedy_h} "
+          f"(rolled_back={rolled}, rounds={st_h['rounds']})")
+    print(f"             greedy_h[:10]={greedy_h[:10]}")
+    print(f"             spec_h  [:10]={spec_h[:10]}")
+    # (7b) the hybrid rollback must also honor eos — both terminate at the first eos (inclusive)
+    greedy_he = _greedy_reference_hybrid(_HybridStubModel(), prompt, MAXN, eos_id=EOS)
+    spec_he, _ = spec_generate(_HybridStubModel(), _WrongMTP(), EMBED, HEAD, prompt, max_new=MAXN, eos_id=EOS)
+    good = spec_he == greedy_he
+    ok = ok and good
+    print(f"  [{'OK' if good else 'FAIL'}] hybrid k=1 + eos: spec==greedy={good}")
 
     # k validation: spec_generate_k(k=0) must raise (rule 6 — no silent k<1 fallthrough)
     raised = False
