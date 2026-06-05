@@ -4,7 +4,7 @@ A two-model agentic stack on one M3 Ultra (≤ 490.4 GiB), quantized through `qu
 parity-first pipeline.
 
 - **Main agent:** `NVIDIA-Nemotron-3-Ultra-550B-A55B` — hybrid Mamba2 + attention + MoE
-  (`model_type: nemotron_h`) → **int4-GPTQ experts + int8 dense + bf16 core**.
+  (`model_type: nemotron_h`) → **int4-AWQ g64 experts + int8 dense + bf16 core** (U2 ✅ baked).
 - **Orchestrator:** `JetBrains/Mellum2-12B-A2.5B-Thinking` — sliding-window + full-attn MoE
   (`model_type: mellum`) → **int8 (AWQ)**.
 
@@ -47,8 +47,10 @@ port; closest template `src/quanta/qwen35/`.
 
 ## Memory (one-at-a-time)
 
-- Ultra int4 mix **289.7 GiB resident** (U0-measured: int4-GPTQ 255.0 + int8 30.3 + bf16 4.4 GiB;
-  + ~1–2 GiB MTP head). Headroom **200.7 GiB** for KV + activations. Only **12 / 108** layers carry
+- Ultra int4-AWQ g64 mix **336 GiB resident** (U2-measured, `du` of the baked artifact: int4-AWQ
+  routed ~290 + int8 dense + bf16 core). Headroom **154 GiB** for KV + activations. (NB the U0 fit
+  projection of 289.7 GiB under-counted — it tracked the routed int4-g64 portion only; reconcile
+  `nemotron_ultra_fit_test.py`, non-blocking since 336 ≤ 490.4 fits.) Only **12 / 108** layers carry
   growing KV — the 48 Mamba layers have **O(1)** state (a real long-context win at 256K).
 - Mellum int8 ≈ 11.5 GiB.
 
@@ -91,13 +93,16 @@ port; closest template `src/quanta/qwen35/`.
   (0.984, 23/24 experts AWQ≤RTN); relu² channel sparsity 99.74% (the #38 precondition) is present but
   AWQ's α-grid rejects the degenerate scales (range ≈1, not ≈1e6). Caveat: L1-only + activation-weighted
   recon (not e2e ppl). **AWQ cleared.**
-- **U2 — full int4-AWQ g64 + int8 bake**, layer-streamed (rule 8), via `bake_nemotron(..., expert_method=
-  "awq", group_size=64)` (cf. `parity/run_bake_nemotron.py`, the AWQ driver); the AWQ pass captures the
-  per-MoE-layer latent + routing (`nemotron/calibrate.py`) over ~2–4K agentic-corpus tokens, then
-  grid-scales each expert's up/down. Self-contained artifact (config + manifest + tokenizer + relative
-  shards) → `~/models/NVIDIA-Nemotron-3-Ultra-550B-A55B-quanta_int4awq_g64`. Gate: loads + manifest
-  in-artifact only. **Hours; run solo (OOM hazard).** RTN (`expert_method="rtn"`) the known-good fallback
-  if U3 ppl regresses.
+- **U2 ✅ — full int4-AWQ g64 + int8 bake.** `parity/run_bake_nemotron_ultra_int4awq_g64.py` drove
+  `bake_nemotron(..., expert_method="awq", group_size=64, scale_dtype=bf16)` layer-streamed (rule 8) over
+  ~4K agentic-corpus calib tokens (capture per-MoE latent+routing → α-grid each expert's up/down),
+  **0.48h solo** → `~/models/NVIDIA-Nemotron-3-Ultra-550B-A55B-quanta_int4awq_g64`. Stats: 108 layers /
+  48 moe / 512 experts-per-layer, **warm_experts 24,235 / 24,576 (98.6%)** got real AWQ scales; the 341
+  cold experts → plain int4 RTN (s=1, one runtime path). **Artifact audited self-contained + fully
+  covered**: no symlinks, zero external refs in index/manifest/config, all weight_map relative, **42/42
+  shards**, tokenizer in-artifact, manifest `format=quanta` 49,983 tensors; coverage = all 108 layers,
+  512 up + 512 down experts/moe-layer, embeddings/lm_head/norm_f present. **Resident 336 GiB** (≤490.4,
+  154 GiB headroom). RTN (`expert_method="rtn"`) the known-good fallback if U3 ppl regresses.
 - **U3 — teacher-forced ppl + top-1** vs bf16 reference on real prose (stop set {2, 11}). Gate: sane.
 - **U4 — optimizations**, each behind a flag and ppl-equivalent: native **MTP spec-decode**
   (`spec.py`/`mtp.py`), **paged-KV** on the 12 attn layers (port #153 loop-kill), packed int4 experts

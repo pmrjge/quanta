@@ -47,9 +47,16 @@ RTN. Finding #38's relu² down-proj AWQ collapse **does NOT reproduce at Ultra**
 precondition is present (99.74% near-zero channels) but AWQ's grid rejects the degenerate scales (range
 ≈1, not ≈1e6, so the folded `1/s` never blows up). Caveat: L1-only + activation-weighted recon ("far
 more e2e-predictive than raw recon" per `bake/calibrate.py`, but NOT e2e ppl — U3 is the arbiter).
-**U2 next** = full int4-AWQ g64 + int8 bake (layer-streamed, hours, solo) → `…-quanta_int4awq_g64`
-(RTN the known-good fallback if U3 ppl regresses). The InternLM2.5 MInference track below
-is **paused at M6 ✅ (M7 deferred)**, not abandoned.
+**U2 ✅** = full int4-AWQ g64 + int8 bake (`parity/run_bake_nemotron_ultra_int4awq_g64.py`, 0.48h solo) →
+`…-quanta_int4awq_g64`: 108 layers / 48 moe / 512 experts, **warm 24,235/24,576 (98.6%)** real AWQ scales,
+341 cold→plain int4 RTN; **artifact audited self-contained + fully covered** (no symlinks, zero external
+refs in index/manifest/config, weight_map relative, 42/42 shards, tokenizer in-artifact, manifest
+`format=quanta` 49,983 tensors, all 108 layers + 512 up/512 down experts/moe + embed/head/norm_f);
+**resident 336 GiB** (≤490.4, 154 GiB headroom — NB exceeds the U0 289.7 projection, which tracked only
+the routed int4-g64 portion and under-counted the int8 dense + bf16 core; reconcile
+`nemotron_ultra_fit_test.py`, non-blocking). **U3 next** = teacher-forced ppl + top-1 vs the bf16
+reference (stop {2,11}) — the AWQ-vs-RTN e2e arbiter (RTN `expert_method="rtn"` the known-good fallback
+if U3 regresses). The InternLM2.5 MInference track below is **paused at M6 ✅ (M7 deferred)**, not abandoned.
 
 **Paused: InternLM2.5 sparse-prefill (MInference family) — M6 ✅, M7 next.** Handover
 **`PLAN_minference.md`**. Reuse the validated block-sparse substrate (`quanta.modeling.xattention`,
