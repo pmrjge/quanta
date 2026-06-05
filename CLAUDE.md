@@ -67,12 +67,16 @@ resident-decode stream first; that path is already coded — built+gated for Sup
 `moe.py`/`runtime.py`): **M1 ✅** — `NemotronQuantizedMoE` gather_qmm over packed int4-g64 stacks ==
 dequant bf16 reference at Ultra L1 (512 experts, latent 2048 / inter 5120), **rel err 0.028% « 2%**
 (`parity/nemotron_ultra_qmoe_test.py`, quantized side built by the *real* runtime constructor
-`build_resident_block(art, cfg, 1).mixer`; RTN ⇒ s=1, gather_qmm decodes the same grid). **M2 next** =
-full-resident e2e ppl — load `NemotronResidentModel` over the 306 GiB RTN artifact (solo) and confirm
-ppl == the U3 streamed-dequant RTN reference **3.845** (covers the dense mamba/attn int8 wiring too).
-Remaining U4 streams (each behind a flag, ppl-equivalent): MTP spec-decode, paged-KV on the 12 attn
-layers, batched decode + Mamba-state batching. The InternLM2.5 MInference track below is **paused at
-M6 ✅ (M7 deferred)**, not abandoned.
+`build_resident_block(art, cfg, 1).mixer`; RTN ⇒ s=1, gather_qmm decodes the same grid). **M2 ✅** =
+full-resident e2e ppl — loaded `NemotronResidentModel` over the **306 GiB RTN artifact** RAM-resident
+(solo, 400 GiB wired, load 1.9 min, freed clean) and teacher-forced the **same** U3 1024-tok corpus
+(metric imported verbatim): **ppl 3.839 / acc 0.646** == U3 streamed-dequant RTN ref **3.845 / 0.644**,
+**Δ −0.1% « 2% — PASS** (`parity/nemotron_ultra_resident_ppl.py`; the −0.006 is resident bf16-head vs
+streamed fp32-head, within noise). **Packed-int4 + gather_qmm stream COMPLETE e2e** — M1 gated the MoE
+at one layer, M2 ran the whole 108-layer resident model so it also covers the **dense mamba/attn int8
+`QuantizedLinear` wiring** end-to-end. Remaining U4 streams (each behind a flag, ppl-equivalent, not
+started): MTP spec-decode, paged-KV on the 12 attn layers, batched decode + Mamba-state batching. The
+InternLM2.5 MInference track below is **paused at M6 ✅ (M7 deferred)**, not abandoned.
 
 **Paused: InternLM2.5 sparse-prefill (MInference family) — M6 ✅, M7 next.** Handover
 **`PLAN_minference.md`**. Reuse the validated block-sparse substrate (`quanta.modeling.xattention`,

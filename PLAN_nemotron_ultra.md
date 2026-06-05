@@ -134,10 +134,18 @@ port; closest template `src/quanta/qwen35/`.
     (~5.4 GiB packed + ~21.5 GiB bf16 ref). **rel err 0.0282% « 2% gate** — the packed-int4 decode
     path is output-equivalent to dequant (RTN ⇒ s=1, no AWQ rescale; gather_qmm decodes the same
     grid). Mirrors the Super `nemotron_qmoe_test` gate at Ultra scale + the shipped RTN artifact.
-  - **U4/M2 next — full-resident e2e ppl @ Ultra.** Load `NemotronResidentModel` over the 306 GiB
-    RTN artifact (solo, ~306 GiB wired) and teacher-force the U3 1024-tok corpus; gate ppl == the U3
-    streamed-dequant RTN reference (**3.845**) → confirms the whole resident gather_qmm /
-    int8-`QuantizedLinear` forward (incl. the dense mamba/attn wiring) is output-equivalent e2e.
+  - **U4/M2 ✅ — full-resident e2e ppl @ Ultra.** `parity/nemotron_ultra_resident_ppl.py`: load
+    `NemotronResidentModel` over the **306 GiB RTN artifact** RAM-resident (solo, 400 GiB wired —
+    load 1.9 min, peaks ~306 GiB, freed clean) and teacher-force the **same** U3 1024-tok `LONG_PROSE`
+    corpus (metric `_ppl_acc` imported verbatim, so directly comparable). **ppl 3.839 / acc 0.646**
+    vs the U3 streamed-dequant RTN reference **3.845 / 0.644** — **Δ −0.1% « 2% gate, PASS** (the
+    −0.006 is the resident bf16-head vs streamed fp32-head difference, within noise; forward 11.3s).
+    Closes the packed-int4 + gather_qmm stream **end-to-end**: M1 gated the MoE at one layer; M2 runs
+    the whole 108-layer resident model, so it also covers the **dense mamba/attn int8
+    `QuantizedLinear` wiring** end-to-end. The resident gather_qmm / int8-QuantizedLinear forward is
+    output-equivalent e2e to the dequant reference at full Ultra scale.
+  - **U4 remaining streams** (each behind a flag, ppl-equivalent, not started): MTP spec-decode,
+    paged-KV on the 12 attn layers, batched decode + Mamba-state batching.
 
 ### Mellum2 (after Ultra)
 - **M0** — new `src/quanta/mellum/`: config + reference forward (dual-RoPE per `layer_types` +
