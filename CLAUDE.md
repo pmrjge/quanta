@@ -74,9 +74,22 @@ full-resident e2e ppl — loaded `NemotronResidentModel` over the **306 GiB RTN 
 **Δ −0.1% « 2% — PASS** (`parity/nemotron_ultra_resident_ppl.py`; the −0.006 is resident bf16-head vs
 streamed fp32-head, within noise). **Packed-int4 + gather_qmm stream COMPLETE e2e** — M1 gated the MoE
 at one layer, M2 ran the whole 108-layer resident model so it also covers the **dense mamba/attn int8
-`QuantizedLinear` wiring** end-to-end. Remaining U4 streams (each behind a flag, ppl-equivalent, not
-started): MTP spec-decode, paged-KV on the 12 attn layers, batched decode + Mamba-state batching. The
-InternLM2.5 MInference track below is **paused at M6 ✅ (M7 deferred)**, not abandoned.
+`QuantizedLinear` wiring** end-to-end. **U4 next stream = native MTP spec-decode** (user-picked;
+`mtp.py`/`spec.py` + the model-free `nemotron_mtp_spec_test` were built for Super but the head was never
+baked/loaded — task #40): **MTP-M0 ✅** — native MTP draft-head **bf16 numeric parity** at full Ultra
+scale (`parity/nemotron_ultra_mtp_parity.py`): build `NemotronMTPModule` (fuse `eh_proj(concat([enorm(
+embed), hnorm(prev_hidden)]))` → attn sub-block `mtp.layers.0` → 512-expert relu² latent-moe
+`mtp.layers.1` → final_layernorm → shared head), fill from the source's **1040 `mtp.*` tensors** (rule-6
+coverage 1040/1040), diff vs an **independent inline reference** (raw-mx fusion/pre-norms/residuals/
+readout + U1-gated standalone mixers) — **logits Δ 0.0 / new_hidden Δ 0.0 (bit-identical)**, rule-8
+streamed (the 512-expert ~21.5 GiB bf16 stack the peak, solo). Gates the head's *structural assembly*;
+the *functional* accept-rate is the separate **MTP-M2** gate (losslessness holds for ANY head quality —
+the main model verifies every draft). **MTP-M1 next** = bake the head (int4-RTN experts + int8 dense +
+bf16 core, same policy; `quant_policy` already classifies `mtp.*`) into a sidecar; **MTP-M2** = loader +
+resident spec-contract adapter (`offset`/`make_caches`/`truncate`) + real lossless accept-rate gate (spec
+== greedy; mean_accept + speedup, k∈{1,2,3}). Other U4 streams (not started): paged-KV on the 12 attn
+layers, batched decode + Mamba-state batching. The InternLM2.5 MInference track below is **paused at M6 ✅
+(M7 deferred)**, not abandoned.
 
 **Paused: InternLM2.5 sparse-prefill (MInference family) — M6 ✅, M7 next.** Handover
 **`PLAN_minference.md`**. Reuse the validated block-sparse substrate (`quanta.modeling.xattention`,

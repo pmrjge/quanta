@@ -144,8 +144,28 @@ port; closest template `src/quanta/qwen35/`.
     the whole 108-layer resident model, so it also covers the **dense mamba/attn int8
     `QuantizedLinear` wiring** end-to-end. The resident gather_qmm / int8-QuantizedLinear forward is
     output-equivalent e2e to the dequant reference at full Ultra scale.
-  - **U4 remaining streams** (each behind a flag, ppl-equivalent, not started): MTP spec-decode,
-    paged-KV on the 12 attn layers, batched decode + Mamba-state batching.
+  - **U4 / MTP spec-decode — native MTP self-speculation** (user-picked next stream; #40). `mtp.py` /
+    `spec.py` (draft head + lossless k≥1 / chained / tree / batched verify) and the model-free
+    `nemotron_mtp_spec_test` were already built (for Super), but the head was never baked/loaded.
+    - **MTP-M0 ✅ — native MTP draft-head bf16 numeric parity @ Ultra.**
+      `parity/nemotron_ultra_mtp_parity.py`: build `NemotronMTPModule` (fuse
+      `eh_proj(concat([enorm(embed), hnorm(prev_hidden)]))` → attn sub-block `mtp.layers.0` →
+      512-expert relu² latent-moe `mtp.layers.1` → final_layernorm → shared head), fill from the
+      source's **1040 `mtp.*` tensors** (rule-6 coverage 1040/1040), diff vs an independent inline
+      reference (raw-mx fusion/pre-norms/residuals/readout + U1-gated standalone `NemotronAttention` /
+      `NemotronLatentMoE`): **logits Δ 0.0 / new_hidden Δ 0.0 (bit-identical)**. Rule-8 streamed (the
+      512-expert ~21.5 GiB bf16 stack the peak, solo). Gates the head's *structural assembly*; the
+      *functional* accept-rate is the separate MTP-M2 gate (losslessness holds for any head quality —
+      the main model verifies every draft, rule 4).
+    - **MTP-M1 next** — bake the head: int4-RTN experts + int8 dense + bf16 core (same policy as the
+      backbone; `quant_policy` already classifies `mtp.*`), into a sidecar of the int4-RTN artifact;
+      gate baked-head forward ≈ bf16-head forward (recon).
+    - **MTP-M2** — loader (`NemotronMTP` from the baked `mtp.*`) + resident spec-contract adapter on
+      `NemotronResidentModel` (`offset` / `make_caches` / `truncate`); real lossless accept-rate gate:
+      `spec_generate(_k)` output == greedy on real prose, report mean_accept + decode speedup for
+      k ∈ {1, 2, 3}.
+  - **U4 remaining streams** (each behind a flag, ppl-equivalent, not started): paged-KV on the 12 attn
+    layers, batched decode + Mamba-state batching.
 
 ### Mellum2 (after Ultra)
 - **M0** — new `src/quanta/mellum/`: config + reference forward (dual-RoPE per `layer_types` +
