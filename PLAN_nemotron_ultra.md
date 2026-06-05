@@ -122,9 +122,22 @@ port; closest template `src/quanta/qwen35/`.
   49,983 manifest tensors, format=quanta, 39 shards, tokenizer in-artifact). Files:
   `parity/run_bake_nemotron_ultra_int4rtn_g64.py`, `parity/nemotron_ultra_ppl.py`.
 - **U4 — optimizations**, each behind a flag and ppl-equivalent: native **MTP spec-decode**
-  (`spec.py`/`mtp.py`), **paged-KV** on the 12 attn layers (port #153 loop-kill), packed int4 experts
-  + `gather_qmm` (already in `moe.py`), batched decode + Mamba-state batching (`batched_runtime.py`).
-  MInference sparse-prefill only if long-ctx attn-layer prefill proves a bottleneck (just 12 layers).
+  (`spec.py`/`mtp.py`), **paged-KV** on the 12 attn layers (port #153 loop-kill), **packed int4
+  experts + `gather_qmm`** (the resident decode path — already coded in `moe.py`/`runtime.py`,
+  built+gated for Super-120B, now validated at Ultra scale on the RTN artifact), batched decode +
+  Mamba-state batching (`batched_runtime.py`). MInference sparse-prefill only if long-ctx attn-layer
+  prefill proves a bottleneck (just 12 layers). **Stream chosen first (user): packed int4 + gather_qmm.**
+  - **U4/M1 ✅ — resident-MoE numeric parity @ Ultra.** `parity/nemotron_ultra_qmoe_test.py`:
+    `NemotronQuantizedMoE` (gather_qmm over packed int4-g64 stacks, built by the *real* runtime
+    constructor `build_resident_block(art, cfg, 1).mixer`) vs `NemotronLatentMoE` (gather_mm on the
+    artifact's dequantized weights), real Ultra L1 (512 experts, latent 2048, inter 5120), rule-8
+    (~5.4 GiB packed + ~21.5 GiB bf16 ref). **rel err 0.0282% « 2% gate** — the packed-int4 decode
+    path is output-equivalent to dequant (RTN ⇒ s=1, no AWQ rescale; gather_qmm decodes the same
+    grid). Mirrors the Super `nemotron_qmoe_test` gate at Ultra scale + the shipped RTN artifact.
+  - **U4/M2 next — full-resident e2e ppl @ Ultra.** Load `NemotronResidentModel` over the 306 GiB
+    RTN artifact (solo, ~306 GiB wired) and teacher-force the U3 1024-tok corpus; gate ppl == the U3
+    streamed-dequant RTN reference (**3.845**) → confirms the whole resident gather_qmm /
+    int8-`QuantizedLinear` forward (incl. the dense mamba/attn wiring) is output-equivalent e2e.
 
 ### Mellum2 (after Ultra)
 - **M0** — new `src/quanta/mellum/`: config + reference forward (dual-RoPE per `layer_types` +

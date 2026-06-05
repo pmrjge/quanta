@@ -62,9 +62,17 @@ more tokens, +11.2%→+24.3%; the U2 recon de-risk could not see it — recon �
 **finding #38 reproduced e2e** and the RTN fallback ships: `expert_method="rtn"`, data-free bake
 (`parity/run_bake_nemotron_ultra_int4rtn_g64.py`, 0.10h, warm_experts 0; inventory-identical to AWQ),
 same 4-bit footprint, **306 GiB resident (30 GiB < AWQ's 336** — RTN stores bf16 vs AWQ's fp32 expert
-scales). AWQ artifact retired. **U4 next** = optimizations behind flags (MTP spec-decode, paged-KV on
-the 12 attn layers, packed int4 + `gather_qmm`, batched decode + Mamba-state batching). The InternLM2.5
-MInference track below is **paused at M6 ✅ (M7 deferred)**, not abandoned.
+scales). AWQ artifact retired. **U4 in progress** (user picked the **packed int4 + `gather_qmm`**
+resident-decode stream first; that path is already coded — built+gated for Super-120B in
+`moe.py`/`runtime.py`): **M1 ✅** — `NemotronQuantizedMoE` gather_qmm over packed int4-g64 stacks ==
+dequant bf16 reference at Ultra L1 (512 experts, latent 2048 / inter 5120), **rel err 0.028% « 2%**
+(`parity/nemotron_ultra_qmoe_test.py`, quantized side built by the *real* runtime constructor
+`build_resident_block(art, cfg, 1).mixer`; RTN ⇒ s=1, gather_qmm decodes the same grid). **M2 next** =
+full-resident e2e ppl — load `NemotronResidentModel` over the 306 GiB RTN artifact (solo) and confirm
+ppl == the U3 streamed-dequant RTN reference **3.845** (covers the dense mamba/attn int8 wiring too).
+Remaining U4 streams (each behind a flag, ppl-equivalent): MTP spec-decode, paged-KV on the 12 attn
+layers, batched decode + Mamba-state batching. The InternLM2.5 MInference track below is **paused at
+M6 ✅ (M7 deferred)**, not abandoned.
 
 **Paused: InternLM2.5 sparse-prefill (MInference family) — M6 ✅, M7 next.** Handover
 **`PLAN_minference.md`**. Reuse the validated block-sparse substrate (`quanta.modeling.xattention`,
