@@ -279,8 +279,22 @@ port; closest template `src/quanta/qwen35/`.
       sequential incl. replica fidelity/divergence; `nemotron_tree_spec_test.py`: tree==greedy for any MTP
       quality) — MTP-M4 adds the WEIGHT-level parity + the real-head economics the headless artifact made
       impossible.
-  - **U4 remaining streams** (each behind a flag, ppl-equivalent, not started): paged-KV on the 12 attn
-    layers, batched decode + Mamba-state batching.
+  - **U4/paged-KV ✅ — real-Ultra paged==discrete gate (the deferred #152 rule-4 ship gate).**
+    `parity/nemotron_ultra_paged_real_test.py` (solo ~306 GiB, no MTP sidecar). The paged contract
+    (`make_paged_state` / `prefill_paged` / `step_batch(paged_batched=…)` + the #153 batched-KV
+    loop-kill) was already built on `NemotronBatchedResidentModel`, model-free-green
+    (`paged_engine_equiv_test.py`) and Super-120B-green (#174); only the real-Ultra-artifact gate was
+    "deferred, one model at a time" (`batched_runtime.py:613`). Drives the real serving path
+    (`_BaseBatchedSession` paged mode): seq A stores a 32-tok/2-block prefix's int8 KV across all **12**
+    attention layers + the Mamba recurrent boundary; seq B reuses them + suffix-only prefill; 10 greedy
+    steps. **paged == discrete top-1 10/10 (bit-exact)**, 12-attn-layer coverage (derived from the
+    artifact, not the Super's 8), prefix reused 32 tok/2 blocks, recurrent boundary restored 1/1, engine
+    `get_cache_stats()` agrees; logit max-abs 0.875 INFO (chunked-Mamba-prefill + int8-KV reblock,
+    bf16-ULP class — top-1, the rule-4 arbiter, never flips over 10 steps). The #153 loop-kill's
+    *throughput* win (B>1 decode tok/s) folds into the multi-stream stream (MTP-M4: Ultra's per-stream
+    Mamba loop, 48/108 layers, caps the attention-KV-only amortization on a hybrid).
+  - **U4 remaining streams** (each behind a flag, ppl-equivalent, not started): multi-stream B>1 decode +
+    Mamba-state batching, fused multi-token verify kernel (the B=1 latency lever).
 
 ### Mellum2 (after Ultra)
 - **M0** — new `src/quanta/mellum/`: config + reference forward (dual-RoPE per `layer_types` +

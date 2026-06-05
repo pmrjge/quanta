@@ -180,8 +180,25 @@ hybrid the experts are NOT the single dominator). **So tree-verify is a serving-
 lever, not a single-stream B=1 latency lever** — and even for throughput the per-stream Mamba loop caps the
 amortization on a hybrid. The decisive B=1 latency lever stays a **fused multi-token verify kernel**; the B>1
 win wants genuine **multi-stream decode** (independent requests, not path-replication) + Mamba-state batching.
-Other U4 streams (not started): paged-KV on the 12 attn layers, batched decode + Mamba-state batching. The
-InternLM2.5 MInference track below is **paused at M6 ✅ (M7 deferred)**, not abandoned.
+**U4/paged-KV ✅** — the deferred rule-4 **real-Ultra** gate for the #152 paged contract. The whole contract
+(`make_paged_state`/`prefill_paged`/`step_batch(paged_batched=…)` + the #153 batched-KV loop-kill) was already
+built on `NemotronBatchedResidentModel`, model-free-green (`paged_engine_equiv_test.py`) AND real-green on the
+**Super-120B** sibling (#174 `nemotron_paged_real_test.py`); only the real-Ultra-artifact gate was "deferred,
+one model at a time" (`batched_runtime.py:613`). `parity/nemotron_ultra_paged_real_test.py` (solo ~306 GiB, NO
+MTP sidecar — paged-KV is backbone-only) closes it: drives the real serving path (`_BaseBatchedSession` paged
+mode) — seq A stores a 32-tok/2-block prefix's int8 KV across all **12** attention layers + the Mamba recurrent
+boundary snapshot, seq B reuses them and prefills only the 5-tok suffix, then 10 greedy steps. **paged ==
+discrete top-1 10/10 (bit-exact)**; the paged manager covers exactly **12** attn layers (the count
+`paged_kv_spec` derives from the artifact — NOT the Super's 8, the one thing that could have been stale at Ultra
+scale); prefix reused 32 tok/2 blocks; recurrent boundary restored (snapshot 1/1); engine `get_cache_stats()`
+agrees. logit max-abs 0.875 is INFO-only — the chunked-Mamba-SSD prefill resumed from the boundary + the
+int8-KV reblock perturb logits at the **bf16-ULP class M2/M3 documented**, but top-1 (the rule-4 arbiter for
+paged==discrete) never flips over 10 steps. So the paged contract is real-green at Ultra scale; the #153
+loop-kill's *throughput* win (B>1 decode tok/s, +18% on Super) folds into the next stream — where MTP-M4 already
+flagged that Ultra's per-stream Mamba loop (48/108 layers) caps the attention-KV-only amortization on a hybrid.
+Remaining U4 streams (each behind a flag, not started): **multi-stream B>1 decode + Mamba-state batching**,
+**fused multi-token verify kernel** (the B=1 latency lever). The InternLM2.5 MInference track below is **paused
+at M6 ✅ (M7 deferred)**, not abandoned.
 
 **Paused: InternLM2.5 sparse-prefill (MInference family) — M6 ✅, M7 next.** Handover
 **`PLAN_minference.md`**. Reuse the validated block-sparse substrate (`quanta.modeling.xattention`,
