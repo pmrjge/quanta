@@ -49,9 +49,10 @@ context length is too short for the orchestrator role.
 
 - Ultra **int4-RTN g64** mix **306 GiB resident** (U3-shipped; `du` of the baked artifact: int4 routed
   + int8 dense + bf16 core — **30 GiB under the retired AWQ 336**, since RTN stores bf16 vs AWQ's fp32
-  expert scales). Headroom **184 GiB** for KV + activations. (NB the U0 fit projection of 289.7 GiB
-  under-counted — it tracked the routed int4-g64 portion only; reconcile `nemotron_ultra_fit_test.py`,
-  non-blocking since 306 ≤ 490.4 fits.) Only **12 / 108** layers carry growing KV — the 48 Mamba layers
+  expert scales). Headroom **184 GiB** for KV + activations. (The U0 fit projection said 289.7 GiB but
+  hardcoded **g128**; **RECONCILED** — `quant_policy` → g64 + the per-expert bf16 `awq_scale` vector →
+  **305.9 GiB**, and the fit-test now cross-checks the projection against the on-disk backbone, Δ 0.01%
+  vs 306.0 GiB.) Only **12 / 108** layers carry growing KV — the 48 Mamba layers
   have **O(1)** state (a real long-context win at 256K).
 - Second-model (MiniMax-M3) footprint TBD once weights ship.
 
@@ -62,8 +63,9 @@ context length is too short for the orchestrator role.
   checkpoint schemas via `_hybrid_pattern` (compact letter string **or** explicit
   `layers_block_type` list). Gate `parity/nemotron_ultra_fit_test.py`: Ultra parses, derived split
   reproduces the explicit list bit-for-bit, **quant policy covers all 51,023 tensors** (rule #6),
-  and the mix **fits 289.7 GiB ≤ 490.4** (200.7 GiB headroom). Super (old schema) backward-compat
-  green. Files: `src/quanta/nemotron/config.py`, `parity/nemotron_ultra_fit_test.py`.
+  and the mix **fits 305.9 GiB ≤ 490.4** (184.5 GiB headroom; g64-faithful + per-expert `awq_scale`,
+  cross-checked Δ 0.01% vs the 306.0 GiB on-disk backbone — the original 289.7 used g128). Super (old
+  schema) backward-compat green. Files: `src/quanta/nemotron/config.py`, `parity/nemotron_ultra_fit_test.py`.
 - **U1 ✅ — per-layer numeric parity vs an independent transformers `NemotronH*` reference**, at full
   Ultra scale, layer-streamed (rule 8: one real layer resident; the moe's ~21.5 GiB bf16 expert stacks
   the peak — the 1023 GiB whole model is never loaded, and the transformers MoE's 512 experts stay on

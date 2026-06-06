@@ -1,12 +1,13 @@
 """Per-tensor quantization policy for the Nemotron-H bake (the int4/int8/bf16 mix).
 
-Fit is **not** the constraint (247 GB bf16 < 490 GiB), so the mix is a decode-bandwidth play:
+For **Super-120B** the bf16 model fits (~247 GiB < 490), so the mix is purely a decode-bandwidth
+play; for **Ultra-550B** the bf16 model is ~1023 GiB and does NOT fit, so the int4 mix (~306 GiB
+resident) is what lets it serve at all. Both ship at **group-size 64**:
 
-  * **routed relu^2 experts** (the ~113B bulk, sparse top-22) -> ``int4`` GPTQ g128
-    (the bf16 source gives the headroom Kimi's int4 source never had);
-  * **dense always-on** (mamba in/out-proj, attention q/k/v/o, shared experts, MoE latent
-    proj, MTP eh_proj) -> ``int8`` affine g128 — this path sets the decode floor here
-    (inverted vs Kimi, where experts dominated);
+  * **routed relu^2 experts** (the sparse top-k bulk) -> ``int4`` g64 (RTN — AWQ regressed e2e on
+    the relu^2 down-proj, #38). The bf16 source gives the headroom Kimi's int4 source never had;
+  * **dense always-on** (mamba in/out-proj, attention q/k/v/o, shared experts, MoE latent proj,
+    MTP eh_proj) -> ``int8`` affine g64 — this path sets the decode floor here (inverted vs Kimi);
   * **SSM core** (``A_log``/``D``/``dt_bias``/``conv1d``), all norms, router gate + correction
     bias, embeddings, and lm_head -> ``bf16`` (recurrence stability + logit sensitivity; small
     fraction of bytes).
@@ -35,8 +36,8 @@ class QScheme:
         return (self.bits + 32 / self.group_size) / 8  # affine: + per-group scale/zero overhead
 
 
-INT4_GPTQ = QScheme("int4_gptq", 4, 128)
-INT8 = QScheme("int8_affine", 8, 128)
+INT4_GPTQ = QScheme("int4_gptq", 4, 64)   # both Nemotron bakes ship g64 (…-quanta_int4{rtn,awq}_g64)
+INT8 = QScheme("int8_affine", 8, 64)      # dense shares the experts' group size (bake.py: one `gs`)
 BF16 = QScheme("bf16", 16, 0)
 
 _BYTES = {INT4_GPTQ.kind: INT4_GPTQ.bytes_per_param, INT8.kind: INT8.bytes_per_param,
@@ -82,7 +83,16 @@ def bake_plan(tensor_names) -> dict[str, QScheme]:
 
 
 def estimate_storage(cfg: NemotronHConfig) -> dict:
-    """Analytic storage of the quant mix vs bf16 (backbone only; ignores the ~2.8B MTP head)."""
+    """Analytic storage of the shipped int4-RTN/AWQ g64 mix vs bf16 (backbone only; ignores the
+    ~2.8B MTP sidecar).
+
+    Faithful to the as-baked artifact (rule #6 — the fit gate must match what ships): each affine
+    group stores a bf16 scale + bf16 zero (= 32 bits/group, the ``32/group_size`` term in
+    :attr:`QScheme.bytes_per_param`), and every routed expert additionally stores a per-input-channel
+    bf16 ``awq_scale`` vector (``ones`` under RTN, real scales under AWQ — same bytes either way). At
+    g64 this projects ~305.9 GiB, matching the 305.97 GiB on-disk Ultra backbone
+    (``…-quanta_int4rtn_g64``); the prior g128 sizing under-counted by ~16 GiB (the U0 fit-test
+    cross-checks the projection against the real artifact)."""
     h = cfg.hidden_size
     counts = {INT4_GPTQ.kind: 0, INT8.kind: 0, BF16.kind: 0}
 
@@ -107,11 +117,16 @@ def estimate_storage(cfg: NemotronHConfig) -> dict:
     add(BF16, 2 * cfg.vocab_size * h + h)  # embeddings + lm_head + final norm
 
     gib = {k: counts[k] * _BYTES[k] / 2**30 for k in counts}
+    # per-routed-expert awq_scale vector (bf16, one per input channel: up<-latent, down<-intermediate);
+    # stored for EVERY expert — the runtime always divides by a scale (`ones` in the RTN bake, #38)
+    scale_overhead_gib = (cfg.count("moe") * cfg.n_routed_experts
+                          * (cfg.moe_latent_size + cfg.moe_intermediate_size) * 2) / 2**30
     total_params = sum(counts.values())
     return {
         "params": counts,
         "gib": gib,
+        "scale_overhead_gib": scale_overhead_gib,
         "total_params": total_params,
-        "total_gib_mix": sum(gib.values()),
+        "total_gib_mix": sum(gib.values()) + scale_overhead_gib,
         "total_gib_bf16": total_params * 2 / 2**30,
     }

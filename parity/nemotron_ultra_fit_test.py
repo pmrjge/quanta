@@ -28,6 +28,7 @@ from quanta.nemotron.quant_policy import bake_plan, estimate_storage
 
 ULTRA = "/Users/pmrj/models/NVIDIA-Nemotron-3-Ultra-550B-A55B-BF16"
 SUPER = "/Users/pmrj/models/NVIDIA-Nemotron-3-Super-120B-A12B-BF16"
+ART_RTN = "/Users/pmrj/models/NVIDIA-Nemotron-3-Ultra-550B-A55B-quanta_int4rtn_g64"  # the shipped backbone
 CEILING_GIB = 490.4  # M3 Ultra recommended max working set (CLAUDE.md)
 
 
@@ -66,6 +67,15 @@ def run() -> None:
     mix, bf16 = est["total_gib_mix"], est["total_gib_bf16"]
     fits = mix <= CEILING_GIB
 
+    # 5b. faithfulness cross-check (rule #6): the analytic projection matches the on-disk backbone, not
+    #     just itself — the g64 mix + per-expert awq_scale must land on the bytes the runtime loads
+    #     RAM-resident. Sums shard sizes only (no weights read); skipped pre-bake when the artifact is
+    #     absent. Catches a sizing drift (e.g. the old g128 under-count) before any multi-hour bake.
+    art = Path(ART_RTN)
+    shards = sorted(art.glob("*.safetensors")) if art.exists() else []
+    on_disk = sum(p.stat().st_size for p in shards) / 2**30 if shards else None
+    disk_ok = on_disk is None or abs(mix - on_disk) / on_disk < 0.01
+
     # 6. backward-compat: the Super (old-schema) config still parses through the shared adapter
     sup = NemotronHConfig.from_pretrained(SUPER)
     super_ok = (sup.num_hidden_layers == 88 and sup.count("attention") == 8
@@ -77,15 +87,23 @@ def run() -> None:
     print(f"key dims (8192/512e/top-22)    : {dims_ok}")
     print(f"quant policy coverage         : {len(plan)} tensors -> {dict(by_scheme)}")
     print(f"resident mix                  : {mix:.1f} GiB  (bf16 {bf16:.1f} GiB, {bf16 / mix:.1f}x)")
-    print(f"  by scheme (GiB)             : {dict((k, round(v, 1)) for k, v in est['gib'].items())}")
+    print(f"  by scheme (GiB)             : {dict((k, round(v, 1)) for k, v in est['gib'].items())} "
+          f"+ {est['scale_overhead_gib']:.1f} expert-scale")
+    if on_disk is not None:
+        print(f"  on-disk backbone (g64)      : {on_disk:.1f} GiB over {len(shards)} shards  "
+              f"(projection Δ {abs(mix - on_disk):.2f} GiB, {abs(mix - on_disk) / on_disk:.2%})")
+    else:
+        print("  on-disk cross-check         : skipped (artifact absent — pre-bake projection only)")
     print(f"fits <= {CEILING_GIB} GiB           : {fits}  (headroom {CEILING_GIB - mix:.1f} GiB)")
     print(f"Super old-schema parses       : {super_ok}")
     print("  note: backbone-only; +~2.8B MTP head ~1-2 GiB more (still well under).")
 
     assert fits, f"Ultra int4 mix {mix:.1f} GiB exceeds the {CEILING_GIB} GiB ceiling"
+    assert disk_ok, f"projection {mix:.1f} GiB drifted from on-disk {on_disk:.1f} GiB (>1%)"
     assert mix < bf16 and super_ok
-    print(f"PASS — Ultra parses (new schema), policy covers all {len(plan)} tensors, "
-          f"resident {mix:.1f} GiB under {CEILING_GIB} GiB.")
+    print(f"PASS — Ultra parses (new schema), policy covers all {len(plan)} tensors, resident "
+          f"{mix:.1f} GiB under {CEILING_GIB} GiB" + ("" if on_disk is None else
+          f" (matches the {on_disk:.1f} GiB on-disk backbone)") + ".")
 
 
 if __name__ == "__main__":

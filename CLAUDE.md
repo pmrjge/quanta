@@ -26,8 +26,9 @@ mid-session and the U2 slice de-risk cleared AWQ on *recon*, but **U3's e2e ppl 
 int4-RTN ships** — recon ≠ e2e, see below); **one model resident at a time**; drive Ultra to completion. **U0 ✅** — config adapter (`_hybrid_pattern`
 normalises the newer explicit-`layers_block_type` schema, which omits `num_hidden_layers`) +
 fit-check: Ultra parses, the derived split reproduces the explicit list bit-for-bit, the quant policy
-covers all 51,023 tensors (rule #6), and the mix is resident at **289.7 GiB ≤ 490.4** (200.7 GiB
-headroom) — `parity/nemotron_ultra_fit_test.py`. **U1 ✅** — per-layer numeric parity vs an
+covers all 51,023 tensors (rule #6), and the mix is resident at **305.9 GiB ≤ 490.4** (184.5 GiB
+headroom — the original U0 projection said 289.7 but used g128; **reconciled**, see below) —
+`parity/nemotron_ultra_fit_test.py`. **U1 ✅** — per-layer numeric parity vs an
 **independent transformers `NemotronH*` reference** at full Ultra scale, layer-streamed (rule 8: one
 real layer resident, the moe's ~21.5 GiB expert stacks the peak), `parity/nemotron_ultra_layer_parity.py`:
 **mamba** our `MambaMixer` vs `NemotronHMamba2Mixer` (fp32, Δ 3.1e-04), **attn** ours vs transformers'
@@ -52,9 +53,13 @@ more e2e-predictive than raw recon" per `bake/calibrate.py`, but NOT e2e ppl —
 341 cold→plain int4 RTN; **artifact audited self-contained + fully covered** (no symlinks, zero external
 refs in index/manifest/config, weight_map relative, 42/42 shards, tokenizer in-artifact, manifest
 `format=quanta` 49,983 tensors, all 108 layers + 512 up/512 down experts/moe + embed/head/norm_f);
-**resident 336 GiB** (≤490.4, 154 GiB headroom — NB exceeds the U0 289.7 projection, which tracked only
-the routed int4-g64 portion and under-counted the int8 dense + bf16 core; reconcile
-`nemotron_ultra_fit_test.py`, non-blocking). **U3 ✅ → SHIP int4-RTN** (`parity/nemotron_ultra_ppl.py`,
+**resident 336 GiB** (≤490.4, 154 GiB headroom — AWQ exceeds RTN's 306 because it stores fp32 affine
+expert scales vs RTN's bf16). **Fit-test RECONCILED** (no longer the stale 289.7): the U0 projection
+hardcoded **g128** but both Nemotron bakes ship **g64** (`…_int4{rtn,awq}_g64`) — `quant_policy`
+constants → g64 + the per-expert bf16 `awq_scale` vector (`ones` under RTN, 0.33 GiB) now modelled →
+**305.9 GiB**, and the fit-test gained a rule-#6 cross-check that the projection matches the on-disk
+backbone (Δ **0.01%** vs 306.0 GiB / 39 shards; Super likewise 68.1==68.1). **U3 ✅ → SHIP int4-RTN**
+(`parity/nemotron_ultra_ppl.py`,
 3 sequential rule-8 streamed forwards over a held-out 1024-tok prose corpus, ≈10× the 109-tok pilot):
 **bf16 ppl 3.835/acc 0.651**, **int4-AWQ 4.766/0.604/Δ +24.3%/agree 0.811**, **int4-RTN 3.845/0.644/Δ
 +0.3%/agree 0.964** — RTN ~lossless, **AWQ regresses hard** (the relu² down-proj tax got *worse* with
