@@ -5,7 +5,8 @@ random weights suffice), tiny sequence — safe alongside the bake (no checkpoin
 loaded; the loader section only reads tensor *shapes* lazily + one tiny tensor).
 
   * MambaMixer:  chunked prefill == token-by-token decode (SSD + conv state)
-  * NemotronAttention: naive == fast (rope+sdpa), and prefill == incremental decode (KV cache)
+  * NemotronAttention: naive == fast (rope+sdpa), and prefill == incremental decode — bf16 KV
+    cache (tight algebraic equivalence) and the #133 int8 KV default (its own per-group quant floor)
   * loader: resolves backbone.* names; tensor shapes match the config dataclass
 
     uv run python -m parity.nemotron_layers_test
@@ -53,9 +54,16 @@ def run() -> None:
     o_fast = attn(xa, offset=0, use_fast=True)
     o_naive = attn(xa, offset=0, use_fast=False)
     nf_ok = _rel(o_fast, o_naive) < 2e-3
-    cache = KVCache()
-    od = [attn(xa[:, t : t + 1], cache=cache, use_fast=True) for t in range(length)]
-    dec_ok = _rel(mx.concatenate(od, axis=1), o_fast) < 2e-3
+    # bf16 KV cache — the algebraic prefill==decode equivalence (append + offset bookkeeping);
+    # tight, since no quantization is involved (this is what the assertion is really checking).
+    cache_bf16 = KVCache(quantized=False)
+    od_bf16 = [attn(xa[:, t : t + 1], cache=cache_bf16, use_fast=True) for t in range(length)]
+    dec_bf16_ok = _rel(mx.concatenate(od_bf16, axis=1), o_fast) < 2e-3
+    # int8 KV cache — the #133 default; the per-group int8 KV quant has its own ~5e-3 floor, so it
+    # is gated at that floor (NOT the bf16 algebraic tolerance), still failing loud on a regression.
+    cache_int8 = KVCache()  # quantized=True since #133
+    od_int8 = [attn(xa[:, t : t + 1], cache=cache_int8, use_fast=True) for t in range(length)]
+    dec_int8_ok = _rel(mx.concatenate(od_int8, axis=1), o_fast) < 8e-3
 
     # --- loader: name resolution + shapes match the config ------------------
     ck = NemotronSourceCheckpoint(MODEL)
@@ -78,10 +86,11 @@ def run() -> None:
     print("\n=== Nemotron-H layers (self-consistency) ===")
     print(f"Mamba mixer prefill == decode        : {mamba_ok}  rel={_rel(mx.concatenate(ys, axis=1), y_pf):.2e}")
     print(f"GQA attention naive == fast          : {nf_ok}  rel={_rel(o_fast, o_naive):.2e}")
-    print(f"GQA attention prefill == decode      : {dec_ok}  rel={_rel(mx.concatenate(od, axis=1), o_fast):.2e}")
+    print(f"GQA attn prefill == decode (bf16 KV) : {dec_bf16_ok}  rel={_rel(mx.concatenate(od_bf16, axis=1), o_fast):.2e}")
+    print(f"GQA attn prefill == decode (int8 KV) : {dec_int8_ok}  rel={_rel(mx.concatenate(od_int8, axis=1), o_fast):.2e}  (#133 floor)")
     print(f"loader names/shapes match config     : {loader_ok}")
     print(f"  in_proj{sh_in} conv{sh_conv} expert_up{sh_up} q_proj{sh_q}")
-    assert all([mamba_ok, nf_ok, dec_ok, loader_ok])
+    assert all([mamba_ok, nf_ok, dec_bf16_ok, dec_int8_ok, loader_ok])
     print("Nemotron-H layers OK (mixer + GQA self-consistent; loader wired)")
 
 
