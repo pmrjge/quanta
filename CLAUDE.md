@@ -227,12 +227,42 @@ correctness limit). Parity self-check green (B=1 fused==loop |Δ|=0, B=4 native=
 overlap rows reproduce 0de52a9). **Confirms the economics batched-SSD-step ceiling**: the per-stream Mamba
 recurrence — NOT memory, NOT MoE bandwidth (both had headroom) — caps the B-amortization, so the ONLY lever
 that lifts aggregate past ~48 tok/s is the batched-SSD-step tune, the **same `mamba_ssd.py` SSD-step surface
-as Stream B's fused multi-token verify kernel** (one kernel effort moves both). **Remaining U4 work:** Stream
-B = build the fused multi-token SSD scan kernel (extend the one-token `_ssd_step_kernel` in `mamba_ssd.py:97`
-to loop T internally carrying state; gate output-equivalent to eager, rule 4, then bench vs the 0.84× B=1
-ceiling) — it subsumes Stream A's optional batched-SSD-step tune (same surface). Stream A's serving
-recommendation is settled: **B≈32 throughput-optimal**. The InternLM2.5 MInference track below is **paused at
-M6 ✅ (M7 deferred)**, not abandoned.
+as Stream B's fused multi-token verify kernel** (one kernel effort moves both). **U4/Stream-B (fused
+multi-token SSD-scan verify) ✅** — built `ssd_scan_fused` (`mamba_ssd.py`: extends the one-token
+`_ssd_step_kernel` to loop T internally, carrying the N=128 state through the `new_state` buffer —
+register-carry would spill — so the whole T-token verify recurrence is **one Metal launch per layer**; at
+T=1 it equals `ssd_step_fused`), wired into `MambaMixer`'s T>1 continuation behind `FUSED_SSD_SCAN`
+(default off, rule 4): when on, a **bit-identical** batched conv (the per-token `causal_conv1d_step`
+rolling window materialised over T + reduced by the SAME `mx.sum` over K, same final `conv_state`) feeds
+one `ssd_scan_fused`; off/T=1 the per-token loop is byte-unchanged. **Gated output-equivalent**: model-free
+(`parity/nemotron_ssd_scan_kernel_test.py`) — scan == per-token `ssd_step` loop rel **2.2e-7** (barely
+compounding over T), T=1 bit-exact to `ssd_step_fused`, batched conv **bit-identical**; real-weight
+per-block (`parity/nemotron_ultra_fused_scan_parity.py`, rule-8 streamed — all **48** mamba blocks, given
+identical inputs) — fused block output == eager **≤1 bf16 ULP** (83/144 bit-identical, worst rel 2.4e-3,
+the abs deltas clean powers of two), conv **bit-identical** everywhere, ssm (fp32) **≤7.6e-6**. **The
+parity gate caught the bf16 cascade** (the CLAUDE.md thesis): a first full-MODEL verify gate FAILED its
+intermediate-state assertion (hiddenΔ 106, convΔ 2.00) **despite perfect top-1 agreement** — per-layer
+tracing showed the bf16-cast mamba output is bit-identical for most layers but the ~2.2e-7 fp32 scan
+reorder occasionally straddles a bf16 boundary and flips a SINGLE ULP (first ~2⁻⁶ at the 2nd mamba layer),
+cascading through clean powers of two (2⁻⁶→2⁻⁴→…→10²) across 108 layers — the **exact M2/M3 settled
+finding** (a single bf16 ULP near-tie cascades chaotically; "spec == T=1 greedy" is the wrong criterion).
+The cascade afflicts ANY ULP-level reorder (bf16 chaos, not a fusion bug), so the honest decisive criterion
+is **per-block equivalence + top-1** (what spec consumes), NOT intermediate-state magnitude; the gate was
+redesigned to per-block. **Bench** (`parity/nemotron_ultra_fused_scan_bench.py`, solo ~313 GiB; E=eager /
+F=fused / FC=fused+compiled, ordered so the only compiled-verify traces are flag-True): t_main 88.8 ms;
+**t_verify F 1.07–1.12× / FC 1.10–1.15× vs eager** (the fused scan removes the per-token *launch* overhead,
+not compute); **best B=1 spec 0.80× (eager ≈ M3 0.79) → 0.90× (F) → 0.92× (FC, draft_topk=8 k=1, accept
+1.66/2) — the best B=1 single-stream spec-decode measured (+15% over the eager ceiling, beats the 0.84×
+compiled ceiling), but STILL <1×**: the fused verify is 1.43–2.01× t_main, the residual T-growth is the
+**unfused MoE `gather_qmm`** (40% per the economics — weight-bandwidth, NOT launch-bound, a scan kernel
+can't touch it). `acc==` shows `!!` at bf16 near-ties (F/FC are ≤1 ULP, not bit-identical — near-ties flip
+across modes; `match` mostly 48/48); losslessness owned by M2 (the int4 main model verifies every draft).
+**So crossing 1× at B=1 now needs the MoE verify cost reduced (bandwidth, not launch — a harder lever); the
+throughput lever stays the already-characterized B>1 tree-verify (MTP-M4).** **Remaining U4 work:** the B=1
+>1× MoE-bandwidth lever (open), and serving-throughput B>1 multi-stream decode (Stream A settled B≈32; the
+#153 loop-kill throughput win folds in). Stream A's serving recommendation is settled: **B≈32
+throughput-optimal**. The InternLM2.5 MInference track below is **paused at M6 ✅ (M7 deferred)**, not
+abandoned.
 
 **Paused: InternLM2.5 sparse-prefill (MInference family) — M6 ✅, M7 next.** Handover
 **`PLAN_minference.md`**. Reuse the validated block-sparse substrate (`quanta.modeling.xattention`,

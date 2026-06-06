@@ -19,6 +19,7 @@ from quanta.nemotron.mamba_ssd import (
     causal_conv1d,
     causal_conv1d_step,
     ssd_chunked,
+    ssd_scan_fused,
     ssd_step,
     ssd_step_fused,
 )
@@ -27,6 +28,15 @@ from quanta.nemotron.mamba_ssd import (
 # win in the compiled decode path (mx.compile already fuses the composed SSD ops: ~34 vs ~35
 # tok/s), so default off per rule-4 (optimizations default to the proven path until a measured win).
 FUSED_SSD_STEP = False
+
+# Opt-in fused **multi-token** SSD scan for the T>1 spec-VERIFY continuation: one Metal launch runs the
+# whole T-token recurrence (vs the per-token step loop below), targeting the verify's launch-bound Mamba
+# T-growth (the dominant verify cost — parity/nemotron_ultra_decode_economics.py; the part mx.compile
+# can't fuse across the sequential T-loop). Output-equivalent to the per-token path (the batched conv is
+# bit-identical; the fused scan matches ssd_step within the ssd_step_fused tolerance). Default off per
+# rule-4 (the proven per-token path until the real-backbone gate + bench prove the win):
+# parity/nemotron_ultra_fused_scan_parity.py gates it; nemotron_ultra_fused_scan_bench.py measures it.
+FUSED_SSD_SCAN = False
 
 
 def _silu(x: mx.array) -> mx.array:
@@ -143,18 +153,35 @@ class MambaMixer(nn.Module):
             if state is None:
                 state = mx.zeros((b, self.h, self.n, self.p), dtype=x.dtype)
             dt_all = _softplus(dt + self.dt_bias)
-            step_fn = ssd_step_fused if FUSED_SSD_STEP else ssd_step
-            ys: list[mx.array] = []
-            for ti in range(t):
-                conv_out, conv_state = causal_conv1d_step(
-                    xbc[:, ti], self.conv_weight, conv_state, self.conv_bias,
-                )
-                xs_t, bm_t, cm_t = self._split_xbc(_silu(conv_out)[:, None], b, 1)
-                y_t, state = step_fn(
-                    xs_t[:, 0], dt_all[:, ti], a, bm_t[:, 0], cm_t[:, 0], self.D, state,
-                )
-                ys.append(y_t[:, None])
-            y = ys[0] if t == 1 else mx.concatenate(ys, axis=1)
+            if FUSED_SSD_SCAN and t > 1:
+                # Fused multi-token continuation (opt-in, rule 4): a **bit-identical** batched conv —
+                # the per-token ``causal_conv1d_step`` rolling window materialised over T and reduced by
+                # the SAME ``mx.sum`` over the K axis, with the SAME final ``conv_state`` (the raw last
+                # k-1 of [restored window, xbc]) — feeds ONE ``ssd_scan_fused`` launch (== the per-token
+                # ``ssd_step`` loop within the fused-step tolerance). Output-equivalent to the loop in
+                # the ``else`` below; the per-token T launches collapse to a single Metal launch (the
+                # verify's launch-bound Mamba T-growth). Gated on the real backbone in
+                # parity/nemotron_ultra_fused_scan_parity.py.
+                xbc_ext = mx.concatenate([conv_state, xbc], axis=1)        # [b,(k-1)+T,conv_dim]
+                wk = mx.swapaxes(self.conv_weight, 0, 1)                   # (K, conv_dim)
+                windows = mx.stack([xbc_ext[:, j:j + t] for j in range(self.k)], axis=2)  # [b,T,K,conv_dim]
+                conv_out = mx.sum(windows * wk[None, None], axis=2) + self.conv_bias       # [b,T,conv_dim]
+                conv_state = xbc_ext[:, -(self.k - 1):]                    # raw window for the next call
+                xs, bm, cm = self._split_xbc(_silu(conv_out), b, t)
+                y, state = ssd_scan_fused(xs, dt_all, a, bm, cm, self.D, state)
+            else:
+                step_fn = ssd_step_fused if FUSED_SSD_STEP else ssd_step
+                ys: list[mx.array] = []
+                for ti in range(t):
+                    conv_out, conv_state = causal_conv1d_step(
+                        xbc[:, ti], self.conv_weight, conv_state, self.conv_bias,
+                    )
+                    xs_t, bm_t, cm_t = self._split_xbc(_silu(conv_out)[:, None], b, 1)
+                    y_t, state = step_fn(
+                        xs_t[:, 0], dt_all[:, ti], a, bm_t[:, 0], cm_t[:, 0], self.D, state,
+                    )
+                    ys.append(y_t[:, None])
+                y = ys[0] if t == 1 else mx.concatenate(ys, axis=1)
         y = y.reshape(b, t, self.d_inner)
         y = self.norm(y, z)  # group-wise gated RMSNorm (gate=silu(z) applied inside, per n_groups)
         return self.out_proj(y), state, conv_state

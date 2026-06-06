@@ -325,6 +325,30 @@ port; closest template `src/quanta/qwen35/`.
     `mamba_ssd.py` SSD-step surface as Stream B. **Serving default pinned: B=32** — already the Nemotron
     `BEST_BATCH` operating point + uniform `SERVING_BATCH_CAP=32` (`shim/omlx.py`); the Ultra measurement now
     backs it (was Super-120B-only). Stream A recommendation **settled**.
+  - **U4/Stream-B (fused multi-token SSD-scan verify kernel) ✅ — built + gated + benched.**
+    `ssd_scan_fused` (`mamba_ssd.py`) extends the one-token `_ssd_step_kernel` to loop T internally,
+    carrying the N=128 state through the `new_state` buffer (register-carry spills at N=128) — the whole
+    T-token verify Mamba recurrence is ONE Metal launch per layer (at T=1 == `ssd_step_fused`). Wired into
+    `MambaMixer`'s T>1 continuation behind `FUSED_SSD_SCAN` (default off, rule 4) with a **bit-identical**
+    batched conv (per-token `causal_conv1d_step` window over T, same `mx.sum`-over-K, same `conv_state`);
+    off/T=1 byte-unchanged. **Gates**: model-free `parity/nemotron_ssd_scan_kernel_test.py` (scan ==
+    per-token loop 2.2e-7, T=1 bit-exact to `ssd_step_fused`, batched conv bit-identical); real-weight
+    per-block `parity/nemotron_ultra_fused_scan_parity.py` (rule-8 streamed all 48 mamba blocks — fused
+    output == eager ≤1 bf16 ULP, 83/144 bit-identical, conv bit-identical, ssm ≤7.6e-6). **The gate caught
+    the bf16 cascade**: a first full-model gate FAILED intermediate-state (hiddenΔ 106, convΔ 2.00) despite
+    perfect top-1; per-layer trace = a clean power-of-two cascade from a single bf16 ULP flip at the 2nd
+    mamba layer (2⁻⁶→…→10²) — the M2/M3 settled finding (a ULP near-tie cascades chaotically), so the
+    honest criterion is **per-block equivalence + top-1**, NOT intermediate magnitude (gate redesigned to
+    per-block). **Bench** `parity/nemotron_ultra_fused_scan_bench.py` (solo ~313 GiB; E/F/FC ordered so the
+    only compiled-verify traces are flag-True): t_main 88.8 ms; t_verify **F 1.07–1.12× / FC 1.10–1.15× vs
+    eager** (launch-overhead only); **best B=1 spec 0.80× eager → 0.90× F → 0.92× FC** (draft_topk=8 k=1,
+    accept 1.66/2) — **best B=1 single-stream spec measured, +15% over the eager ceiling, beats the 0.84×
+    compiled ceiling, but STILL <1×**: the fused verify is 1.43–2.01× t_main, the residual is the **unfused
+    MoE `gather_qmm`** (40%, weight-bandwidth, NOT launch-bound — a scan kernel can't touch it). `acc==`
+    shows `!!` at bf16 near-ties (F/FC ≤1 ULP, not bit-identical; `match` mostly 48/48); losslessness owned
+    by M2 (the int4 main model verifies every draft). **Crossing 1× at B=1 now needs the MoE verify
+    bandwidth reduced (a harder lever, not a scan kernel); the throughput lever stays the
+    already-characterized B>1 tree-verify (MTP-M4).**
 
 ### Mellum2 (after Ultra)
 - **M0** — new `src/quanta/mellum/`: config + reference forward (dual-RoPE per `layer_types` +

@@ -126,6 +126,82 @@ def ssd_step_fused(x_t, dt_t, A, B_t, C_t, D, state):
     return y.astype(out_dtype), new_state
 
 
+_SSD_SCAN_SRC = r"""
+    uint pp = thread_position_in_grid.x;   // head_dim index p
+    uint hh = thread_position_in_grid.y;   // head index h
+    uint bb = thread_position_in_grid.z;   // batch index
+    const int H = dims[0], P = dims[1], N = dims[2], rep = dims[3], BN = dims[4], T = dims[5];
+    if ((int)pp >= P || (int)hh >= H || (int)bb >= BN) return;
+    const int G = H / rep;
+    const int g = (int)hh / rep;
+    const float Ah = A[hh];
+    const float Dh = D[hh];
+    const int sbase = (((int)bb * H + (int)hh) * N) * P + (int)pp;  // state[bb,hh,0,pp], stride P over n
+    // seed the working state (new_state) from the input state, then scan it in place across T
+    for (int n = 0; n < N; ++n) new_state[sbase + n * P] = state[sbase + n * P];
+    for (int t = 0; t < T; ++t) {
+        const int rowbt = (int)bb * T + t;                 // flat (batch,time) row
+        const int xidx = (rowbt * H + (int)hh) * P + (int)pp;
+        const float dtv = dt[rowbt * H + (int)hh];
+        const float da = exp(dtv * Ah);
+        const float xv = x[xidx];
+        const int bc = (rowbt * G + g) * N;                // B/C[bb,t,g,0]
+        float acc = 0.0f;
+        for (int n = 0; n < N; ++n) {
+            const float s = da * new_state[sbase + n * P] + dtv * B[bc + n] * xv;
+            new_state[sbase + n * P] = s;
+            acc += C[bc + n] * s;
+        }
+        y[xidx] = acc + Dh * xv;
+    }
+"""
+
+_ssd_scan_kernel = mx.fast.metal_kernel(
+    name="ssd_scan",
+    input_names=["x", "dt", "A", "B", "C", "D", "state", "dims"],
+    output_names=["y", "new_state"],
+    source=_SSD_SCAN_SRC,
+)
+
+
+def ssd_scan_fused(x, dt, A, B, C, D, state_in):
+    """Fused **multi-token** SSD scan — one Metal launch for a whole ``T``-token continuation,
+    output-equivalent to a per-token :func:`ssd_step` loop carrying state. Returns (y, state_out).
+
+    x: (Bn,T,H,P)  dt: (Bn,T,H)  A: (H,)  B,C: (Bn,T,G,N)  D: (H,)  state_in: (Bn,H,N,P)
+    -> y: (Bn,T,H,P), new_state: (Bn,H,N,P)
+
+    One thread per ``(batch, head, head_dim)`` seeds its ``N``-length state slice from ``state_in`` into
+    the ``new_state`` buffer, then loops ``t`` internally — at each step updating ``state[.,h,:,p]`` and
+    accumulating ``y[.,h,t,p]`` — so the recurrence runs WITHOUT re-launching per token. This collapses
+    the ``mamba_mixer`` spec-VERIFY step loop (``~8 composed ops × T tokens × 48 mamba layers``) into
+    one launch per layer: the T>1 verify is launch-bound on the per-token step loop (the dominant
+    component of the verify T-growth — ``parity/nemotron_ultra_decode_economics.py``), the part
+    ``mx.compile`` cannot fuse across the sequential Python T-loop (MTP-M3 A's 1.08–1.10x ceiling).
+
+    fp32 scan (the recurrence is bf16-unstable); inputs upcast, ``y`` cast back, state returned fp32
+    (matching :func:`ssd_step`). At ``T == 1`` this is identical to :func:`ssd_step_fused` (the prologue
+    copies ``state_in`` into ``new_state`` and the single scan step reads it). Opt-in behind
+    ``quanta.nemotron.mamba_mixer.FUSED_SSD_SCAN`` (default off, rule 4); gated output-equivalent in
+    ``parity/nemotron_ssd_scan_kernel_test.py`` (model-free) and
+    ``parity/nemotron_ultra_fused_scan_parity.py`` (real backbone)."""
+    out_dtype = x.dtype
+    x, dt, A = x.astype(mx.float32), dt.astype(mx.float32), A.astype(mx.float32)
+    B, C = B.astype(mx.float32), C.astype(mx.float32)
+    D, state_in = D.astype(mx.float32), state_in.astype(mx.float32)
+    bn, t, h, p = x.shape
+    g, n = B.shape[-2], B.shape[-1]
+    dims = mx.array([h, p, n, h // g, bn, t], dtype=mx.int32)
+    y, new_state = _ssd_scan_kernel(
+        inputs=[x, dt, A, B, C, D, state_in, dims],
+        grid=(p, h, bn),
+        threadgroup=(min(p, 256), 1, 1),
+        output_shapes=[(bn, t, h, p), (bn, h, n, p)],
+        output_dtypes=[mx.float32, mx.float32],
+    )
+    return y.astype(out_dtype), new_state
+
+
 def ssd_chunked(x, dt, A, B, C, D, chunk_size, state_in=None):
     """SSD prefill via matmuls — output-equivalent to :func:`ssd_sequential`. Returns (y, state).
 
