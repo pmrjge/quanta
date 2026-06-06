@@ -76,6 +76,7 @@ def _sweep(model: NemotronBatchedResidentModel) -> None:
     prev_peak = 0.0
     max_slope = INIT_SLOPE                              # worst per-stream marginal seen (for the guard)
     last_per = float("nan")
+    last_b = 0
     for b in BATCHES:
         if prev_b is not None:                         # project this B's peak from the worst marginal
             proj = prev_peak + max_slope * (b - prev_b)
@@ -97,7 +98,9 @@ def _sweep(model: NemotronBatchedResidentModel) -> None:
         print(f"  {b:>4}  {n_per:>9.2f} /{n_agg:>11.2f}  {scale:>7.2f}x  {gib_stream:>9.2f}  "
               f"{active:>5.1f}/{peak:>6.1f}", flush=True)
         prev_b, prev_peak = b, peak
-        best_agg, best_b, best_scale, last_per = n_agg, b, scale, n_per
+        if n_agg > best_agg:                           # track the throughput PEAK (max agg), not the last B swept
+            best_agg, best_b, best_scale = n_agg, b, scale
+        last_per, last_b = n_per, b                    # per-stream floor + memory peak live at the highest B run
 
     if prev_b is not None:                             # extrapolate the memory-bounded serving ceiling
         max_b_safe = prev_b + (WORKING_CEIL_GIB - prev_peak) / max_slope
@@ -106,7 +109,7 @@ def _sweep(model: NemotronBatchedResidentModel) -> None:
               f"max B ~{max_b_safe:.0f} @ {WORKING_CEIL_GIB:.0f} GiB safe / ~{max_b_hard:.0f} @ "
               f"{HARD_CEIL_GIB:.0f} GiB hard ceiling", flush=True)
         print(f"  headline: peak measured agg {best_agg:.1f} tok/s @ B={best_b} ({best_scale:.2f}x B=1); "
-              f"per-stream floor {last_per:.2f} tok/s @ B={best_b}", flush=True)
+              f"per-stream floor {last_per:.2f} tok/s @ B={last_b}", flush=True)
 
 
 def run() -> None:
