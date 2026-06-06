@@ -40,7 +40,10 @@ group-wise** (variance over `d_inner//n_groups`, NOT full `d_inner` — `Zamba2R
 a full-width `nn.RMSNorm` — *self-consistent* (prefill==decode) so the old self-consistency-only test
 never caught it, but **42% off** the reference. Fixed via a new group-wise `MambaRMSNormGated`
 (`mamba_mixer.py`, forward-only — corrects the **already-baked Super-120B** too; bf16 `norm.weight`
-unchanged, no re-bake; Super ppl should be re-measured under the fix). **U2 de-risk ✅** — slice
+unchanged, no re-bake; **Super ppl re-measured under the fix** (`parity/nemotron_{ppl,int4_ppl,resident_ppl}`,
+same unchanged 109-tok PROSE yardstick): bf16 **5.981→3.379**, served int4g64 **resident 3.305** (≈lossless,
+−0.7% vs the 3.327 dequant ref) — the pre-fix baseline was measuring the degraded buggy-norm forward, which
+the residual skip kept coherent-ish at 5.981; the fix recovered ~2.6 ppl points). **U2 de-risk ✅** — slice
 diagnostic `parity/nemotron_ultra_awq_slice_test.py` (Ultra L1, the first MoE; streams layers 0–1, NO
 21.5 GiB expert stack materialized): per warm expert, held-out activation-weighted recon error, AWQ vs
 RTN. Finding #38's relu² down-proj AWQ collapse **does NOT reproduce at Ultra** — AWQ *helps* up-proj

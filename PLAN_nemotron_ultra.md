@@ -84,8 +84,11 @@ context length is too short for the orchestrator role.
       but **42% off** the transformers reference. Fixed with a new `MambaRMSNormGated` (group-wise, fused
       `mx.fast.rms_norm` per group, weight after) in `src/quanta/nemotron/mamba_mixer.py`. **Forward-only**
       — the bf16 `norm.weight` is unchanged, so it also corrects the **already-baked Super-120B** with no
-      re-bake (Super ppl/quality should be re-measured under the fix; it was previously measured buggy).
-  Files: `parity/nemotron_ultra_layer_parity.py`, `src/quanta/nemotron/mamba_mixer.py`.
+      re-bake. **Re-measured under the fix** (same unchanged 109-tok PROSE): bf16 **5.981→3.379**, int4g64
+      **resident 3.305** (≈lossless, −0.7% vs the 3.327 dequant ref) — the pre-fix baseline measured the
+      buggy-norm forward (kept coherent-ish by the residual skip); the fix recovered ~2.6 ppl points.
+  Files: `parity/nemotron_ultra_layer_parity.py`, `src/quanta/nemotron/mamba_mixer.py`,
+  `parity/nemotron_ppl.py`, `parity/nemotron_int4_ppl.py`, `parity/nemotron_resident_ppl.py`.
   > Note: `nemotron_layers_test.py`'s *attention* prefill==decode assertion (2e-3) is pre-existing-stale
   > vs the int8 `KVCache` default (#133) — ~5.3e-3, unrelated to U1; flagged for a separate cleanup.
 - **U2 de-risk ✅ — AWQ slice diagnostic.** `parity/nemotron_ultra_awq_slice_test.py` streams Ultra

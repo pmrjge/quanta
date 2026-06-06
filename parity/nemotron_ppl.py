@@ -3,7 +3,10 @@
 Streamed forward: one decoder layer's source weights resident at a time (build -> load -> run ->
 release), so peak residency is ~one layer (~6 GiB) not the whole 120B (~240 GiB) — the rule-8
 memory discipline. Single teacher-forced pass (prefill only; no decode state). The layers run in
-bf16; the final norm + lm_head + softmax are fp32 for a stable ppl.
+bf16; the final norm + lm_head + softmax are fp32 for a stable ppl. The 109-token PROSE yields
+bf16 ppl 3.379 / acc 0.741 after the U1 group-wise mamba-norm fix (mamba_n_groups=8, so per-group
+RMS is over 1024 channels, not the full 8192; was 5.981 under the buggy full-width norm — the fix
+recovered ~2.6 ppl points).
 
     uv run --with tokenizers python -m parity.nemotron_ppl
 """

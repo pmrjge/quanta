@@ -4,11 +4,11 @@ Runs the **same** streamed teacher-forced forward as ``parity.nemotron_ppl`` (on
 resident; rule-8) but over the baked int4/int8 artifact, with every packed weight
 dequantized back to bf16 by :class:`quanta.nemotron.artifact.NemotronArtifact`. Because the
 artifact duck-types the source checkpoint, ``streamed_logits`` is reused verbatim — only the
-weights differ, so the ppl delta isolates quantization error. Same PROSE, same 192 tokens,
+weights differ, so the ppl delta isolates quantization error. Same PROSE, same 109 tokens,
 same fp32 head as the reference, so the numbers are directly comparable.
 
-Gate: int4 ppl should sit close to the bf16 reference (5.981). A large gap ⇒ re-bake the
-experts at g64 (#53) and re-gate.
+Gate: int4 ppl should sit close to the bf16 reference (3.379, post the U1 group-wise mamba-norm
+fix). A large gap ⇒ re-bake the experts at g64 (#53) and re-gate.
 
     uv run --with tokenizers python -m parity.nemotron_int4_ppl
 """
@@ -26,7 +26,7 @@ from quanta.nemotron.config import NemotronHConfig
 from quanta.nemotron.tokenizer import NemotronTokenizer
 
 ART = "/Users/pmrj/models/NVIDIA-Nemotron-3-Super-120B-A12B-quanta_int4g64"  # default; override via argv[1]
-BF16_PPL = 5.981  # parity.nemotron_ppl reference (#35), same PROSE / 192 tokens
+BF16_PPL = 3.379  # parity.nemotron_ppl reference, post U1 group-wise-norm fix (was 5.981 buggy); 109 tokens
 
 
 def run() -> None:

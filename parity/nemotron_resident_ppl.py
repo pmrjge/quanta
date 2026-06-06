@@ -2,8 +2,8 @@
 
 Runs the RAM-resident quantized runtime (packed weights via gather_qmm / quantized_matmul) on
 the same teacher-forced prose as the references, and checks it lands on the dequantized reference
-(5.799) — confirming the gather_qmm/QuantizedLinear decode path is output-equivalent to dequant.
-Also vs the bf16 reference (5.981). Same PROSE / tokens / fp32-comparable head.
+(3.327) — confirming the gather_qmm/QuantizedLinear decode path is output-equivalent to dequant.
+Also vs the bf16 reference (3.379). Same PROSE / 109 tokens / fp32-comparable head.
 
     uv run --with tokenizers python -m parity.nemotron_resident_ppl
 """
@@ -19,7 +19,7 @@ from quanta.nemotron.runtime import NemotronResidentModel
 from quanta.nemotron.tokenizer import NemotronTokenizer
 
 ART = "/Users/pmrj/models/NVIDIA-Nemotron-3-Super-120B-A12B-quanta_int4g64"
-BF16_PPL, DEQUANT_PPL = 5.981, 5.799  # #35 bf16 ref / #38 dequant gate
+BF16_PPL, DEQUANT_PPL = 3.379, 3.327  # post-U1-fix re-measure (was 5.981/5.799 under the buggy full-width norm)
 
 
 def run() -> None:
