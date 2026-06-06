@@ -99,7 +99,7 @@ context length is too short for the orchestrator role.
   (0.984, 23/24 experts AWQ≤RTN); relu² channel sparsity 99.74% (the #38 precondition) is present but
   AWQ's α-grid rejects the degenerate scales (range ≈1, not ≈1e6). Caveat: L1-only + activation-weighted
   recon (not e2e ppl). **AWQ cleared.**
-- **U2 ✅ — full int4-AWQ g64 + int8 bake.** `parity/run_bake_nemotron_ultra_int4awq_g64.py` drove
+- **U2 ✅ — full int4-AWQ g64 + int8 bake.** The AWQ bake recipe (since removed) drove
   `bake_nemotron(..., expert_method="awq", group_size=64, scale_dtype=bf16)` layer-streamed (rule 8) over
   ~4K agentic-corpus calib tokens (capture per-MoE latent+routing → α-grid each expert's up/down),
   **0.48h solo** → `~/models/NVIDIA-Nemotron-3-Ultra-550B-A55B-quanta_int4awq_g64`. Stats: 108 layers /

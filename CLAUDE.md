@@ -51,7 +51,7 @@ RTN. Finding #38's relu² down-proj AWQ collapse **does NOT reproduce at Ultra**
 precondition is present (99.74% near-zero channels) but AWQ's grid rejects the degenerate scales (range
 ≈1, not ≈1e6, so the folded `1/s` never blows up). Caveat: L1-only + activation-weighted recon ("far
 more e2e-predictive than raw recon" per `bake/calibrate.py`, but NOT e2e ppl — U3 is the arbiter).
-**U2 ✅** = full int4-AWQ g64 + int8 bake (`parity/run_bake_nemotron_ultra_int4awq_g64.py`, 0.48h solo) →
+**U2 ✅** = full int4-AWQ g64 + int8 bake (0.48h solo; recipe since removed) →
 `…-quanta_int4awq_g64`: 108 layers / 48 moe / 512 experts, **warm 24,235/24,576 (98.6%)** real AWQ scales,
 341 cold→plain int4 RTN; **artifact audited self-contained + fully covered** (no symlinks, zero external
 refs in index/manifest/config, weight_map relative, 42/42 shards, tokenizer in-artifact, manifest

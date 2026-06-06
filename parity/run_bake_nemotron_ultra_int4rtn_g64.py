@@ -1,8 +1,7 @@
 """Nemotron-3-Ultra-550B RTN fallback bake → ~/models/NVIDIA-Nemotron-3-Ultra-550B-A55B-quanta_int4rtn_g64.
 
-The U3 fallback arm. Byte-identical quant mix to the AWQ bake
-(`parity/run_bake_nemotron_ultra_int4awq_g64.py`) **except** the routed relu² experts use plain int4
-**RTN** (s=1, data-free) instead of AWQ — int8 affine dense (mamba in/out-proj, attention q/k/v/o,
+The U3 fallback arm. Byte-identical quant mix to the (since-removed) AWQ bake **except** the routed
+relu² experts use plain int4 **RTN** (s=1, data-free) instead of AWQ — int8 affine dense (mamba in/out-proj, attention q/k/v/o,
 latent fc1/fc2, shared expert), bf16 SSM core + every norm + router + embeddings/head, unchanged.
 
 Why: finding #38, codified in `bake._bake_expert` — AWQ misfires on the relu² down-proj (degenerate
