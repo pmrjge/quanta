@@ -214,10 +214,25 @@ can't fuse across the sequential T-loop → MTP-M3 A's 1.08–1.10× ceiling) + 
 +52.3ms — more distinct experts hit as T grows, weight-bandwidth, NOT fusable) + ~0% attn. So a fused
 multi-token SSD scan kernel (extend the one-token `_ssd_step_kernel` in `mamba_ssd.py:97` to loop T
 internally, carrying state) targets the **majority** grower; the MoE 40% caps the achievable speedup but
-the lever is real. **Remaining U4 work:** Stream B = build that kernel (gate output-equivalent to eager,
-rule 4, then bench vs the 0.84× B=1 ceiling); Stream A optional follow-on = push B>32 / a batched-SSD-step
-tune for the high-B per-stream ceiling. The InternLM2.5 MInference track below is **paused at M6 ✅ (M7
-deferred)**, not abandoned.
+the lever is real. **U4/Stream-A (decode batch-scaling) ✅** — the measure-first half of Stream-A's
+residual lever (`parity/nemotron_ultra_decode_scale.py`, solo ~306 GiB, exit 0): push the native form-2
+serving decode sweep past B=32 toward the 490 GiB ceiling, guarded by an adaptive per-stream-memory
+projection (never launch a B that could OOM — reboot hazard). **Aggregate decode throughput PLATEAUS at
+~48 tok/s from B=32 on** — B=32 48.03 / B=48 47.78 / B=64 47.93 / B=80 48.32 tok/s (all ~48 ± run-noise;
+per-stream 1.50→1.00→0.75→0.60, agg 4.75–4.78× B=1), so **B≈32 is the throughput knee** (367 GiB, 123 GiB
+headroom) and B>32 buys **zero** aggregate — only per-user latency + memory (flat ~1.92 GiB/stream). The
+guard skipped B=96 (projected 494.7 > the 465 safe ceiling); measured to B=80 @ 459.5 GiB ⇒ **extrapolated
+max B ~83 @ 465 safe / ~94 @ 490 hard** (so B>32 is an admission/concurrency policy choice, not a
+correctness limit). Parity self-check green (B=1 fused==loop |Δ|=0, B=4 native==fused |Δ|=0; the B=1/8/16/32
+overlap rows reproduce 0de52a9). **Confirms the economics batched-SSD-step ceiling**: the per-stream Mamba
+recurrence — NOT memory, NOT MoE bandwidth (both had headroom) — caps the B-amortization, so the ONLY lever
+that lifts aggregate past ~48 tok/s is the batched-SSD-step tune, the **same `mamba_ssd.py` SSD-step surface
+as Stream B's fused multi-token verify kernel** (one kernel effort moves both). **Remaining U4 work:** Stream
+B = build the fused multi-token SSD scan kernel (extend the one-token `_ssd_step_kernel` in `mamba_ssd.py:97`
+to loop T internally carrying state; gate output-equivalent to eager, rule 4, then bench vs the 0.84× B=1
+ceiling) — it subsumes Stream A's optional batched-SSD-step tune (same surface). Stream A's serving
+recommendation is settled: **B≈32 throughput-optimal**. The InternLM2.5 MInference track below is **paused at
+M6 ✅ (M7 deferred)**, not abandoned.
 
 **Paused: InternLM2.5 sparse-prefill (MInference family) — M6 ✅, M7 next.** Handover
 **`PLAN_minference.md`**. Reuse the validated block-sparse substrate (`quanta.modeling.xattention`,

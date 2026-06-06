@@ -83,6 +83,11 @@ BEST_BATCH: tuple[tuple[str, int], ...] = (
     #                       #153 paged KV loop-kill (default since 7f49bd9) REAFFIRMS 32: decode-only
     #                       loopkill ~146 tok/s @32 ≈ ~144 @48 (the loop-kill flattened the >32 decay) but
     #                       32 uses ~16 GiB less KV (99.7 vs 115.5, parity/nemotron_paged_batched_bench.py).
+    #                       ULTRA-550B (U4/Stream-A) confirms 32: agg PLATEAUS ~48 tok/s from B=32
+    #                       (48.0/47.8/47.9/48.3 @ B=32/48/64/80; per-stream 1.50→0.60),
+    #                       B>32 buys ZERO aggregate — only latency + ~1.92 GiB/stream (per-stream
+    #                       Mamba SSD-step caps amortization, not memory/MoE).
+    #                       parity/nemotron_ultra_decode_scale.py.
     ("internlm2", 32),    # InternLM2.5 worker (#21): agg peaks 243.1 tok/s @32 (4.49x over the loop);
     #                       REGRESSES to 213.6 @48 then plateaus ~210-221 through 128 — KV-light but the
     #                       knee is still 32 (per-stream decay outpaces B past 32; memory flat ~9 GiB).

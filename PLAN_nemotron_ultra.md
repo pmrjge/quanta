@@ -311,6 +311,20 @@ port; closest template `src/quanta/qwen35/`.
       `_ssd_step_kernel` in `mamba_ssd.py:97` to loop T internally, carrying state) — targets the majority
       grower; MoE 40% caps the speedup. Next: gate output-equivalent to eager (rule 4), bench vs the 0.84×
       B=1 ceiling.
+  - **U4/Stream-A (decode batch-scaling) ✅ — pushed the multi-stream decode sweep past B=32 to the memory
+    ceiling.** `parity/nemotron_ultra_decode_scale.py` (solo ~306 GiB, exit 0), native form-2 serving path,
+    adaptive per-stream-memory guard (never launch a B that could OOM). **Aggregate decode throughput
+    PLATEAUS at ~48 tok/s from B=32 on** — B=32 48.03 / B=48 47.78 / B=64 47.93 / B=80 48.32 tok/s (all ~48
+    ± run-noise; per-stream 1.50→1.00→0.75→0.60, agg 4.75–4.78× B=1). So **B≈32 is the throughput knee**
+    (367 GiB, 123 GiB headroom); B>32 buys zero aggregate, only per-user latency + memory (flat ~1.92
+    GiB/stream). Guard skipped B=96 (projected 494.7 > 465 safe); measured to B=80 @ 459.5 GiB ⇒ extrapolated
+    max B ~83 @ 465 safe / ~94 @ 490 hard (B>32 = an admission/concurrency policy choice, not a correctness
+    limit). Parity self-check green (B=1 fused==loop |Δ|=0, B=4 native==fused |Δ|=0; overlap rows reproduce
+    `0de52a9`). **Confirms the batched-SSD-step ceiling** — the per-stream Mamba recurrence (NOT memory/MoE)
+    caps the amortization, so the only lever past ~48 tok/s is the batched-SSD-step tune, the same
+    `mamba_ssd.py` SSD-step surface as Stream B. **Serving default pinned: B=32** — already the Nemotron
+    `BEST_BATCH` operating point + uniform `SERVING_BATCH_CAP=32` (`shim/omlx.py`); the Ultra measurement now
+    backs it (was Super-120B-only). Stream A recommendation **settled**.
 
 ### Mellum2 (after Ultra)
 - **M0** — new `src/quanta/mellum/`: config + reference forward (dual-RoPE per `layer_types` +
