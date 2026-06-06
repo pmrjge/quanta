@@ -196,9 +196,28 @@ int8-KV reblock perturb logits at the **bf16-ULP class M2/M3 documented**, but t
 paged==discrete) never flips over 10 steps. So the paged contract is real-green at Ultra scale; the #153
 loop-kill's *throughput* win (B>1 decode tok/s, +18% on Super) folds into the next stream — where MTP-M4 already
 flagged that Ultra's per-stream Mamba loop (48/108 layers) caps the attention-KV-only amortization on a hybrid.
-Remaining U4 streams (each behind a flag, not started): **multi-stream B>1 decode + Mamba-state batching**,
-**fused multi-token verify kernel** (the B=1 latency lever). The InternLM2.5 MInference track below is **paused
-at M6 ✅ (M7 deferred)**, not abandoned.
+**U4/decode-economics ✅** — combined measure-first run for the two remaining U4 streams
+(`parity/nemotron_ultra_decode_economics.py`, solo ~306 GiB, exit 0). The scoping discovery reframes
+MTP-M4: its "60 Mamba/attn layers run per-stream" was the **T>1 verify** path (`batched_decode_step`);
+the **T=1 multi-stream decode** path (`batched_decode_step_fused`/`_native`) already batches Mamba (ONE
+`[B,…]` mixer call — `ssd_step_fused` is `grid=(p,h,bn)`, the mixer runs every op over the B axis), attn
+(fused SDPA), MoE (stacked). **Stream A (multi-stream B>1 decode) — MTP-M4 pessimism OVERTURNED for
+decode:** real-Ultra native (form-2 persistent `BatchedMambaState`, the prod serving path) aggregate
+decode **scales 10.3→28.4→40.0→47.5 tok/s @ B=1/8/16/32 (4.61× @ B=32)**, loop-kill **1.77× @ B=8** over
+the per-stream loop, parity-confirmed on real weights (native==fused==loop **bit-exact**, Δ=0); peak 367
+GiB @ B=32 (room under 490 → B can go higher). So the hybrid DOES amortize across B in decode — Stream A
+is a **characterization win, no kernel needed**; the sublinear per-stream drop (10.3→1.48) is the
+batched-SSD-step-compute ceiling (the only residual A-lever). **Stream B (fused multi-token verify
+kernel) — GO:** the B=1 T>1-verify component breakdown (T∈{1..4}) shows the T-growth is **59% Mamba
+per-token step loop** (`mamba_mixer.py:148`, +77.8ms over T=1→4 — launch-bound, the part `mx.compile`
+can't fuse across the sequential T-loop → MTP-M3 A's 1.08–1.10× ceiling) + **40% MoE** (`gather_qmm`,
++52.3ms — more distinct experts hit as T grows, weight-bandwidth, NOT fusable) + ~0% attn. So a fused
+multi-token SSD scan kernel (extend the one-token `_ssd_step_kernel` in `mamba_ssd.py:97` to loop T
+internally, carrying state) targets the **majority** grower; the MoE 40% caps the achievable speedup but
+the lever is real. **Remaining U4 work:** Stream B = build that kernel (gate output-equivalent to eager,
+rule 4, then bench vs the 0.84× B=1 ceiling); Stream A optional follow-on = push B>32 / a batched-SSD-step
+tune for the high-B per-stream ceiling. The InternLM2.5 MInference track below is **paused at M6 ✅ (M7
+deferred)**, not abandoned.
 
 **Paused: InternLM2.5 sparse-prefill (MInference family) — M6 ✅, M7 next.** Handover
 **`PLAN_minference.md`**. Reuse the validated block-sparse substrate (`quanta.modeling.xattention`,

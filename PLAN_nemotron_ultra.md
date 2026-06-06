@@ -293,8 +293,24 @@ port; closest template `src/quanta/qwen35/`.
     bf16-ULP class — top-1, the rule-4 arbiter, never flips over 10 steps). The #153 loop-kill's
     *throughput* win (B>1 decode tok/s) folds into the multi-stream stream (MTP-M4: Ultra's per-stream
     Mamba loop, 48/108 layers, caps the attention-KV-only amortization on a hybrid).
-  - **U4 remaining streams** (each behind a flag, ppl-equivalent, not started): multi-stream B>1 decode +
-    Mamba-state batching, fused multi-token verify kernel (the B=1 latency lever).
+  - **U4/decode-economics ✅ — combined measure-first run for the two remaining streams.**
+    `parity/nemotron_ultra_decode_economics.py` (solo ~306 GiB). Scoping discovery: MTP-M4's "60
+    Mamba/attn layers per-stream" was the **T>1 verify** path; the **T=1 multi-stream decode** path
+    (`batched_decode_step_fused`/`_native`) already batches Mamba (one `[B,…]` mixer call; `ssd_step_fused`
+    is `grid=(p,h,bn)`) + attn (fused SDPA) + MoE (stacked).
+    - **Stream A (multi-stream B>1 decode) — characterization win, MTP-M4 pessimism overturned for
+      decode.** Real-Ultra native (form-2 persistent `BatchedMambaState`) aggregate decode scales
+      **10.3→28.4→40.0→47.5 tok/s @ B=1/8/16/32 (4.61× @ B=32)**, loop-kill **1.77× @ B=8**, parity bit-exact
+      (native==fused==loop, Δ=0), peak 367 GiB @ B=32 (room under 490). No kernel needed; the sublinear
+      per-stream drop (10.3→1.48) is the batched-SSD-step-compute ceiling (optional follow-on: push B>32 /
+      a batched-SSD-step tune).
+    - **Stream B (fused multi-token verify kernel) — GO.** B=1 T>1-verify breakdown (T∈{1..4}): the
+      T-growth is **59% Mamba per-token step loop** (`mamba_mixer.py:148`, +77.8ms — launch-bound, the part
+      `mx.compile` can't fuse across the sequential T-loop) + **40% MoE** `gather_qmm` (+52.3ms — weight
+      bandwidth, NOT fusable) + ~0% attn. Build a fused multi-token SSD scan kernel (extend the one-token
+      `_ssd_step_kernel` in `mamba_ssd.py:97` to loop T internally, carrying state) — targets the majority
+      grower; MoE 40% caps the speedup. Next: gate output-equivalent to eager (rule 4), bench vs the 0.84×
+      B=1 ceiling.
 
 ### Mellum2 (after Ultra)
 - **M0** — new `src/quanta/mellum/`: config + reference forward (dual-RoPE per `layer_types` +
