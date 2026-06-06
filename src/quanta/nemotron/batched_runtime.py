@@ -46,6 +46,7 @@ from typing import Any
 
 import mlx.core as mx
 
+import quanta.nemotron.mamba_mixer as mm
 from quanta.cache_quant import BITS
 from quanta.nemotron.attention import KVCache
 from quanta.nemotron.config import NemotronHConfig
@@ -305,13 +306,14 @@ def batched_decode_step_fused(
     h = embed_w[ids][:, None].astype(mx.bfloat16)                       # [B, 1, hidden]
     caches_per_stream = [stream_caches[s][0] for s in range(b)]
     offsets = _read_attn_offsets(layers, caches_per_stream, b)
+    fused_step = mm.BATCHED_FUSED_SSD_STEP                              # graduated: fused one-launch SSD step
 
     for i, blk in enumerate(layers):
         if blk.kind == "mamba":                                        # batched recurrence (form-1)
             ssm_cat = _stack_mamba_state([stream_caches[s][1][i] for s in range(b)], "ssm", i)
             conv_cat = _stack_mamba_state([stream_caches[s][2][i] for s in range(b)], "conv", i)
             h, ssm_cat, conv_cat = blk(h, cache=None, ssm_state=ssm_cat, conv_state=conv_cat,
-                                       use_fast=True)                  # ONE call over [B,1,hidden]
+                                       use_fast=True, fused_step=fused_step)  # ONE call over [B,1,hidden]
             for s in range(b):                                         # scatter back to per-stream slots
                 stream_caches[s][1][i] = ssm_cat[s:s + 1]
                 stream_caches[s][2][i] = conv_cat[s:s + 1]
@@ -405,6 +407,7 @@ def batched_decode_step_native(
     ids = mx.array([int(t.reshape(-1)[0]) for t in stream_token_ids], dtype=mx.int32)
     h = embed_w[ids][:, None].astype(mx.bfloat16)                       # [B, 1, hidden]
     offsets = _read_attn_offsets(layers, state.kv, b)
+    fused_step = mm.BATCHED_FUSED_SSD_STEP                              # graduated: fused one-launch SSD step
 
     for i, blk in enumerate(layers):
         if blk.kind == "mamba":                                        # persistent batched recurrence
@@ -412,7 +415,8 @@ def batched_decode_step_native(
                 raise ValueError(f"native decode: batched Mamba state missing at layer {i} — decode "
                                  "before prefill / make_batched_state")
             h, state.ssm[i], state.conv[i] = blk(h, cache=None, ssm_state=state.ssm[i],
-                                                 conv_state=state.conv[i], use_fast=True)
+                                                 conv_state=state.conv[i], use_fast=True,
+                                                 fused_step=fused_step)
         elif blk.kind == "attention":
             h = _fused_attn_layer(blk, h, offsets, [state.kv[s][i] for s in range(b)],
                                   paged_batched=paged_batched)

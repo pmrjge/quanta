@@ -25,9 +25,24 @@ from quanta.nemotron.mamba_ssd import (
 )
 
 # Opt-in fused one-launch decode kernel. Parity-exact (== ssd_step, ~2e-7), BUT measured NOT a
-# win in the compiled decode path (mx.compile already fuses the composed SSD ops: ~34 vs ~35
-# tok/s), so default off per rule-4 (optimizations default to the proven path until a measured win).
+# win in the COMPILED SINGLE-STREAM decode path (mx.compile already fuses the composed SSD ops:
+# ~34 vs ~35 tok/s), so default off there per rule-4. This GLOBAL forces the fused step everywhere
+# (incl. the compiled single-stream path); leave False. The BATCHED multi-stream decode opts in via
+# BATCHED_FUSED_SSD_STEP below — a different regime where the fused step is a large WIN.
 FUSED_SSD_STEP = False
+
+# GRADUATED (rule 4: proven output-equivalent, now a measured win): the multi-stream batched-decode
+# steppers (quanta.nemotron.batched_runtime.batched_decode_step_fused / _native) use the fused
+# one-launch SSD step by default. In the EAGER batched path the composed ssd_step materializes several
+# [B,H,N,P] fp32 temporaries (~268 MiB each @ B=32) that mx.compile is NOT there to fuse away, so the
+# fused kernel (in-kernel state carry, no temporaries) is ~3.86× faster on that op and lifts aggregate
+# decode +36% @ B=32 (49.4 → 67.0 tok/s) — greedy-exact e2e (the bf16-ULP reorder class), measured in
+# parity/nemotron_ultra_decode_step_breakdown.py and re-gated greedy-exact model-free in
+# parity/nemotron_batched_attention_test.py. Default ON (the proven-better path); set False to force the
+# composed step in the batched path (rule-4 escape hatch / apples-to-apples parity). The compiled
+# SINGLE-STREAM decode does NOT read this (its mixers are built without ``fused_step``) so it is
+# unchanged — fused is a ~3% loss there (mx.compile fuses the composed ops).
+BATCHED_FUSED_SSD_STEP = True
 
 # Opt-in fused **multi-token** SSD scan for the T>1 spec-VERIFY continuation: one Metal launch runs the
 # whole T-token recurrence (vs the per-token step loop below), targeting the verify's launch-bound Mamba
@@ -107,7 +122,7 @@ class MambaMixer(nn.Module):
         cm = xbc[..., self.d_inner + gn :].reshape(b, t, self.g, self.n)
         return x, bm, cm
 
-    def __call__(self, x, *, state=None, conv_state=None, chunked_cont=False):
+    def __call__(self, x, *, state=None, conv_state=None, chunked_cont=False, fused_step=False):
         b, t, _ = x.shape
         a = -mx.exp(self.A_log)
         z, xbc, dt = self._split(self.in_proj(x))
@@ -170,7 +185,11 @@ class MambaMixer(nn.Module):
                 xs, bm, cm = self._split_xbc(_silu(conv_out), b, t)
                 y, state = ssd_scan_fused(xs, dt_all, a, bm, cm, self.D, state)
             else:
-                step_fn = ssd_step_fused if FUSED_SSD_STEP else ssd_step
+                # ``fused_step`` (threaded from the batched steppers' BATCHED_FUSED_SSD_STEP) opts this
+                # call into the fused one-launch kernel; ``FUSED_SSD_STEP`` is the global force-on. The
+                # compiled single-stream path passes neither ⇒ composed (unchanged). Output-equivalent
+                # (== ssd_step, ~2e-7; greedy-exact e2e — the bf16-ULP reorder class).
+                step_fn = ssd_step_fused if (FUSED_SSD_STEP or fused_step) else ssd_step
                 ys: list[mx.array] = []
                 for ti in range(t):
                     conv_out, conv_state = causal_conv1d_step(

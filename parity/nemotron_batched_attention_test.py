@@ -12,12 +12,19 @@ attention change (the MoE stacking is identical on both sides). The looped path'
 single-stream decode is gated in ``parity/nemotron_batched_test.py``, so this gate closes the loop.
 
 A. **fused == loop** — ``batched_decode_step_fused`` (form-1: batched Mamba via per-step concat + fused
-   attention) vs ``batched_decode_step``: ``B=1`` bit-exact (``L_max == L_1``, no padding) + ``B=3`` ragged
-   greedy-exact over several steps (the Mamba batching is bit-exact; only the padded-SDPA tiling reorders
-   the attention softmax → bf16 ULPs).
+   attention) vs ``batched_decode_step``, with ``BATCHED_FUSED_SSD_STEP`` **pinned False** (composed SSD
+   step on both sides) so this isolates the **attention** fusion: ``B=1`` bit-exact (``L_max == L_1``, no
+   padding) + ``B=3`` ragged greedy-exact (the Mamba batching is bit-exact; only the padded-SDPA tiling
+   reorders the attention softmax → bf16 ULPs).
 B. **native == fused** — ``batched_decode_step_native`` (form-2: persistent ``BatchedMambaState``, no
-   per-step concat) vs form-1: **bit-exact** at ``B=1`` and ``B=3`` (identical math, only the recurrent
-   state *storage* differs) + a ``BatchedMambaState.scatter_to`` round-trip back to per-stream slots.
+   per-step concat) vs form-1, at the **default** (graduated fused SSD step on both): **bit-exact** at
+   ``B=1`` and ``B=3`` (identical math + identical deterministic kernel, only the recurrent state *storage*
+   differs) + a ``BatchedMambaState.scatter_to`` round-trip back to per-stream slots.
+B2. **graduated fused SSD step** — the batched native stepper with ``BATCHED_FUSED_SSD_STEP=True`` (the
+   default fused one-launch decode kernel) == ``False`` (composed ``ssd_step``), isolating the step kernel
+   (attention + MoE byte-identical): **greedy-exact**, ``|Δlogit|`` within the bf16-ULP reorder tol. This
+   is the rule-4 output-equivalence proof for the graduated path (+36% @ B=32 — the breakdown bench);
+   ``run()`` pins the default ON so a revert fails loud.
 C. **dispatch** — ``NemotronBatchedResidentModel.step_batch`` (fused default, via ``from_inner``) vs the
    retained ``batched_decode_step`` reference (one step, ragged offsets).
 D. **paged KV loop-kill** (#153-class) — ``_fused_attn_layer`` with ``PagedKVCacheView`` caches +
@@ -39,6 +46,7 @@ from __future__ import annotations
 
 import mlx.core as mx
 
+import quanta.nemotron.mamba_mixer as mm
 from parity.nemotron_batched_test import _randomize, _tiny_cfg
 from quanta.cache_quant import BITS
 from quanta.nemotron.batched_runtime import (
@@ -75,7 +83,12 @@ def _args(model: NemotronModel):
 
 
 def _core(b: int, lengths: list[int]) -> tuple[float, bool]:
-    """fused == looped over STEPS decode steps at ragged offsets; return (worst |Δlogit|, greedy_match)."""
+    """fused == looped over STEPS decode steps at ragged offsets; return (worst |Δlogit|, greedy_match).
+
+    Pins ``BATCHED_FUSED_SSD_STEP=False`` (composed SSD step on BOTH sides) so this stays an
+    apples-to-apples **attention-fusion** isolation: the only difference is fused-SDPA vs per-stream SDPA
+    (the Mamba step is identical), so ``B=1`` is bit-exact. The graduated fused SSD step is proven
+    output-equivalent separately in :func:`_core_grad` (its own greedy-exact gate)."""
     mx.random.seed(0)
     cfg = _tiny_cfg()
     model = NemotronModel(cfg)
@@ -91,16 +104,21 @@ def _core(b: int, lengths: list[int]) -> tuple[float, bool]:
 
     worst = 0.0
     match = True
-    for _ in range(STEPS):
-        lb = batched_decode_step(*args, [mx.array([t]) for t in l_tok], l_states)
-        fb = batched_decode_step_fused(*args, [mx.array([t]) for t in f_tok], f_states)
-        mx.eval(lb, fb)
-        for s in range(b):
-            lo, fo = lb[s][0, -1], fb[s][0, -1]
-            worst = max(worst, float(mx.max(mx.abs(fo - lo)).item()))
-            lt, ft = int(mx.argmax(lo).item()), int(mx.argmax(fo).item())
-            match = match and (lt == ft)
-            l_tok[s], f_tok[s] = lt, ft
+    saved = mm.BATCHED_FUSED_SSD_STEP
+    mm.BATCHED_FUSED_SSD_STEP = False                      # composed both sides → isolate the attention fusion
+    try:
+        for _ in range(STEPS):
+            lb = batched_decode_step(*args, [mx.array([t]) for t in l_tok], l_states)
+            fb = batched_decode_step_fused(*args, [mx.array([t]) for t in f_tok], f_states)
+            mx.eval(lb, fb)
+            for s in range(b):
+                lo, fo = lb[s][0, -1], fb[s][0, -1]
+                worst = max(worst, float(mx.max(mx.abs(fo - lo)).item()))
+                lt, ft = int(mx.argmax(lo).item()), int(mx.argmax(fo).item())
+                match = match and (lt == ft)
+                l_tok[s], f_tok[s] = lt, ft
+    finally:
+        mm.BATCHED_FUSED_SSD_STEP = saved
     return worst, match
 
 
@@ -137,9 +155,14 @@ def _dispatch() -> None:
     f_states, f_tok = [s for s, _ in fuse], [t for _, t in fuse]
     l_states, l_tok = [s for s, _ in loop], [t for _, t in loop]
 
-    fused = rt.step_batch([mx.array([t]) for t in f_tok], f_states)               # fused default
-    looped = batched_decode_step(*_args(model), [mx.array([t]) for t in l_tok], l_states)
-    mx.eval(fused, looped)
+    saved = mm.BATCHED_FUSED_SSD_STEP
+    mm.BATCHED_FUSED_SSD_STEP = False                      # composed both sides → isolate dispatch + attn fusion
+    try:
+        fused = rt.step_batch([mx.array([t]) for t in f_tok], f_states)           # fused default (attn)
+        looped = batched_decode_step(*_args(model), [mx.array([t]) for t in l_tok], l_states)
+        mx.eval(fused, looped)
+    finally:
+        mm.BATCHED_FUSED_SSD_STEP = saved
 
     worst = 0.0
     match = True
@@ -191,6 +214,46 @@ def _core_native(b: int, lengths: list[int]) -> tuple[float, bool]:
         for s in range(b):
             d = float(mx.max(mx.abs(n_states[s][1][i] - nat_state.ssm[i][s:s + 1])).item())
             assert d == 0.0, f"scatter_to ssm mismatch at layer {i} stream {s}: {d:.2e}"
+    return worst, match
+
+
+def _core_grad(b: int, lengths: list[int]) -> tuple[float, bool]:
+    """GRADUATION proof (rule 4): the batched native stepper with ``BATCHED_FUSED_SSD_STEP=True`` (the
+    fused one-launch SSD decode kernel, the default/graduated path) == ``False`` (the composed ``ssd_step``),
+    from identical seeds, over ``STEPS`` at ragged offsets. The ONLY difference is the SSD decode kernel —
+    attention (fused SDPA) + MoE (stacked) are byte-identical on both sides — so this **isolates** the
+    graduated step. ``ssd_step_fused`` is parity-exact (== ``ssd_step`` ~2e-7, gated in
+    ``parity/nemotron_ssd_scan_kernel_test.py``), so the e2e result must be **greedy-exact** with
+    ``|Δlogit|`` within the bf16-ULP reorder tolerance. Returns (worst ``|Δlogit|``, greedy_match)."""
+    mx.random.seed(0)
+    cfg = _tiny_cfg()
+    model = NemotronModel(cfg)
+    _randomize(model)
+    rt = NemotronBatchedResidentModel.from_inner(_FakeInner(model), max_batch=max(b, 1))
+    prompts = [_prompt(cfg, n) for n in lengths]
+    comp = [_seed(model, p) for p in prompts]
+    fuse = [_seed(model, p) for p in prompts]
+    c_states, c_tok = [s for s, _ in comp], [t for _, t in comp]
+    f_states, f_tok = [s for s, _ in fuse], [t for _, t in fuse]
+    c_nat = rt.make_batched_state(c_states)               # composed-step state
+    f_nat = rt.make_batched_state(f_states)               # fused-step state
+    saved = mm.BATCHED_FUSED_SSD_STEP
+    worst, match = 0.0, True
+    try:
+        for _ in range(STEPS):
+            mm.BATCHED_FUSED_SSD_STEP = False
+            cb = rt.step_batch_native([mx.array([t]) for t in c_tok], c_nat)
+            mm.BATCHED_FUSED_SSD_STEP = True
+            fb = rt.step_batch_native([mx.array([t]) for t in f_tok], f_nat)
+            mx.eval(cb, fb)
+            for s in range(b):
+                co, fo = cb[s][0, -1], fb[s][0, -1]
+                worst = max(worst, float(mx.max(mx.abs(fo - co)).item()))
+                ct, ft = int(mx.argmax(co).item()), int(mx.argmax(fo).item())
+                match = match and (ct == ft)
+                c_tok[s], f_tok[s] = ct, ft
+    finally:
+        mm.BATCHED_FUSED_SSD_STEP = saved
     return worst, match
 
 
@@ -248,6 +311,12 @@ def _core_paged_loopkill(b: int, pre_len: list[int], steps: int) -> float:
 
 
 def run() -> None:
+    # Graduation pin (rule 4): the batched decode steppers default to the fused one-launch SSD step
+    # (BATCHED_FUSED_SSD_STEP) — proven output-equivalent + a measured +36% @ B=32
+    # (parity/nemotron_ultra_decode_step_breakdown.py). A revert that forgets must fail loud here.
+    assert mm.BATCHED_FUSED_SSD_STEP is True, ("BATCHED_FUSED_SSD_STEP must default ON (graduated fused "
+                                               "SSD decode step) — got False")
+
     print("A. batched_decode_step_fused == batched_decode_step (looped), ragged offsets:")
     w1, m1 = _core(1, [11])
     exact = "bit-exact" if w1 == 0.0 else f"|Δlogit|={w1:.2e}"
@@ -269,6 +338,18 @@ def run() -> None:
     print(f"  [{'OK' if (nm3 and nw3 == 0.0) else 'XX'}] B=3 offsets=[13,7,10] steps={STEPS} "
           f"|Δlogit|={nw3:.2e} greedy_match={nm3}")
     assert nm3 and nw3 == 0.0, f"B=3 native != fused: |Δlogit|={nw3:.2e} match={nm3}"
+
+    print("B2. GRADUATED fused SSD decode step (BATCHED_FUSED_SSD_STEP True) == composed (False), "
+          "native stepper — isolates the step kernel:")
+    gw1, gm1 = _core_grad(1, [11])
+    print(f"  [{'OK' if (gm1 and gw1 < LOGIT_TOL) else 'XX'}] B=1 |Δlogit|={gw1:.2e} greedy_match={gm1} "
+          "(fused one-launch step == composed ssd_step, ~2e-7 fp32 reorder)")
+    assert gm1 and gw1 < LOGIT_TOL, f"B=1 graduated fused step != composed: |Δlogit|={gw1:.2e} match={gm1}"
+
+    gw3, gm3 = _core_grad(3, [13, 7, 10])
+    print(f"  [{'OK' if (gm3 and gw3 < LOGIT_TOL) else 'XX'}] B=3 offsets=[13,7,10] steps={STEPS} "
+          f"|Δlogit|={gw3:.2e} greedy_match={gm3}")
+    assert gm3 and gw3 < LOGIT_TOL, f"B=3 graduated fused step != composed: |Δlogit|={gw3:.2e} match={gm3}"
 
     print("C. runtime dispatch: step_batch(fused default) == batched_decode_step:")
     _dispatch()

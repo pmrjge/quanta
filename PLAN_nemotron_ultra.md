@@ -377,6 +377,23 @@ context length is too short for the orchestrator role.
     → greedy-exact); then the residual ceiling is the **MoE+mamba co-dominant weight bandwidth** (B>32 =
     admission policy, not a kernel).
 
+  - **U4/fused-step graduation ✅ — wired the confirmed lever into the prod serving path (+36% @ B=32).**
+    The batched decode steppers (`batched_decode_step_fused`/`_native`) use the fused one-launch SSD step
+    via a new module flag **`BATCHED_FUSED_SSD_STEP` (mamba_mixer, default ON)**, threaded explicitly as a
+    `fused_step` kwarg `NemotronBlock → MambaMixer` (rule 6: no leaked global state). Scope is exact: the
+    per-stream-loop reference + the tree-spec `batch_step` stay **composed** (the naive baseline); the
+    **compiled single-stream** path passes no `fused_step` ⇒ **unchanged** (fused is a ~3% loss there —
+    `mx.compile` fuses the composed ops; the global `FUSED_SSD_STEP` force-on stays OFF). `step_batch_native`
+    (the omlx serving entry) gets the **+36% @ B=32 (49.4 → 67.0 tok/s)** for free, greedy-exact. **Re-gated**
+    model-free (`nemotron_batched_attention_test.py`): the fused-vs-loop / native-vs-fused bit-exact guards
+    pin `BATCHED_FUSED_SSD_STEP=False` (apples-to-apples — isolates the *attention* fusion); a new **B2**
+    proves the graduated step output-equivalent (fused == composed `|Δlogit|` 4.8e-7, greedy-exact); a
+    default-ON pin fails loud on revert. The real-model `_decode_compare` helper pins composed too (B=1
+    bit-exact stays valid; the graduated path's real-weight greedy-exactness is the breakdown bench's
+    `_greedy_match_fused`). Model-free gates green: batched-attention re-gate, native-serving, loop-equiv,
+    tree-verify, mtp-spec. **Residual U4 ceiling:** the MoE+mamba co-dominant weight bandwidth (B>32 =
+    admission policy / quant-bits, not a kernel); B≈32 settled throughput-optimal at **~67 tok/s**.
+
 ### Second model — MiniMax-M3 (when available)
 - **Mellum2 dropped** — its context length is too short for the orchestrator role. Replaced by
   **MiniMax-M3 once it ships**; the `src/quanta/minimax/` module is already substantially ported in-tree

@@ -70,15 +70,17 @@ class NemotronBlock(nn.Module):
         self.mixer = _MIXER[kind](cfg)
 
     def __call__(self, x, *, cache=None, ssm_state=None, conv_state=None, use_fast=True,
-                 topk_override: int | None = None, chunked_cont: bool = False):
+                 topk_override: int | None = None, chunked_cont: bool = False, fused_step: bool = False):
         """``topk_override`` (moe layers only): if set, route through that many experts instead of
         cfg.num_experts_per_tok — used by the MTP draft head's moe sub-block for a lighter drafter.
         ``chunked_cont`` (mamba layers only): when prefilling a suffix on top of a restored recurrent
-        state, use the chunked-SSD continuation (#152 paged) instead of the per-token steps."""
+        state, use the chunked-SSD continuation (#152 paged) instead of the per-token steps.
+        ``fused_step`` (mamba layers only): use the fused one-launch SSD decode step (the batched
+        steppers' graduated ``BATCHED_FUSED_SSD_STEP`` path); ignored by attention/moe."""
         h = self.norm(x)
         if self.kind == "mamba":
             y, ssm_state, conv_state = self.mixer(h, state=ssm_state, conv_state=conv_state,
-                                                  chunked_cont=chunked_cont)
+                                                  chunked_cont=chunked_cont, fused_step=fused_step)
         elif self.kind == "attention":
             y = self.mixer(h, cache=cache, use_fast=use_fast)
         else:  # moe (stateless)

@@ -284,13 +284,25 @@ as a "no-win", but that was B=1-*compiled*-only, where `mx.compile` fuses the co
 confirms** it on the real native serving decode, **greedy-exact** (argmax_match; the |Δlogit| 2.12 is the
 bf16-ULP reorder class): composed→fused **1.04× / 1.15× / 1.26× / 1.36× @ B=1/8/16/32** — **+36% aggregate
 decode throughput at B=32 (49.4 → 67.0 tok/s)**, output-equivalent (so the lever is now *measured AND
-parity-proven*, not assumed). **Remaining U4 work:** **graduate `FUSED_SSD_STEP` for the batched decode
-steppers** (the confirmed lever — wire it into `batched_decode_step_fused`/`_native` + re-gate the
-`native==fused` parity bit-exact→greedy-exact; ~1.36× @ B=32), after which the residual ceiling is the
-**MoE+mamba co-dominant weight bandwidth** (B>32 is admission policy / a quant-bits lever, not a kernel)
-and the B=1 >1× spec lever stays fundamentally capped (a single stream can't amortize). Stream A's serving
-recommendation is settled: **B≈32 throughput-optimal** (now ~67 tok/s with the fused step). The InternLM2.5
-MInference track below is **paused at M6 ✅ (M7 deferred)**, not abandoned.
+parity-proven*, not assumed). **U4/fused-step graduation ✅** — wired the confirmed lever into the prod
+serving path. The batched decode steppers (`batched_decode_step_fused`/`_native`) now use the fused
+one-launch SSD step via a new module flag **`BATCHED_FUSED_SSD_STEP` (mamba_mixer, default ON)**, threaded
+explicitly as a `fused_step` kwarg `NemotronBlock → MambaMixer` (rule 6: no leaked global state). The
+per-stream-loop reference + the tree-spec `batch_step` stay **composed** (the naive baseline), and the
+**compiled single-stream** path passes no `fused_step` ⇒ **unchanged** (fused is a ~3% loss there —
+`mx.compile` already fuses the composed ops; the global `FUSED_SSD_STEP` force-on stays OFF). So
+`step_batch_native` (the omlx serving entry, `shim/omlx.py`) is **+36% @ B=32 (49.4 → 67.0 tok/s)** for
+free, greedy-exact. **Re-gated** model-free (`nemotron_batched_attention_test.py`): the existing
+fused-vs-loop / native-vs-fused bit-exact guards pin `BATCHED_FUSED_SSD_STEP=False` (apples-to-apples,
+isolating the *attention* fusion); a new **B2** proves the graduated step output-equivalent (fused ==
+composed `|Δlogit|` 4.8e-7, greedy-exact); a default-ON pin fails loud on revert. The real-model
+`_decode_compare` helper pins composed too (its B=1 bit-exact stays valid; the graduated path's
+real-weight greedy-exactness is the breakdown bench's `_greedy_match_fused`). model-free gates green
+(batched-attention re-gate, native-serving, loop-equiv, tree-verify, mtp-spec). **Remaining U4 work:** the
+residual ceiling is now the **MoE+mamba co-dominant weight bandwidth** (B>32 = admission policy / a
+quant-bits lever, not a kernel); the B=1 >1× spec lever stays fundamentally capped (a single stream can't
+amortize). Stream A's serving recommendation is settled: **B≈32 throughput-optimal, now ~67 tok/s**. The
+InternLM2.5 MInference track below is **paused at M6 ✅ (M7 deferred)**, not abandoned.
 
 **Paused: InternLM2.5 sparse-prefill (MInference family) — M6 ✅, M7 next.** Handover
 **`PLAN_minference.md`**. Reuse the validated block-sparse substrate (`quanta.modeling.xattention`,

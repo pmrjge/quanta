@@ -39,6 +39,7 @@ import time
 
 import mlx.core as mx
 
+import quanta.nemotron.mamba_mixer as mm
 from quanta.nemotron.batched_runtime import (
     NemotronBatchedResidentModel,
     batched_decode_step,
@@ -82,26 +83,37 @@ def _seed(model: NemotronBatchedResidentModel, prompts: list[mx.array]) -> list:
 def _decode_compare(model: NemotronBatchedResidentModel, prompts: list[mx.array], steps: int
                     ) -> tuple[float, bool]:
     """Lock-step decode ``steps`` tokens through fused vs looped from two identically-seeded state sets;
-    return (worst ``|Δlogit|``, all-steps-greedy-match)."""
+    return (worst ``|Δlogit|``, all-steps-greedy-match).
+
+    Pins ``BATCHED_FUSED_SSD_STEP=False`` (composed SSD step on both sides) so the fused path's only
+    difference from the loop is the **attention** fusion — keeping ``B=1`` bit-exact (a faithful-port
+    guard). The graduated fused SSD step's real-weight greedy-exactness is gated separately in
+    ``parity/nemotron_ultra_decode_step_breakdown.py`` (``_greedy_match_fused``) + model-free in
+    ``parity/nemotron_batched_attention_test.py`` (``_core_grad``)."""
     f_states = _seed(model, prompts)
     l_states = _seed(model, prompts)
     f_tok = [mx.array([int(p[-1].item())]) for p in prompts]
     l_tok = [mx.array([int(p[-1].item())]) for p in prompts]
     args = _args(model)
     worst, match = 0.0, True
-    for _ in range(steps):
-        fused = batched_decode_step_fused(*args, f_tok, f_states)
-        loope = batched_decode_step(*args, l_tok, l_states)
-        mx.eval(fused, loope)
-        nf, nl = [], []
-        for s in range(len(prompts)):
-            fo, lo = fused[s][0, -1], loope[s][0, -1]
-            worst = max(worst, float(mx.max(mx.abs(fo - lo)).item()))
-            ft, lt = int(mx.argmax(fo).item()), int(mx.argmax(lo).item())
-            match = match and (ft == lt)
-            nf.append(mx.array([ft]))
-            nl.append(mx.array([lt]))
-        f_tok, l_tok = nf, nl
+    saved = mm.BATCHED_FUSED_SSD_STEP
+    mm.BATCHED_FUSED_SSD_STEP = False                      # composed both sides → isolate the attention fusion
+    try:
+        for _ in range(steps):
+            fused = batched_decode_step_fused(*args, f_tok, f_states)
+            loope = batched_decode_step(*args, l_tok, l_states)
+            mx.eval(fused, loope)
+            nf, nl = [], []
+            for s in range(len(prompts)):
+                fo, lo = fused[s][0, -1], loope[s][0, -1]
+                worst = max(worst, float(mx.max(mx.abs(fo - lo)).item()))
+                ft, lt = int(mx.argmax(fo).item()), int(mx.argmax(lo).item())
+                match = match and (ft == lt)
+                nf.append(mx.array([ft]))
+                nl.append(mx.array([lt]))
+            f_tok, l_tok = nf, nl
+    finally:
+        mm.BATCHED_FUSED_SSD_STEP = saved
     return worst, match
 
 

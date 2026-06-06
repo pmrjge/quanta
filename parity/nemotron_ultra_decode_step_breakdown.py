@@ -28,9 +28,10 @@ cost@B=1). The kind whose per-token cost drops LEAST (ratio nearest 1, or > 1) i
 ``out_proj`` at B=1 vs B=32) decides whether the SSD recurrence or the projections dominate the mamba
 block — i.e. whether "the batched SSD-step kernel" is even the right lever, and whether the fused-step
 kernel (``FUSED_SSD_STEP``, measured a no-win in *compiled single-stream* decode) becomes a win at B=32.
-Finally an **E2E A/B** swaps ``FUSED_SSD_STEP`` off↔on in the REAL native serving decode (with cross-layer
-overlap intact, plus a greedy-exactness check) — the decisive test the no-overlap microbench cannot give:
-does graduating the already-built fused step actually lift serving tok/s, and is it output-equivalent?
+Finally an **E2E A/B** swaps ``BATCHED_FUSED_SSD_STEP`` off↔on (the batched-stepper flag the graduation
+flips) in the REAL native serving decode (with cross-layer overlap intact, plus a greedy-exactness check)
+— the decisive test the no-overlap microbench cannot give: does graduating the already-built fused step
+actually lift serving tok/s, and is it output-equivalent?
 
 NOT a parity gate (native==fused==loop is gated model-free + Stream-A re-confirmed ``|Δ|=0`` on real
 weights); a measurement. One model resident — **RUN SOLO** (~306 GiB int4-RTN backbone; 400 GiB wired).
@@ -155,10 +156,11 @@ def _mamba_sub(model: NemotronBatchedResidentModel, idx: int, h: mx.array, nat) 
 
 def _greedy_match_fused(model: NemotronBatchedResidentModel, b: int, steps: int) -> tuple[float, bool]:
     """E2E greedy-exactness of the fused SSD step in the real native decode loop (rule 4): two
-    identically-seeded form-2 batched states decode ``steps`` tokens, one with ``FUSED_SSD_STEP=False``
-    (composed ``ssd_step``), one with ``True`` (the fused kernel); compare per-step argmax + worst
-    ``|Δlogit|``. The kernel is parity-gated == ``ssd_step`` (~2e-7 fp32 reorder), so the e2e tokens must
-    AGREE (argmax-stable) — confirming the optimization is output-equivalent before it can be graduated."""
+    identically-seeded form-2 batched states decode ``steps`` tokens, one with ``BATCHED_FUSED_SSD_STEP=
+    False`` (composed ``ssd_step``), one with ``True`` (the fused kernel — the GRADUATED batched-stepper
+    flag); compare per-step argmax + worst ``|Δlogit|``. The kernel is parity-gated == ``ssd_step`` (~2e-7
+    fp32 reorder), so the e2e tokens must AGREE (argmax-stable) — the output-equivalence the graduation
+    requires."""
     prompt = _prompt(SEED_LEN, model.cfg.bos_token_id)
     s_off = model.make_batched_state(_seed(model, [prompt] * b))
     s_on = model.make_batched_state(_seed(model, [prompt] * b))
@@ -166,34 +168,41 @@ def _greedy_match_fused(model: NemotronBatchedResidentModel, b: int, steps: int)
     t_off = [mx.array([last]) for _ in range(b)]
     t_on = [mx.array([last]) for _ in range(b)]
     worst, match = 0.0, True
-    for _ in range(steps):
-        mm.FUSED_SSD_STEP = False
-        o_off = model.step_batch_native(t_off, s_off)
-        mm.FUSED_SSD_STEP = True
-        o_on = model.step_batch_native(t_on, s_on)
-        mm.FUSED_SSD_STEP = False
-        mx.eval(o_off, o_on)
-        nf, nn = [], []
-        for sidx in range(b):
-            fo, no = o_off[sidx][0, -1], o_on[sidx][0, -1]
-            worst = max(worst, float(mx.max(mx.abs(fo - no)).item()))
-            ft, nt = int(mx.argmax(fo).item()), int(mx.argmax(no).item())
-            match = match and (ft == nt)
-            nf.append(mx.array([ft]))
-            nn.append(mx.array([nt]))
-        t_off, t_on = nf, nn
+    saved = mm.BATCHED_FUSED_SSD_STEP
+    try:
+        for _ in range(steps):
+            mm.BATCHED_FUSED_SSD_STEP = False
+            o_off = model.step_batch_native(t_off, s_off)
+            mm.BATCHED_FUSED_SSD_STEP = True
+            o_on = model.step_batch_native(t_on, s_on)
+            mx.eval(o_off, o_on)
+            nf, nn = [], []
+            for sidx in range(b):
+                fo, no = o_off[sidx][0, -1], o_on[sidx][0, -1]
+                worst = max(worst, float(mx.max(mx.abs(fo - no)).item()))
+                ft, nt = int(mx.argmax(fo).item()), int(mx.argmax(no).item())
+                match = match and (ft == nt)
+                nf.append(mx.array([ft]))
+                nn.append(mx.array([nt]))
+            t_off, t_on = nf, nn
+    finally:
+        mm.BATCHED_FUSED_SSD_STEP = saved
     return worst, match
 
 
 def _ab_fused_step(model: NemotronBatchedResidentModel, b: int) -> tuple[float, float]:
     """Native (form-2) decode aggregate tok/s at batch ``b`` with the composed ``ssd_step``
-    (``FUSED_SSD_STEP=False``, baseline) vs the fused kernel (``True``). Returns (agg_off, agg_on)."""
+    (``BATCHED_FUSED_SSD_STEP=False``, baseline) vs the fused kernel (``True``, the graduated batched
+    path). Returns (agg_off, agg_on)."""
     prompt = _prompt(SEED_LEN, model.cfg.bos_token_id)
-    mm.FUSED_SSD_STEP = False
-    _, agg_off = _time_path(model, prompt, b, GEN, "native")
-    mm.FUSED_SSD_STEP = True
-    _, agg_on = _time_path(model, prompt, b, GEN, "native")
-    mm.FUSED_SSD_STEP = False
+    saved = mm.BATCHED_FUSED_SSD_STEP
+    try:
+        mm.BATCHED_FUSED_SSD_STEP = False
+        _, agg_off = _time_path(model, prompt, b, GEN, "native")
+        mm.BATCHED_FUSED_SSD_STEP = True
+        _, agg_on = _time_path(model, prompt, b, GEN, "native")
+    finally:
+        mm.BATCHED_FUSED_SSD_STEP = saved
     return agg_off, agg_on
 
 
