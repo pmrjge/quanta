@@ -1,12 +1,13 @@
-# PLAN — Nemotron-3-Ultra-550B (main agent) + Mellum2-12B (orchestrator)
+# PLAN — Nemotron-3-Ultra-550B serving runtime
 
-A two-model agentic stack on one M3 Ultra (≤ 490.4 GiB), quantized through `quanta`'s
-parity-first pipeline.
+A single-model serving/runtime track on one M3 Ultra (≤ 490.4 GiB), quantized through `quanta`'s
+parity-first pipeline. The eventual second agentic-stack model is **deferred to MiniMax-M3 when it
+ships** — **Mellum2 was dropped (its context length is too short)**; the `minimax` module is already
+substantially ported in-tree.
 
-- **Main agent:** `NVIDIA-Nemotron-3-Ultra-550B-A55B` — hybrid Mamba2 + attention + MoE
+- **Main model:** `NVIDIA-Nemotron-3-Ultra-550B-A55B` — hybrid Mamba2 + attention + MoE
   (`model_type: nemotron_h`) → **int4-RTN g64 experts + int8 dense + bf16 core** (U3 ✅ — RTN beat AWQ e2e).
-- **Orchestrator:** `JetBrains/Mellum2-12B-A2.5B-Thinking` — sliding-window + full-attn MoE
-  (`model_type: mellum`) → **int8 (AWQ)**.
+- **Second model (deferred, when available):** MiniMax-M3 as the orchestrator — **not** Mellum2.
 
 ## Decisions (user, this session)
 
@@ -19,11 +20,11 @@ parity-first pipeline.
    RESOLVED → int4-RTN ships:** at the 1024-token teacher-forced arbiter AWQ regressed **+24.3%** (recon
    mispredicted — recon ≠ e2e) while RTN held **+0.3%**, so finding #38 reproduced e2e and the RTN
    fallback is the shipped expert method (AWQ retired).
-2. Mellum **int8 (AWQ)** — user choice. int8-from-bf16 is near-lossless, so AWQ here is
-   belt-and-suspenders (harmless; `bake/awq.py` exists).
+2. **Second model deferred to MiniMax-M3** (when released) — **Mellum2 dropped** (its context length is
+   too short for the orchestrator role). The `minimax` module is already substantially ported in-tree.
 3. **One model resident at a time** — honors the OOM-safety rule; the agentic loop swaps
    main/orchestrator. No concurrent-resident budget needed now.
-4. **Drive Nemotron-Ultra to completion first**, then Mellum.
+4. **Drive Nemotron-Ultra to completion first**; the second model follows once MiniMax-M3 ships.
 
 ## Key facts (authoritative — from on-disk `config.json`)
 
@@ -40,12 +41,9 @@ list, **no** `hybrid_override_pattern` / `num_hidden_layers`.
 > `spec`). The **120B-Super sibling is already baked int4** at
 > `~/models/NVIDIA-Nemotron-3-Super-120B-A12B-quanta_int4g64`. Ultra is a config-driven scale-up.
 
-**Mellum2** (`mellum`): 28 layers, hidden 2304; GQA 32 Q / 4 KV, head_dim 128; **64 experts top-8**
-(SwiGLU, moe_inter 896); **sliding-window (1024) on 3 of every 4 layers + full attention every 4th**;
-**dual RoPE** — full-attn layers YaRN (θ=5e5, factor 16, orig 8192, β_fast 32 / β_slow 1, attn_factor
-1.2772588722), sliding-attn layers default RoPE (θ=5e5); ctx 131072; vocab 98304; thinking model
-(`<think>…</think>`, qwen3 reasoning-parser, hermes tool-call). **No module yet** — a genuine new
-port; closest template `src/quanta/qwen35/`.
+**Second model — MiniMax-M3 (deferred).** To be integrated as the orchestrator when released; the
+`src/quanta/minimax/` module is already substantially ported in-tree. **Mellum2 was dropped** — its
+context length is too short for the orchestrator role.
 
 ## Memory (one-at-a-time)
 
@@ -55,7 +53,7 @@ port; closest template `src/quanta/qwen35/`.
   under-counted — it tracked the routed int4-g64 portion only; reconcile `nemotron_ultra_fit_test.py`,
   non-blocking since 306 ≤ 490.4 fits.) Only **12 / 108** layers carry growing KV — the 48 Mamba layers
   have **O(1)** state (a real long-context win at 256K).
-- Mellum int8 ≈ 11.5 GiB.
+- Second-model (MiniMax-M3) footprint TBD once weights ship.
 
 ## Roadmap
 
@@ -349,18 +347,27 @@ port; closest template `src/quanta/qwen35/`.
     by M2 (the int4 main model verifies every draft). **Crossing 1× at B=1 now needs the MoE verify
     bandwidth reduced (a harder lever, not a scan kernel); the throughput lever stays the
     already-characterized B>1 tree-verify (MTP-M4).**
+  - **U4/MoE gather_qmm batch-scaling ✅ — measured the MoE "bandwidth lever" before building.**
+    `parity/nemotron_ultra_moe_qmm_bench.py` (one real MoE layer, rule 8) times the routed
+    `gather_qmm` across N=B·T. The MoE is **already fused** (sorted dispatch, the DSV4
+    `_swiglu_stack_packed` / qwen35 pattern) and amortizes hard at batch: **per-token cost 1195 µs @
+    B=1 → 209 µs @ B=32 (5.58× cheaper/token) → 182 µs @ B=128 (6.6×)**; sorted dispatch **0.93× @ B=1**
+    (overhead, no overlap) **→ 1.81× @ B=32** (each touched expert's int4 weights read once for all
+    tokens routed to it). So the MoE "bandwidth lever" is **not a missing fusion** — it's a **B=1-vs-B=32
+    regime**: a single stream can't amortize (why Stream B's B=1 spec stayed <1×), B=32 serving gets it
+    for free. **Reconciles Stream A**: at B=32 the MoE is cheap (5.6× amortized), so the per-stream
+    **Mamba** recurrence is the decode ceiling — not the MoE. So the only serving lever past ~48 tok/s is
+    the **batched Mamba SSD-step** (same `mamba_ssd.py` surface as Stream B); the MoE needs nothing more.
 
-### Mellum2 (after Ultra)
-- **M0** — new `src/quanta/mellum/`: config + reference forward (dual-RoPE per `layer_types` +
-  sliding-window mask). Template `qwen35`.
-- **M1** — layer-by-layer numeric parity vs `transformers` `MellumForCausalLM`.
-- **M2** — int8 (AWQ) bake → `~/models/Mellum2-12B-A2.5B-Thinking-quanta_int8g64`.
-- **M3** — teacher-forced ppl + top-1 vs bf16.
-- **M4** — orchestrator integration: `<think>` parsing, hermes tool-calls, stop on eos=0.
+### Second model — MiniMax-M3 (when available)
+- **Mellum2 dropped** — its context length is too short for the orchestrator role. Replaced by
+  **MiniMax-M3 once it ships**; the `src/quanta/minimax/` module is already substantially ported in-tree
+  (config/attention/bake/calibrate/decode/eagle/generate), so integration is mostly bring-up + parity
+  + bake when weights are released. Until then this is a **single-model (Nemotron-Ultra) track**.
 
-### Stack
+### Stack (deferred until the second model lands)
 - Two-model agentic loop, one-at-a-time residency (swap main↔orchestrator); measure swap latency.
-  If swapping is too slow for the loop, revisit concurrent-resident (~301 GiB; needs a measured
+  If swapping is too slow for the loop, revisit concurrent-resident (needs a measured
   `mx.set_wired_limit` budget — a deviation from the one-at-a-time rule).
 
 ## Cadence (standing)

@@ -17,13 +17,13 @@ That is the mistake this project exists to not repeat.
 
 ## Active task (transient — full handover in PLAN_nemotron_ultra.md)
 
-**In flight (PIVOT, this session): Nemotron-3-Ultra-550B (main agent) + Mellum2-12B (orchestrator)
-agentic stack.** Handover **`PLAN_nemotron_ultra.md`**. Quantize Nemotron-Ultra (hybrid
-Mamba2+attn+MoE, `nemotron_h` — already supported; the 120B-Super sibling is already baked int4) as
-**int4-RTN experts + int8 dense + bf16 core** (user pivoted experts → AWQ mid-session and the U2 slice
-de-risk cleared AWQ on *recon*, but **U3's e2e ppl arbiter retired AWQ → int4-RTN ships** — recon ≠ e2e,
-see below), then Mellum2 (`mellum`, a new port) as **int8**; **one model resident at a time**; drive
-Ultra first. **U0 ✅** — config adapter (`_hybrid_pattern`
+**In flight: Nemotron-3-Ultra-550B serving runtime.** (The second agentic-stack model is **deferred to
+MiniMax-M3 when it ships** — **Mellum2 was dropped, its context length is too short**; the `minimax`
+module is already substantially ported in-tree.) Handover **`PLAN_nemotron_ultra.md`**. Quantize
+Nemotron-Ultra (hybrid Mamba2+attn+MoE, `nemotron_h` — already supported; the 120B-Super sibling is
+already baked int4) as **int4-RTN experts + int8 dense + bf16 core** (user pivoted experts → AWQ
+mid-session and the U2 slice de-risk cleared AWQ on *recon*, but **U3's e2e ppl arbiter retired AWQ →
+int4-RTN ships** — recon ≠ e2e, see below); **one model resident at a time**; drive Ultra to completion. **U0 ✅** — config adapter (`_hybrid_pattern`
 normalises the newer explicit-`layers_block_type` schema, which omits `num_hidden_layers`) +
 fit-check: Ultra parses, the derived split reproduces the explicit list bit-for-bit, the quant policy
 covers all 51,023 tensors (rule #6), and the mix is resident at **289.7 GiB ≤ 490.4** (200.7 GiB
@@ -258,10 +258,20 @@ compiled ceiling), but STILL <1×**: the fused verify is 1.43–2.01× t_main, t
 can't touch it). `acc==` shows `!!` at bf16 near-ties (F/FC are ≤1 ULP, not bit-identical — near-ties flip
 across modes; `match` mostly 48/48); losslessness owned by M2 (the int4 main model verifies every draft).
 **So crossing 1× at B=1 now needs the MoE verify cost reduced (bandwidth, not launch — a harder lever); the
-throughput lever stays the already-characterized B>1 tree-verify (MTP-M4).** **Remaining U4 work:** the B=1
->1× MoE-bandwidth lever (open), and serving-throughput B>1 multi-stream decode (Stream A settled B≈32; the
-#153 loop-kill throughput win folds in). Stream A's serving recommendation is settled: **B≈32
-throughput-optimal**. The InternLM2.5 MInference track below is **paused at M6 ✅ (M7 deferred)**, not
+throughput lever stays the already-characterized B>1 tree-verify (MTP-M4).** **U4/MoE gather_qmm
+batch-scaling ✅** (`parity/nemotron_ultra_moe_qmm_bench.py`, one real MoE layer, rule 8) — MEASURES the
+Stream-B "reduce the MoE verify bandwidth" question instead of guessing: the routed `gather_qmm` is
+**already fused** (sorted dispatch, the DSV4 `_swiglu_stack_packed` / qwen35 pattern) and amortizes hard at
+batch — **per-token MoE cost 1195 µs @ B=1 → 209 µs @ B=32 (5.58× cheaper/token) → 182 µs @ B=128 (6.6×)**;
+**sorted dispatch is 0.93× @ B=1** (pure overhead, no overlap) **but 1.81× @ B=32** (each touched expert's
+int4 weights read once for all tokens routed to it). So the MoE "bandwidth lever" is **not a missing
+fusion** — it's a **B=1-vs-B=32 regime**: a single stream can't amortize (why Stream B's B=1 spec stayed
+<1×), but B=32 serving gets it for free. This **reconciles Stream A**: at B=32 the MoE is cheap (amortized
+5.6×) so the per-stream **Mamba** recurrence is the decode ceiling (NOT the MoE), consistent with the ~48
+tok/s knee. **Remaining U4 work:** the only serving lever past ~48 tok/s is the **batched Mamba SSD-step**
+(the same `mamba_ssd.py` surface as Stream B's kernel — the MoE needs nothing more); the B=1 >1× spec lever
+is fundamentally capped (a single stream can't amortize the MoE). Stream A's serving recommendation is
+settled: **B≈32 throughput-optimal**. The InternLM2.5 MInference track below is **paused at M6 ✅ (M7 deferred)**, not
 abandoned.
 
 **Paused: InternLM2.5 sparse-prefill (MInference family) — M6 ✅, M7 next.** Handover
