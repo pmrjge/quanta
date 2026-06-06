@@ -268,11 +268,29 @@ int4 weights read once for all tokens routed to it). So the MoE "bandwidth lever
 fusion** — it's a **B=1-vs-B=32 regime**: a single stream can't amortize (why Stream B's B=1 spec stayed
 <1×), but B=32 serving gets it for free. This **reconciles Stream A**: at B=32 the MoE is cheap (amortized
 5.6×) so the per-stream **Mamba** recurrence is the decode ceiling (NOT the MoE), consistent with the ~48
-tok/s knee. **Remaining U4 work:** the only serving lever past ~48 tok/s is the **batched Mamba SSD-step**
-(the same `mamba_ssd.py` surface as Stream B's kernel — the MoE needs nothing more); the B=1 >1× spec lever
-is fundamentally capped (a single stream can't amortize the MoE). Stream A's serving recommendation is
-settled: **B≈32 throughput-optimal**. The InternLM2.5 MInference track below is **paused at M6 ✅ (M7 deferred)**, not
-abandoned.
+tok/s knee. **U4/decode-step breakdown ✅** — the measure-first localization of that ~48 tok/s ceiling
+BEFORE building any SSD kernel (`parity/nemotron_ultra_decode_step_breakdown.py`, solo ~306 GiB): a real
+native (form-2) **T=1 decode** step decomposed by layer-kind + a mamba sub-breakdown + an **e2e
+fused-step A/B**. Stream A *inferred* the ceiling is "the per-stream Mamba recurrence"; the breakdown keeps
+the direction but **corrects the mechanism**. At B=32 the step is **MoE 47% + mamba 40% + attn 12%** (real
+total 642 ms ⇒ 49.8 tok/s, reproducing the knee), and **every** kind amortizes per-token (moe 0.26× /
+mamba 0.21× — the dense GEMMs read their weight once for all B tokens). The lone non-amortizer is the SSD
+recurrence (per-stream state), and the sub-breakdown finds the real cost: the **composed `ssd_step`
+explodes to 64% of the mamba block at B=32** (4.6 ms/block vs the projections' ~2 ms) because the **eager**
+batched path materializes several `[B,H,N,P]` fp32 temporaries (~268 MiB each) it can't fuse — the
+already-built **`ssd_step_fused` kernel does the identical work 3.86× faster** (in-kernel state carry, no
+temporaries). So the serving lever is **NOT a new kernel** — it is **graduating `FUSED_SSD_STEP`** (shelved
+as a "no-win", but that was B=1-*compiled*-only, where `mx.compile` fuses the composed ops). The **e2e A/B
+confirms** it on the real native serving decode, **greedy-exact** (argmax_match; the |Δlogit| 2.12 is the
+bf16-ULP reorder class): composed→fused **1.04× / 1.15× / 1.26× / 1.36× @ B=1/8/16/32** — **+36% aggregate
+decode throughput at B=32 (49.4 → 67.0 tok/s)**, output-equivalent (so the lever is now *measured AND
+parity-proven*, not assumed). **Remaining U4 work:** **graduate `FUSED_SSD_STEP` for the batched decode
+steppers** (the confirmed lever — wire it into `batched_decode_step_fused`/`_native` + re-gate the
+`native==fused` parity bit-exact→greedy-exact; ~1.36× @ B=32), after which the residual ceiling is the
+**MoE+mamba co-dominant weight bandwidth** (B>32 is admission policy / a quant-bits lever, not a kernel)
+and the B=1 >1× spec lever stays fundamentally capped (a single stream can't amortize). Stream A's serving
+recommendation is settled: **B≈32 throughput-optimal** (now ~67 tok/s with the fused step). The InternLM2.5
+MInference track below is **paused at M6 ✅ (M7 deferred)**, not abandoned.
 
 **Paused: InternLM2.5 sparse-prefill (MInference family) — M6 ✅, M7 next.** Handover
 **`PLAN_minference.md`**. Reuse the validated block-sparse substrate (`quanta.modeling.xattention`,

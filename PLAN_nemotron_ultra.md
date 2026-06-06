@@ -359,6 +359,24 @@ context length is too short for the orchestrator role.
     **Mamba** recurrence is the decode ceiling — not the MoE. So the only serving lever past ~48 tok/s is
     the **batched Mamba SSD-step** (same `mamba_ssd.py` surface as Stream B); the MoE needs nothing more.
 
+  - **U4/decode-step breakdown ✅ — localized the B=32 serving ceiling + CONFIRMED the lever (measure-first,
+    no kernel built yet).** `parity/nemotron_ultra_decode_step_breakdown.py` (solo ~306 GiB) decomposes a
+    real native (form-2) **T=1 decode** step by layer-kind + a mamba sub-breakdown + an **e2e fused-step
+    A/B**. At B=32: **MoE 47% + mamba 40% + attn 12%** (real total 642 ms ⇒ 49.8 tok/s, reproduces the
+    Stream-A knee); **every** kind amortizes per-token (moe 0.26× / mamba 0.21× — dense GEMMs share the
+    weight read across B). The lone non-amortizer is the SSD recurrence, and the sub-breakdown nails the
+    real cost: the **composed `ssd_step` is 64% of the mamba block at B=32** (4.6 ms/block vs projections'
+    ~2 ms) because the **eager** batched path materializes several `[B,H,N,P]` fp32 temporaries (~268 MiB
+    each) — the already-built **`ssd_step_fused` kernel is 3.86× faster** (in-kernel state carry). So the
+    lever is **NOT a new kernel** — it's **graduating `FUSED_SSD_STEP`** (shelved as a "no-win", but that
+    was B=1-*compiled*-only). The **e2e A/B confirms it greedy-exact** (argmax_match; |Δlogit| 2.12 = the
+    bf16-ULP reorder class): composed→fused **1.04× / 1.15× / 1.26× / 1.36× @ B=1/8/16/32** — **+36% agg
+    decode @ B=32 (49.4 → 67.0 tok/s)**, output-equivalent. **Corrects Stream A**: mamba IS co-dominant,
+    but the cost is the composed-op blowup, not the recurrence FLOPs. **Next:** graduate `FUSED_SSD_STEP`
+    into the batched steppers (`batched_decode_step_fused`/`_native`) + re-gate `native==fused` (bit-exact
+    → greedy-exact); then the residual ceiling is the **MoE+mamba co-dominant weight bandwidth** (B>32 =
+    admission policy, not a kernel).
+
 ### Second model — MiniMax-M3 (when available)
 - **Mellum2 dropped** — its context length is too short for the orchestrator role. Replaced by
   **MiniMax-M3 once it ships**; the `src/quanta/minimax/` module is already substantially ported in-tree
