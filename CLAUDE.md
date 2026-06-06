@@ -444,6 +444,28 @@ These are non-negotiable and apply to every line of runtime/bake code:
 
 ---
 
+## Serving throughput — measured fleet baseline (M3 Ultra, 2026-06-06)
+
+Steady-state **decode** tok/s through each tuned keeper's production batched/paged path with every
+graduated optimization on (#153 loop-kill, fused-SSD-step, option-B packed experts), run **solo** at
+the cohort operating point **B=32**; greedy/bit-exact correctness verified per run.
+
+| model | resident | agg tok/s @ B=32 | per-stream | B=1 | note |
+|---|---|---|---|---|---|
+| InternLM2.5-7B int8g64 | 9 GiB | **327.4** | 10.2 | 45.5 | plateaus (318 @ B=48) |
+| Nemotron-Super-120B int4g64 | 68 GiB | **205.9** | 6.4 | 27.7 | flat ~206 @ B=32–48 |
+| Qwen3.6-35B-A3B int4g64 | 19 GiB | **175.6** | 5.5 | 28.6 | still climbing past B=32 |
+| DSV4-Flash int4g64 | 180 GiB | **77.8** | 2.4 | 6.2 | 90.4 @ B=48; unpaged #18 arena ~108.5 @ B=32 |
+| Nemotron-Ultra-550B int4rtn_g64 | 306 GiB | **65.5** | 2.05 | 10.5 | peak @ B=32 (63.6 @ B=48); ~78 streams to ceiling |
+
+Throughput tracks size inversely (the 7B serves ~5× the 550B's tok/s); **batching is the lever**
+(DSV4 12.5× / Ultra 6.2× aggregate B=1→B=32). These are *throughput* numbers — the B=1 spec-decode
+*latency* levers (InternLM2.5 EAGLE 1.42×@k2; Ultra MTP best 0.92×, <1×) are a separate axis. Repro
+(each SOLO): `parity/{internlm2,nemotron,dsv4}_paged_batched_bench`, `parity/qwen35_batched_bench`,
+`parity/nemotron_ultra_decode_scale` (Ultra bounded via the module's `BATCHES`).
+
+---
+
 ## Methodology: parity-first (the core discipline)
 
 Before optimizing or quantizing anything, establish a **reference** and diff
