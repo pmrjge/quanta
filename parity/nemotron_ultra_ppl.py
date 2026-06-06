@@ -21,11 +21,15 @@ the RTN arm that #38 says should be ~lossless at the same 4-bit footprint. The c
 expository prose, **held out** from the agentic calibration set (project code + INITIAL_PROMPT.md +
 CLAUDE.md) that the AWQ bake fit its scales on.
 
+AWQ retired (U3 verdict: ship int4-RTN; #38 e2e +24.3%) and its 336 GiB artifact removed, so the AWQ
+arm auto-skips when absent and the harness degrades to the enduring bf16-vs-RTN losslessness check.
+
     uv run --with tokenizers python -m parity.nemotron_ultra_ppl
 """
 
 from __future__ import annotations
 
+import os
 import time
 
 import mlx.core as mx
@@ -141,7 +145,7 @@ def _arm(path: str, arr: mx.array, targets: mx.array, pred_ref: mx.array) -> tup
 
 
 def run() -> None:
-    tok = NemotronTokenizer(AWQ)
+    tok = NemotronTokenizer(RTN)  # AWQ retired (#38) and its artifact removed; the tokenizer is identical
     ids = tok.encode(LONG_PROSE, add_bos=False)[:N_TOK]
     arr = mx.array(ids)
     targets = arr[1:]
@@ -157,20 +161,26 @@ def run() -> None:
     mx.clear_cache()
     t_b = (time.perf_counter() - t0) / 60
 
-    # 2) int4-AWQ then 3) int4-RTN — each loaded, measured, and freed in turn (one resident).
-    ppl_a, acc_a, agree_a, t_a = _arm(AWQ, arr, targets, pred_b)
+    # 2) int4-AWQ (retired #38 — only if the artifact still exists) then 3) int4-RTN; one resident at a time.
+    awq = _arm(AWQ, arr, targets, pred_b) if os.path.isdir(AWQ) else None
     ppl_r, acc_r, agree_r, t_r = _arm(RTN, arr, targets, pred_b)
-
-    da = 100 * (ppl_a - ppl_b) / ppl_b
     dr = 100 * (ppl_r - ppl_b) / ppl_b
+
     print(f"\n=== Nemotron-Ultra U3  (streamed teacher-forced, tokens={len(ids)}) ===")
     print(f"bf16 reference   : ppl {ppl_b:7.3f} | top-1 acc {acc_b:.3f}                       [{t_b:.1f} min]")
-    print(f"int4-AWQ g64     : ppl {ppl_a:7.3f} | top-1 acc {acc_a:.3f} | Δ {da:+5.1f}% | agree {agree_a:.3f}  [{t_a:.1f} min]")
+    if awq is not None:
+        ppl_a, acc_a, agree_a, t_a = awq
+        da = 100 * (ppl_a - ppl_b) / ppl_b
+        print(f"int4-AWQ g64     : ppl {ppl_a:7.3f} | top-1 acc {acc_a:.3f} | Δ {da:+5.1f}% | agree {agree_a:.3f}  [{t_a:.1f} min]")
+    else:
+        print("int4-AWQ g64     : retired (#38 e2e +24.3%); artifact removed — skipped")
     print(f"int4-RTN g64     : ppl {ppl_r:7.3f} | top-1 acc {acc_r:.3f} | Δ {dr:+5.1f}% | agree {agree_r:.3f}  [{t_r:.1f} min]")
 
-    win = "RTN" if ppl_r <= ppl_a else "AWQ"
-    wd = dr if ppl_r <= ppl_a else da
-    wagree = agree_r if ppl_r <= ppl_a else agree_a
+    # Verdict — RTN ships (U3 settled); rank against AWQ only when its artifact is present.
+    if awq is not None and ppl_a < ppl_r:
+        win, wd, wagree = "AWQ", da, agree_a
+    else:
+        win, wd, wagree = "RTN", dr, agree_r
     ship = wd < 5.0 and wagree > 0.90
     print(f"  winner         : int4-{win}  (Δ {wd:+.1f}% vs bf16, agree {wagree:.3f})")
     print(f"VERDICT          : {'ship int4-' + win if ship else 'int4-' + win + ' best but >5% / <0.90 — decision needed'}")
