@@ -310,9 +310,9 @@ real-weight greedy-exactness is the breakdown bench's `_greedy_match_fused`). mo
 residual ceiling is now the **MoE+mamba co-dominant weight bandwidth** (B>32 = admission policy / a
 quant-bits lever, not a kernel); the B=1 >1× spec lever stays fundamentally capped (a single stream can't
 amortize). Stream A's serving recommendation is settled: **B≈32 throughput-optimal, now ~67 tok/s**. The
-InternLM2.5 MInference track below is **paused at M9 ✅ (M10 deferred)**, not abandoned.
+InternLM2.5 MInference track below is **COMPLETE (M0–M10 ✅)**.
 
-**Paused: InternLM2.5 sparse-prefill (MInference family) — M9 ✅, M10 next.** Handover
+**COMPLETE: InternLM2.5 sparse-prefill (MInference family) — M0–M10 ✅.** Handover
 **`PLAN_minference.md`**. Reuse the validated block-sparse substrate (`quanta.modeling.xattention`,
 `gather_sparse_attention`/`sparse_prefill_mask`, `threshold=1.0`==dense); M0 wired a `self.sparse`
 hook into `InternLM2Attention` (default None = dense byte-unchanged). M1 measured XAttention's lossy
@@ -392,9 +392,16 @@ head pay the dense budget (naive per-head gather bottlenecked ≈ uniform xattn,
 group at its OWN `max_kept` (bounded loop, rule 3) — **output-equivalent** (model-free
 `internlm2_grouped_gather_test`: grouped == naive **bit-exact rel 0.00e+00**, == mask 1.3e-7), measured
 **3.2×@64K vs naive 1.2× = 2.64× faster than naive** (bench mix 28 cheap ashape + 4 dense xattn). So
-combining the patterns DOES fold the speed — but only with per-group gathering. **M10 next** = the
-long-context per-head ppl gate (full-model teacher-forcing, dense vs M6 assignment + grouped-fold gather
-twin, chunked probe end-to-end) — the quality companion to M8/M9's speed.
+combining the patterns DOES fold the speed — but only with per-group gathering. **M10 ✅** — the
+long-context per-head ppl gate (`parity/internlm2_ppl_sparse_long.py`, solo, full-model teacher-forcing
+at 16384 tok / 128 blocks on the int8-g64 bake): the three deferred long-context claims verified e2e —
+**keep-all per-head-specs == dense (Δ 1e-5)**, **M7 chunked probe == single-shot BIT-IDENTICAL in
+full-model ppl (Δ 0.00, 3 key chunks)**, **M9 grouped-fold gather == mask (Δ 5e-4)**. Quality frontier:
+block-sparse prefill is **NOT free at long context** on this code-heavy corpus — the per-head assignment
+costs **+31.8% ppl** (94% ashape:L8 / 6% vslash:v6s6) while the adaptive xattn nucleus is near-lossless
+**+2.8% but keeps ~65%** (barely sparse ⇒ priced out of the FLOP budget); a real, steep speed/quality
+tradeoff (vs the 7-block doc's +0.04%), vslash's long-range share rising only 4%→6%. **The MInference
+sparse-prefill track is COMPLETE (M0–M10).**
 
 Prior InternLM2.5 **EAGLE spec-decode** track is **COMPLETE** (M0–M3, `ec0f6f3`; **1.42× lossless @
 k=2** via drafter quantization — memory `project_internlm2_eagle.md`). The earlier batched-decode /

@@ -415,13 +415,61 @@ combining the approaches folds the speed — but only with per-group gathering; 
 gather cannot. (Default off behind the flag; graduating to default-on for per-head configs is a one-line
 follow-up once desired.)
 
-### M10 — long-context per-head ppl gate (remaining)
-- Stream the full 32-layer model at a long context (the now-key-chunked probe makes the vslash heads
-  feasible), dense vs the M6 per-head (kind, params) assignment (mask + the grouped-fold gather twin),
-  with a small ``max_alloc_gb`` so the chunked probe is exercised end-to-end on real weights. Report the
-  long-context Δppl + the gather==mask twins + the realized per-head selector mix (expect more vslash than
-  the 4% M6 saw at 7 blocks — its long-range payoff lands here). The quality companion to M8/M9's speed.
-  Solo GPU.
+### M10 ✅ — long-context per-head ppl gate — DONE
+The QUALITY companion to M8 (gather speed) / M9 (the fold). M1–M6 measured the per-head (kind, params)
+assignment on a SHORT 7-block doc (vslash earned 4%); M10 runs the SAME machinery at a LONG context (128
+blocks) through the full 32-layer teacher-forced model on the real int8-g64 bake, so the three deferred
+long-context claims land **end-to-end on real weights**. `parity/internlm2_ppl_sparse_long.py` (NEW,
+solo): streams ONE ``_DecoderLayer`` resident at a time (rule-8), 16384 real tokens (``_corpus``, no
+tiling), dense vs:
+- **perhd-p** (the M6 per-head assignment, additive-MASK quality path) + **perhd-p fold** (the M9
+  grouped-fold gather — each distinct-spec head-group at its own ``max_kept``, over the M7 chunked probe,
+  with per-head vslash params M6) — the **gather==mask twin**;
+- **vslash v6s6 single** vs **vslash v6s6 chunk** — SAME selection, only ``max_alloc_gb`` differs (8.0 vs
+  0.20), so the full-model ppl delta is the PURE M7 probe chunking (uniform ⇒ 32 heads ⇒ the probe
+  definitely key-chunks — 3 chunks);
+- **perhd-p anchor** (mixed keep-all per-head-specs == dense, the routing parity anchor) + **xattn t0.9**
+  (the priced-out baseline).
+The offline FLOP-budgeted search (``assign_head_specs``, budget=16 blocks) runs per layer over a CHEAP
+bounded menu (ashape L4/L8 + vslash v3s3/v6s6, all keep ≤14 blocks ⇒ GAT_BUDGET=16 strictly NON-binding
+⇒ gather==mask guaranteed by construction); xattn is omitted because at 128 blocks its nucleus keeps ~65%
+⇒ cost ≫ budget ⇒ priced out (the menu-exclusion is the long-context form of the FLOP budget). Decoupled
+``max_alloc_gb`` (the squeeze the substrate forces — one config can't do both at the same T): the mask
+path needs ≥26 GiB for the ``[B,H,T,T]`` mask (set 40), the gather path needs ≤0.20 so the probe chunks.
+- Gates: M0 xattn + M2 ashape + M3 vslash + M4 perhead + M5 perhead-params + M6 vslash-perhead + M7
+  vslash-chunked + M9 grouped-gather + `xattention_parity` still green (**purely additive — NO src
+  change**, so M0–M9 are untouched; re-confirmed M7+M9 model-free green); pytest/ruff/compileall/`uv lock
+  --check`/`git diff --check` clean.
+
+**RESULTS (32 layers, 16384 tok / 128 blocks; int8-g64 bake; wall 175s solo):** dense ppl **4.221**
+(top-1 70.1%). ALL three deferred long-context **CORRECTNESS** claims green e2e on real weights: **[1]
+mixed per-head-specs keep-all == dense (Δ 1.0e-5)** — per-head routing exact at 128 blocks; **[2] M7
+chunked probe == single-shot, BIT-IDENTICAL in full-model ppl (Δ 0.00e+00)** with the probe taking **3
+key chunks** (the chunked probe runs inside the real 32-layer forward, not just the model-free M7 gate);
+**[3] M9 grouped-fold gather == the additive-mask quality path (Δ 4.98e-4 « 2%)** — the fold + per-head
+vslash params + chunked probe, all composed e2e. **Quality frontier (measured):** block-sparse prefill is
+**NOT free at long context** on this code-heavy corpus — the per-head assignment at the aggressive budget
+costs **+31.81%** ppl (94% ashape:L8, 6% vslash:v6s6), uniform cheap patterns +43.21% (vslash v6s6),
+while the adaptive **xattn nucleus is near-lossless +2.81% but keeps ~65%** (little speedup ⇒ priced out).
+So the long-context speed/quality tradeoff is REAL and steep (unlike the 7-block doc's +0.04%): the cheap
+bounded patterns that give M8's 3–4×@64K cost real ppl, and the only near-lossless option is barely
+sparse — the operator picks the budget for the quality they can tolerate. vslash's long-range share rose
+only modestly (4% → 6% at this corpus). The hard gates are the correctness invariants (all green); the
+Δppl + the realized mix are the measured characterization.
+
+---
+
+## Track COMPLETE (M0–M10) ✅
+
+The InternLM2.5 MInference sparse-prefill track is done. Three selectors (xattn antidiagonal nucleus /
+ashape sink+window / vslash global vertical+slash) feed ONE validated chunked block-gather + additive-mask
+execution (`quanta.modeling.xattention`); per-head (kind, params) assignment incl. per-head vslash params
+(M4–M6); the long-context key-chunked probe (M7); the wall-clock speed (M8: O(T²)→O(T), up to 4.3×@64K)
+and the per-head-grouped fold (M9: 2.64× over naive); and the long-context quality frontier (M10). Every
+optimization stayed behind a default-off flag, output-equivalence-gated (rule 4). Optional non-blocking
+follow-up: graduate `grouped_gather` to default-on for per-head configs (one line, bit-exact + strictly
+faster — see M9). The other InternLM2.5 serving lever, EAGLE spec-decode (1.42×@k2 lossless), is also
+DONE (`ec0f6f3`). No further MInference milestones queued.
 
 ---
 
