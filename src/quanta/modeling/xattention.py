@@ -125,10 +125,13 @@ class XAttnConfig:
     # per-head config is set (``head_specs`` / ``head_selectors``), :func:`gather_sparse_attention`
     # instead partitions heads by their DISTINCT spec and gathers each group at its OWN ``max_kept`` (a
     # bounded loop over distinct specs, rule 3), so the cheap-pattern heads run cheap. Output-equivalent
-    # to the naive per-head gather (each head attends the SAME kept blocks); default False ⇒ the naive
-    # single-``max_kept`` path (rule 4 — graduates once the equivalence gate is green). Only affects
-    # ``gather=True`` + a per-head config; the uniform-selector and mask paths are unchanged.
-    grouped_gather: bool = False
+    # to the naive per-head gather (each head attends the SAME kept blocks); default True ⇒ the grouped
+    # fold for per-head configs (**GRADUATED** — equivalence proven bit-exact by the model-free
+    # ``internlm2_grouped_gather_test``, so rule 4's "naive until parity is proven" is satisfied and the
+    # faster fold is now the default). Pass ``grouped_gather=False`` for the naive single-``max_kept``
+    # path. Only affects ``gather=True`` + a per-head config; the uniform-selector (the fold guard is
+    # False ⇒ no-op) and mask paths are unchanged.
+    grouped_gather: bool = True
 
     def __post_init__(self) -> None:
         if self.block % self.stride != 0:
@@ -680,7 +683,8 @@ def gather_sparse_attention(
     global ``max_kept`` = the densest head's, so a few dense heads slow every head. With
     ``grouped_gather=True`` the heads are partitioned by distinct spec and each group gathered at its own
     ``max_kept`` (:func:`_gather_grouped_per_head`) — output-equivalent, but the cheap-pattern heads run
-    cheap. Default False ⇒ the naive single-``max_kept`` path below (rule 4).
+    cheap. Default True (**GRADUATED** — equivalence proven bit-exact by ``internlm2_grouped_gather_test``,
+    so rule 4 is satisfied); pass ``grouped_gather=False`` for the naive single-``max_kept`` path below.
     """
     if cfg.grouped_gather and (cfg.head_specs is not None or cfg.head_selectors is not None):
         return _gather_grouped_per_head(q, k, v, scale, cfg)

@@ -388,9 +388,10 @@ the per-head-GROUPED gather **fold** (answering *"combine the approaches to a fo
 M4–M6 per-head assignment folds quality but NOT speed, because the gather sizes its work by ONE global
 `max_kept` = the densest head's, so a mix of cheap ashape (~3% kept) + dense xattn (~63%) makes every
 head pay the dense budget (naive per-head gather bottlenecked ≈ uniform xattn, 1.2×@64K). The fold
-(`XAttnConfig.grouped_gather`, default off/rule-4) partitions heads by distinct spec and gathers each
-group at its OWN `max_kept` (bounded loop, rule 3) — **output-equivalent** (model-free
-`internlm2_grouped_gather_test`: grouped == naive **bit-exact rel 0.00e+00**, == mask 1.3e-7), measured
+(`XAttnConfig.grouped_gather`, **since graduated to default-on** for per-head configs/rule-4) partitions
+heads by distinct spec and gathers each group at its OWN `max_kept` (bounded loop, rule 3) —
+**output-equivalent** (model-free `internlm2_grouped_gather_test`: grouped == naive **bit-exact rel
+0.00e+00**, == mask 1.3e-7), measured
 **3.2×@64K vs naive 1.2× = 2.64× faster than naive** (bench mix 28 cheap ashape + 4 dense xattn). So
 combining the patterns DOES fold the speed — but only with per-group gathering. **M10 ✅** — the
 long-context per-head ppl gate (`parity/internlm2_ppl_sparse_long.py`, solo, full-model teacher-forcing
@@ -401,7 +402,11 @@ block-sparse prefill is **NOT free at long context** on this code-heavy corpus �
 costs **+31.8% ppl** (94% ashape:L8 / 6% vslash:v6s6) while the adaptive xattn nucleus is near-lossless
 **+2.8% but keeps ~65%** (barely sparse ⇒ priced out of the FLOP budget); a real, steep speed/quality
 tradeoff (vs the 7-block doc's +0.04%), vslash's long-range share rising only 4%→6%. **The MInference
-sparse-prefill track is COMPLETE (M0–M10).**
+sparse-prefill track is COMPLETE (M0–M10).** **Graduation ✅ (post-M10):** `grouped_gather` flipped to
+**default-on** for per-head gather configs (the fold is the default; `False` = the naive single-`max_kept`
+path) — rule-4-authorized since the equivalence is bit-exact (`internlm2_grouped_gather_test` check 6:
+default-no-flag == naive **rel 0.00e+00**); uniform configs + the production uniform `DEFAULT_SPARSE` are a
+no-op (serving unchanged until per-head sparse prefill is wired in, then free).
 
 Prior InternLM2.5 **EAGLE spec-decode** track is **COMPLETE** (M0–M3, `ec0f6f3`; **1.42× lossless @
 k=2** via drafter quantization — memory `project_internlm2_eagle.md`). The earlier batched-decode /

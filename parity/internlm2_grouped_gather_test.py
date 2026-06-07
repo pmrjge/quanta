@@ -11,8 +11,10 @@ pay the dense head's budget. Combining the approaches does not, by itself, fold 
 at its OWN ``max_kept`` (a bounded loop over distinct specs, rule 3), so the cheap-pattern heads finally
 run cheap. It is an **output-equivalent optimization** (rule 4): head ``i`` attends exactly the same kept
 blocks either way — the naive path's extra ``-inf`` gather slots contribute nothing to the softmax — so
-it is kept behind the ``grouped_gather`` flag (default False ⇒ the naive single-``max_kept`` path) until
-this gate proves the equivalence; the wall-clock win is measured separately by the prefill bench.
+it is now **graduated to the default** (``grouped_gather=True`` for per-head configs) — this gate proves
+the equivalence (bit-exact), satisfying rule 4's "naive until parity is proven", so the faster fold is the
+default; pass ``grouped_gather=False`` for the naive single-``max_kept`` path. The wall-clock win is
+measured separately by the prefill bench.
 
 Model-free (synthetic ``q``/``k``/``v``, fp32 for a tight bound). Proves, on a per-head assignment that
 mixes all three selector kinds at different params:
@@ -93,8 +95,10 @@ def run() -> None:
     q, k, v = _qkv(0)
     scale = 1.0 / (D ** 0.5)
 
-    # 1. grouped == naive (head_specs)
-    cfg_naive = XAttnConfig(block=BLOCK, stride=16, head_specs=MIXED_SPECS, min_seq=0, gather=True)
+    # 1. grouped == naive (head_specs). grouped_gather is now DEFAULT True (graduated), so the naive
+    #    reference sets it False explicitly; the fold is the default (check 6 pins the default routes fold).
+    cfg_naive = XAttnConfig(block=BLOCK, stride=16, head_specs=MIXED_SPECS, min_seq=0, gather=True,
+                            grouped_gather=False)
     cfg_fold = replace(cfg_naive, grouped_gather=True)
     naive = gather_sparse_attention(q, k, v, scale, cfg_naive)
     fold = gather_sparse_attention(q, k, v, scale, cfg_fold)
@@ -110,7 +114,7 @@ def run() -> None:
 
     # 3. grouped == naive (head_selectors, the M4 kind-only per-head config)
     cn = XAttnConfig(block=BLOCK, stride=16, head_selectors=MIXED_KINDS, threshold=0.9, local=2,
-                     vert=2, slash=2, min_seq=0, gather=True)
+                     vert=2, slash=2, min_seq=0, gather=True, grouped_gather=False)
     d3 = _rel(gather_sparse_attention(q, k, v, scale, replace(cn, grouped_gather=True)),
               gather_sparse_attention(q, k, v, scale, cn))
     print(f"  grouped vs naive (head_selectors) rel={d3:.2e}  (expect ~0)")
@@ -134,6 +138,15 @@ def run() -> None:
           f"global={global_max:.1f}  (naive pays global for all; fold pays per-group)")
     assert ashape_max < xattn_max, "expected the static ashape heads to keep fewer blocks than xattn"
     assert global_max == xattn_max, "global max_kept should be set by the dense (xattn) group"
+
+    # 6. GRADUATION: grouped_gather is now DEFAULT True for per-head configs. A per-head gather config
+    #    built with NO flag must carry grouped_gather=True AND produce the fold's output (== the explicit
+    #    naive from check 1) — i.e. the new default is the (output-equivalent) fold, not the naive path.
+    cfg_default = XAttnConfig(block=BLOCK, stride=16, head_specs=MIXED_SPECS, min_seq=0, gather=True)
+    assert cfg_default.grouped_gather is True, "grouped_gather did not graduate to default True"
+    d6 = _rel(gather_sparse_attention(q, k, v, scale, cfg_default), naive)
+    print(f"  graduated default(no flag) == naive  rel={d6:.2e}  (default now folds, == naive single-max_kept)")
+    assert d6 < 1e-5, f"graduated default per-head gather != naive ({d6:.2e})"
 
     print("PASS — per-head-grouped gather fold: output-equivalent to the naive per-head gather (and the "
           "mask path), for head_specs & head_selectors, with/without a binding budget; the cheap groups "

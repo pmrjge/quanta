@@ -412,8 +412,8 @@ run cheap.
 gather **1.2×@64K** (≈ uniform xattn; the dense head sets the global budget) → folded **3.2×@64K**, i.e.
 **2.64× faster than naive** at 64K (1.77×@8K → 2.26×@16K → 2.48×@32K → 2.64×@64K), bit-equivalent. So yes:
 combining the approaches folds the speed — but only with per-group gathering; the naive global-``max_kept``
-gather cannot. (Default off behind the flag; graduating to default-on for per-head configs is a one-line
-follow-up once desired.)
+gather cannot. (Landed default-off behind the flag; **subsequently GRADUATED to default-on** for per-head
+configs — see the graduation note in the Track-COMPLETE section.)
 
 ### M10 ✅ — long-context per-head ppl gate — DONE
 The QUALITY companion to M8 (gather speed) / M9 (the fold). M1–M6 measured the per-head (kind, params)
@@ -466,10 +466,23 @@ ashape sink+window / vslash global vertical+slash) feed ONE validated chunked bl
 execution (`quanta.modeling.xattention`); per-head (kind, params) assignment incl. per-head vslash params
 (M4–M6); the long-context key-chunked probe (M7); the wall-clock speed (M8: O(T²)→O(T), up to 4.3×@64K)
 and the per-head-grouped fold (M9: 2.64× over naive); and the long-context quality frontier (M10). Every
-optimization stayed behind a default-off flag, output-equivalence-gated (rule 4). Optional non-blocking
-follow-up: graduate `grouped_gather` to default-on for per-head configs (one line, bit-exact + strictly
-faster — see M9). The other InternLM2.5 serving lever, EAGLE spec-decode (1.42×@k2 lossless), is also
-DONE (`ec0f6f3`). No further MInference milestones queued.
+optimization landed behind a default-off flag, output-equivalence-gated (rule 4).
+
+**Graduation ✅ (post-M10):** `grouped_gather` is now **default True** for per-head configs (`gather=True`
++ `head_specs`/`head_selectors`) — the fold is the default, the naive single-`max_kept` path is `False`.
+Authorized by rule 4 (the equivalence is proven **bit-exact** — `internlm2_grouped_gather_test` gains a
+check 6: a per-head gather config with NO flag carries `grouped_gather=True` and its output == the explicit
+naive, **rel 0.00e+00**). `src/quanta/modeling/xattention.py` (default flip + docstrings) +
+`internlm2_grouped_gather_test.py` (explicit `grouped_gather=False` on the naive refs + check 6). Uniform
+configs are a no-op (the fold guard needs a per-head config); the production `DEFAULT_SPARSE` is uniform,
+so serving behaviour is unchanged until per-head sparse prefill is wired in — at which point it gets the
+fast path for free. The heavy ppl harnesses (M4–M6, M10) now exercise the grouped default on their gather
+twins; **not re-run** — the change is bit-exact (model-free proven), so their ppl is identical. Re-gated
+green: M0/M2/M3/M4/M5/M6/M7/M9 + `xattention_parity` model-free, pytest/ruff/compileall/`uv lock
+--check`/`git diff --check`.
+
+The other InternLM2.5 serving lever, EAGLE spec-decode (1.42×@k2 lossless), is also DONE (`ec0f6f3`). No
+further MInference milestones queued.
 
 ---
 
