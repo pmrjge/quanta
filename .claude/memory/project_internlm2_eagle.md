@@ -16,8 +16,9 @@ research pass (user: "what levers for speed of decode and prefill are still out 
 two highest-value remaining levers as both landing on InternLM2.5:
 1. **EAGLE-3 spec-decode** (lossless; ~1.5–2.5× decode) — STARTED, see below.
 2. **MInference dynamic sparse prefill** (training-free, lossy → quality-gated, up to ~10×@1M) — a
-   separate later track ([[prefill-optimization-landscape]]). MInference = offline per-head pattern
-   (A-shape / vertical-slash / block-sparse) + sparse SDPA.
+   separate track ([[prefill-optimization-landscape]]), now its own milestone series at **M6 ✅**, M7
+   next: [[project-internlm2-minference]]. MInference = offline per-head pattern (A-shape /
+   vertical-slash / block-sparse) + sparse SDPA.
 
 **Settled (do not re-litigate):** spec-decode is NOT diluted on the MoE keepers — the Kimi
 "top-8 routing → expert-union tax" finding ([[project-eagle3-speculative]]) was OVERTURNED by
@@ -92,7 +93,8 @@ a drafter sized to InternLM2.5 + the one missing **capture** primitive.
   bench `IL2_QUANT_BITS` env = PTQ (`nn.quantize` body + `head_bits`). Repro:
   `IL2_QUANT_BITS=4 uv run python -m parity.internlm2_eagle_spec_bench <…/drafter_int8g64_refined2.safetensors>`.
   Gates: `pytest tests/` + capture/spec/train model-free gates green (additive); ruff/compile/lock/diff
-  clean. **EAGLE spec-decode on InternLM2.5 is DONE** (1.42× lossless @ k=2); only the later MInference
-  prefill track (lossy, separate) remains.
+  clean. **EAGLE spec-decode on InternLM2.5 is DONE** (1.42× lossless @ k=2); the MInference prefill
+  track (lossy, separate) is now its own milestone series — **M6 ✅, M7 next** ([[project-internlm2-minference]]).
 
-See also [[project-model-targets]] (keeper set), [[project-batched-operating-point]] (B=32 serving).
+See also [[project-model-targets]] (keeper set), [[project-batched-operating-point]] (B=32 serving),
+[[project-internlm2-minference]] (the 2nd InternLM2.5 lever — sparse prefill).
