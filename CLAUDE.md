@@ -409,7 +409,15 @@ default-no-flag == naive **rel 0.00e+00**); uniform configs + the production uni
 no-op (serving unchanged until per-head sparse prefill is wired in, then free).
 
 Prior InternLM2.5 **EAGLE spec-decode** track is **COMPLETE** (M0–M3, `ec0f6f3`; **1.42× lossless @
-k=2** via drafter quantization — memory `project_internlm2_eagle.md`). The earlier batched-decode /
+k=2** via drafter quantization — memory `project_internlm2_eagle.md`), and is now **wired into the oMLX
+serving shim**: `QuantaOmlxEngine._dispatch_spec_k` routes `spec_k>1` on an InternLM2.5 artifact through
+the EAGLE-3 drafter (`quanta.internlm2.eagle.spec_generate`) — the only keeper whose spec is a trained
+drafter, not native MTP — with the drafter auto-loaded from an **embedded `eagle/` sidecar**
+(`_ensure_eagle` → `quanta.eagle.artifact.load_eagle`; `parity/internlm2_embed_eagle.py` does the one-shot
+embed) and PTQ'd to the int4-g64 serving operating point. Gated model-free
+(`parity/internlm2_omlx_eagle_test.py`: shim `spec==greedy`, injected-state precedence, missing-sidecar
+fail-loud) + **real-weight end-to-end** (`parity/internlm2_omlx_eagle_real_test.py`, solo: `_dispatch_spec_k`
+== greedy **bit-exact** on the real int8-g64 bake + embedded drafter — lossless). The earlier batched-decode /
 paged-KV / expert-footprint sweep across the serving keepers (DSV4, Nemotron, InternLM2.5, Qwen3.6)
 is fully landed:
 

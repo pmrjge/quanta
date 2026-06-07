@@ -990,7 +990,9 @@ class QuantaOmlxEngine(_OmlxBaseEngine):
     def __init__(self, model_name: str, *, runtime: RuntimeLike | None = None,
                  tokenizer: TokenizerLike | None = None, runtime_loader=None,
                  output_cls: type[Any] = OmlxGenerationOutput, eos_token_ids: set[int] | None = None,
-                 batched_session: Any | None = None, paged_kv: bool | None = None) -> None:
+                 batched_session: Any | None = None, paged_kv: bool | None = None,
+                 eagle: tuple[Any, mx.array, mx.array, tuple[int, ...], int | None] | None = None,
+                 eagle_bits: int | None = 4, eagle_group_size: int = 64) -> None:
         self._model_name = model_name
         self._root = Path(model_name).expanduser().resolve(strict=False)
         self._runtime = runtime
@@ -1006,6 +1008,14 @@ class QuantaOmlxEngine(_OmlxBaseEngine):
         # #152 prefix-sharing paged KV — OFF until parity-green (rule 4); None ⇒ the package default.
         from quanta.paged import PAGED_KV_DEFAULT
         self._paged_kv = PAGED_KV_DEFAULT if paged_kv is None else bool(paged_kv)
+        # InternLM2 EAGLE-3 spec-decode state (drafter, embed, head, capture_layers, head_bits) —
+        # injected directly (tests) or lazily loaded from the artifact's embedded eagle/ sidecar by
+        # :meth:`_ensure_eagle` (the only keeper whose spec path is a trained drafter, not native MTP).
+        # ``eagle_bits`` is the drafter PTQ for serving (M3 operating point: int4 g64 → 1.42× lossless
+        # @ k=2; the EAGLE guarantee holds for any drafter quality — quant only changes draft *speed*).
+        self._eagle = eagle
+        self._eagle_bits = eagle_bits
+        self._eagle_group_size = eagle_group_size
 
     # --- BaseEngine properties -------------------------------------------------
     @property
@@ -1598,17 +1608,57 @@ class QuantaOmlxEngine(_OmlxBaseEngine):
                 "(DSV4 / Nemotron / InternLM2.5 only)")
         return self._batched_session
 
+    def _ensure_eagle(self) -> tuple[Any, mx.array, mx.array, tuple[int, ...], int | None]:
+        """Lazy-load the InternLM2.5 EAGLE-3 spec-decode state ``(drafter, embed, head, capture_layers,
+        head_bits)``.
+
+        Injected via the ``eagle=`` ctor arg (tests / advanced callers) takes precedence; otherwise the
+        trained drafter is loaded from the artifact's **embedded** ``eagle/`` sidecar
+        (:func:`quanta.eagle.artifact.load_eagle`, portable in-artifact refs only), PTQ'd to the M3
+        serving operating point (``eagle_bits`` g``eagle_group_size`` — int4 g64 ⇒ 1.42× lossless @
+        k=2), and paired with the runtime's frozen ``embed_head()`` (bf16). Refuses loudly (rule 6) if no
+        sidecar is embedded — never silently downgrades a spec request to plain decode."""
+        if self._eagle is not None:
+            return self._eagle
+        import mlx.nn as nn
+
+        from quanta.eagle.artifact import load_eagle
+        try:
+            drafter, layers = load_eagle(self._root)
+        except FileNotFoundError as e:
+            raise OmlxShimError(
+                "spec_k>1 on InternLM2.5 needs a trained EAGLE-3 drafter embedded in the artifact "
+                f"({e}). Embed one with quanta.eagle.artifact.embed_eagle(<art_dir>, <drafter."
+                "safetensors>, capture_layers=quanta.internlm2.eagle.DEFAULT_CAPTURE_LAYERS, "
+                "drafter_cfg=quanta.internlm2.eagle.INTERNLM2_DRAFTER_CFG).") from e
+        if self._eagle_bits:                                   # PTQ the drafter body (lossless-safe)
+            nn.quantize(drafter, group_size=self._eagle_group_size, bits=self._eagle_bits)
+        embed, head = self._runtime.embed_head()
+        embed, head = embed.astype(mx.bfloat16), head.astype(mx.bfloat16)
+        mx.eval(drafter.parameters(), embed, head)
+        self._eagle = (drafter, embed, head, layers, self._eagle_bits or None)
+        return self._eagle
+
     def _dispatch_spec_k(self, *, prompt_ids: list[int], spec_k: int, max_new: int,
                          eos_id: Any) -> list[int]:
-        """Dispatch a single-stream request to native MTP self-speculation (``spec_k > 1``).
+        """Dispatch a single-stream request to speculative decode (``spec_k > 1``) — native MTP
+        self-speculation (DSV4 / Nemotron) or an EAGLE-3 trained drafter (InternLM2.5).
 
-        Lazy-imports ``quanta.{dsv4,nemotron}.spec.spec_generate_k`` so the engine compiles even when
-        the sibling agents (#148 for Nemotron) haven't merged yet — the failure point is the call,
-        not the module import. The runtime must expose ``mtp``, ``embed_w``, ``lm_head_w`` for spec
-        to call into the head; the engine refuses loudly if any is missing (rule 6 — never silently
-        emit a non-spec stream while the caller asked for spec)."""
+        Lazy-imports the per-model spec entry so the engine compiles even when a sibling agent hasn't
+        merged — the failure point is the call, not the module import. Output is **bit-identical to
+        plain greedy** for every path (the target's own verify arbitrates losslessly; the draft head /
+        drafter only changes *speed*). Refuses loudly if the model class has no spec path or its
+        prerequisites are missing (rule 6 — never silently emit a non-spec stream)."""
         mt = self.model_type or ""
         rt = self._runtime
+        if mt == "internlm2" or mt.startswith("internlm2"):    # EAGLE-3 drafter (not native MTP)
+            from quanta.internlm2.eagle import spec_generate as _eagle_spec
+
+            drafter, embed, head, layers, head_bits = self._ensure_eagle()
+            tokens, _stats = _eagle_spec(rt, drafter, embed, head, prompt_ids, max_new=max_new,
+                                         k=spec_k, layers=layers, eos_id=eos_id, head_bits=head_bits)
+            return [int(t) for t in tokens]
+        # native MTP self-speculation (DSV4 / Nemotron) — needs the MTP head + embed + lm_head.
         for attr in ("mtp", "embed_w", "lm_head_w"):
             if not hasattr(rt, attr):
                 raise OmlxShimError(
@@ -1635,7 +1685,8 @@ class QuantaOmlxEngine(_OmlxBaseEngine):
                                 max_new=max_new, eos_id=eos_id, k=spec_k)
             return [int(t) for t in tokens]
         raise OmlxShimError(
-            f"spec_k>1 not wired for quanta artifact model_type={mt!r} (DSV4 / Nemotron only)")
+            f"spec_k>1 not wired for quanta artifact model_type={mt!r} "
+            "(DSV4 / Nemotron native MTP, or InternLM2.5 EAGLE-3)")
 
     def _sample(self, logits: mx.array, temperature: float, top_k: int, top_p: float, min_p: float,
                 rep: float, freq: float, pres: float, prev: Sequence[int],
