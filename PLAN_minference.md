@@ -381,15 +381,47 @@ headline:
 
 **RESULT:** block-sparse gather prefill turns the keeper's O(T²) attention into O(T) — **up to 4.3× per
 attention layer at 64K** (ashape) / 3.4× (vslash), crossover at 8–16K, the static patterns the clear win
-and the adaptive nucleus the laggard. The per-head deployment number (most heads → ashape/vslash, a few
-→ xattn) + the long-context quality (Δppl) are M9.
+and the adaptive nucleus the laggard. Combining the patterns per-head **folds** the speed (M9); the
+long-context quality (Δppl) is M10.
 
-### M9 — long-context per-head ppl gate (remaining)
+### M9 ✅ — per-head-GROUPED gather "fold" (speed) — DONE
+*"Can't you combine the approaches to a fold on speed?"* — the M4–M6 per-head assignment folds *quality*
+(each head its cheapest-sufficient pattern) but **NOT speed**: the block-gather sizes its work by ONE
+global ``max_kept`` = the densest head's kept-block count (a rectangular ``[B,H,m,max_kept,blk]`` gather),
+so a mix of a cheap static head (ashape, ~3% kept at 64K) with a dense one (xattn nucleus, ~63%) makes
+EVERY head pay the dense budget — the naive per-head gather is bottlenecked ≈ uniform xattn (M8's
+1.2×@64K). The fold: ``XAttnConfig.grouped_gather`` partitions heads by their DISTINCT spec and gathers
+each group at its OWN ``max_kept`` (a bounded loop over distinct specs, rule 3), so the cheap-pattern heads
+run cheap.
+- `src/quanta/modeling/xattention.py`: ``XAttnConfig.grouped_gather`` (default False ⇒ the naive
+  single-``max_kept`` path, rule 4) + a dispatch in ``gather_sparse_attention`` to
+  ``_gather_grouped_per_head`` (slice heads per distinct spec via ``mx.take``, gather each group with its
+  uniform selector, un-permute). **Output-equivalent** — head ``i`` attends the SAME kept blocks either
+  way (the naive path's extra ``-inf`` gather slots contribute nothing to the softmax).
+- `parity/internlm2_grouped_gather_test.py` (NEW, model-free, fp32): grouped == naive **bit-exact (rel
+  0.00e+00)** for head_specs & head_selectors, with/without a binding budget; grouped == the mask path
+  (1.3e-7, composing the M6 gather==mask invariant); the fold premise (cheap group's max_kept ≪ the dense
+  group's global max_kept). Run: `uv run python -m parity.internlm2_grouped_gather_test`.
+- `parity/internlm2_prefill_bench.py` (EXTENDED): a deployment-plausible mix (28 cheap ashape + 4 dense
+  xattn heads) timed naive vs folded across the T sweep.
+- Gates: grouped==naive bit-exact + grouped==mask (model-free); M5/M6/M7 + `xattention_parity` green
+  (naive path unchanged — ``grouped_gather`` defaults off); ruff/compileall/pytest/`uv lock --check`/`git
+  diff --check` clean.
+
+**RESULT:** the fold turns a bottlenecked mixed per-head assignment into a real speedup — naive per-head
+gather **1.2×@64K** (≈ uniform xattn; the dense head sets the global budget) → folded **3.2×@64K**, i.e.
+**2.64× faster than naive** at 64K (1.77×@8K → 2.26×@16K → 2.48×@32K → 2.64×@64K), bit-equivalent. So yes:
+combining the approaches folds the speed — but only with per-group gathering; the naive global-``max_kept``
+gather cannot. (Default off behind the flag; graduating to default-on for per-head configs is a one-line
+follow-up once desired.)
+
+### M10 — long-context per-head ppl gate (remaining)
 - Stream the full 32-layer model at a long context (the now-key-chunked probe makes the vslash heads
-  feasible), dense vs the M6 per-head (kind, params) assignment (mask + gather twin), with a small
-  ``max_alloc_gb`` so the chunked probe is exercised end-to-end on real weights. Report the long-context
-  Δppl + the gather==mask twins + the realized per-head selector mix (expect more vslash than the 4% M6
-  saw at 7 blocks — its long-range payoff lands here). The quality companion to M8's speed. Solo GPU.
+  feasible), dense vs the M6 per-head (kind, params) assignment (mask + the grouped-fold gather twin),
+  with a small ``max_alloc_gb`` so the chunked probe is exercised end-to-end on real weights. Report the
+  long-context Δppl + the gather==mask twins + the realized per-head selector mix (expect more vslash than
+  the 4% M6 saw at 7 blocks — its long-range payoff lands here). The quality companion to M8/M9's speed.
+  Solo GPU.
 
 ---
 

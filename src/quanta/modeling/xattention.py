@@ -118,6 +118,17 @@ class XAttnConfig:
     # :func:`select_keep`, so heads sharing the one global probe can still keep different vert/slash.
     # Built offline by :func:`assign_head_specs` (kernel-aware FLOP-budgeted search).
     head_specs: tuple[HeadSpec, ...] | None = None
+    # --- per-head-GROUPED gather (M9-speed "fold"): the block-gather sizes its work by ONE global
+    # ``max_kept`` = the densest head's kept-block count, so a per-head assignment that mixes a cheap
+    # static pattern (ashape, kept ~3% at long ctx) with a dense one (xattn nucleus, kept ~63%) makes
+    # EVERY head pay the dense head's budget — combining does not fold the speed. When this is True AND a
+    # per-head config is set (``head_specs`` / ``head_selectors``), :func:`gather_sparse_attention`
+    # instead partitions heads by their DISTINCT spec and gathers each group at its OWN ``max_kept`` (a
+    # bounded loop over distinct specs, rule 3), so the cheap-pattern heads run cheap. Output-equivalent
+    # to the naive per-head gather (each head attends the SAME kept blocks); default False ⇒ the naive
+    # single-``max_kept`` path (rule 4 — graduates once the equivalence gate is green). Only affects
+    # ``gather=True`` + a per-head config; the uniform-selector and mask paths are unchanged.
+    grouped_gather: bool = False
 
     def __post_init__(self) -> None:
         if self.block % self.stride != 0:
@@ -664,7 +675,15 @@ def gather_sparse_attention(
     chunked (each chunk scores only its query blocks against keys up to its causal horizon),
     so nothing global is O((T/blk)²) either. The chunk loop is the sanctioned coarse,
     bounded chunked-prefill loop — not a per-token/per-block hot loop.
+
+    Per-head "fold" (``cfg.grouped_gather``): a per-head assignment otherwise sizes the gather by ONE
+    global ``max_kept`` = the densest head's, so a few dense heads slow every head. With
+    ``grouped_gather=True`` the heads are partitioned by distinct spec and each group gathered at its own
+    ``max_kept`` (:func:`_gather_grouped_per_head`) — output-equivalent, but the cheap-pattern heads run
+    cheap. Default False ⇒ the naive single-``max_kept`` path below (rule 4).
     """
+    if cfg.grouped_gather and (cfg.head_specs is not None or cfg.head_selectors is not None):
+        return _gather_grouped_per_head(q, k, v, scale, cfg)
     bsz, h, t, d = q.shape
     vd = v.shape[-1]
     blk = cfg.block
@@ -728,3 +747,47 @@ def gather_sparse_attention(
 
     out = outs[0] if len(outs) == 1 else mx.concatenate(outs, axis=2)  # [B,H,nb,blk,vd]
     return out.reshape(bsz, h, tp, vd)[:, :, :t, :]
+
+
+def _gather_grouped_per_head(
+    q: mx.array, k: mx.array, v: mx.array, scale: float, cfg: XAttnConfig
+) -> mx.array:
+    """Per-head-GROUPED block-gather (the M9-speed "fold") → ``[B,H,T,Vd]``, output-equivalent to the
+    naive per-head :func:`gather_sparse_attention` but each distinct-spec head-group runs at its OWN
+    ``max_kept``.
+
+    The naive per-head gather sizes its work by ONE global ``max_kept`` = the densest head's kept-block
+    count (it builds a rectangular ``[B,H,m,max_kept,blk]`` gather), so a mixed assignment makes the cheap
+    heads pay the dense head's budget. Here the heads are partitioned by their DISTINCT spec (``head_specs``
+    ⇒ HeadSpec, else ``head_selectors`` ⇒ kind); each group is sliced out (``mx.take`` over the head axis),
+    gathered with that group's UNIFORM selector (its own tight ``max_kept``), and the group outputs are
+    un-permuted back to the original head order. Bit-equivalent: head ``i`` attends exactly its kept blocks
+    either way (the naive path's extra ``-inf`` mask slots contribute nothing to the softmax). The loop is
+    bounded over DISTINCT specs (≤ the search-grid size, never per-head/per-token — rule 3).
+    """
+    h = q.shape[1]
+    specs = cfg.head_specs
+    if specs is not None:
+        keys: list = list(specs)
+        uniforms = {sp: replace(cfg, head_specs=None, head_selectors=None, grouped_gather=False,
+                                selector=sp.kind, threshold=sp.threshold, local=sp.local,
+                                vert=sp.vert, slash=sp.slash) for sp in set(specs)}
+    else:
+        keys = list(cfg.head_selectors)
+        uniforms = {kd: replace(cfg, head_specs=None, head_selectors=None, grouped_gather=False,
+                                selector=kd) for kd in set(keys)}
+    if len(keys) != h:
+        raise ValueError(f"grouped_gather: per-head config has {len(keys)} entries but {h} query heads")
+    groups: dict = {}                                          # distinct spec → original head indices
+    for i, key in enumerate(keys):
+        groups.setdefault(key, []).append(i)
+    order: list[int] = []
+    outs: list[mx.array] = []
+    for key, idxs in groups.items():                          # bounded over DISTINCT specs, not heads
+        hi = mx.array(idxs, dtype=mx.int32)
+        outs.append(gather_sparse_attention(mx.take(q, hi, axis=1), mx.take(k, hi, axis=1),
+                                            mx.take(v, hi, axis=1), scale, uniforms[key]))
+        order.extend(idxs)
+    out_perm = outs[0] if len(outs) == 1 else mx.concatenate(outs, axis=1)   # [B,H,T,Vd] grouped order
+    inv = mx.argsort(mx.array(order, dtype=mx.int32))          # restore original head order
+    return mx.take(out_perm, inv, axis=1)

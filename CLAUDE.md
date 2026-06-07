@@ -310,9 +310,9 @@ real-weight greedy-exactness is the breakdown bench's `_greedy_match_fused`). mo
 residual ceiling is now the **MoE+mamba co-dominant weight bandwidth** (B>32 = admission policy / a
 quant-bits lever, not a kernel); the B=1 >1× spec lever stays fundamentally capped (a single stream can't
 amortize). Stream A's serving recommendation is settled: **B≈32 throughput-optimal, now ~67 tok/s**. The
-InternLM2.5 MInference track below is **paused at M8 ✅ (M9 deferred)**, not abandoned.
+InternLM2.5 MInference track below is **paused at M9 ✅ (M10 deferred)**, not abandoned.
 
-**Paused: InternLM2.5 sparse-prefill (MInference family) — M8 ✅, M9 next.** Handover
+**Paused: InternLM2.5 sparse-prefill (MInference family) — M9 ✅, M10 next.** Handover
 **`PLAN_minference.md`**. Reuse the validated block-sparse substrate (`quanta.modeling.xattention`,
 `gather_sparse_attention`/`sparse_prefill_mask`, `threshold=1.0`==dense); M0 wired a `self.sparse`
 hook into `InternLM2Attention` (default None = dense byte-unchanged). M1 measured XAttention's lossy
@@ -383,9 +383,18 @@ gates — keep-all gather == dense **rel 4.7e-3** (bf16 floor) + M7's chunked pr
 0.7×@1K → 1.0×@8K → 2.3×@32K → 4.3×@64K** (kept 100%→3%), **vslash v8s8 → 3.4×@64K** (kept 4%), **xattn
 t0.9 only 1.2×@64K** (kept ~63% — the antidiagonal nucleus is the LEAST sparse, hence slowest, exactly why
 MInference assigns the cheap static ashape/vslash per head + reserves xattn for the heads needing its
-quality). Block-sparse gather prefill is **up to 4.3× per attention layer at 64K**, crossover 8–16K. **M9
-next** = the long-context per-head ppl gate (full-model teacher-forcing, dense vs M6 per-head assignment +
-gather twin, chunked probe end-to-end) — the quality companion to M8's speed.
+quality). Block-sparse gather prefill is **up to 4.3× per attention layer at 64K**, crossover 8–16K. **M9 ✅** —
+the per-head-GROUPED gather **fold** (answering *"combine the approaches to a fold on speed?"*): the
+M4–M6 per-head assignment folds quality but NOT speed, because the gather sizes its work by ONE global
+`max_kept` = the densest head's, so a mix of cheap ashape (~3% kept) + dense xattn (~63%) makes every
+head pay the dense budget (naive per-head gather bottlenecked ≈ uniform xattn, 1.2×@64K). The fold
+(`XAttnConfig.grouped_gather`, default off/rule-4) partitions heads by distinct spec and gathers each
+group at its OWN `max_kept` (bounded loop, rule 3) — **output-equivalent** (model-free
+`internlm2_grouped_gather_test`: grouped == naive **bit-exact rel 0.00e+00**, == mask 1.3e-7), measured
+**3.2×@64K vs naive 1.2× = 2.64× faster than naive** (bench mix 28 cheap ashape + 4 dense xattn). So
+combining the patterns DOES fold the speed — but only with per-group gathering. **M10 next** = the
+long-context per-head ppl gate (full-model teacher-forcing, dense vs M6 assignment + grouped-fold gather
+twin, chunked probe end-to-end) — the quality companion to M8/M9's speed.
 
 Prior InternLM2.5 **EAGLE spec-decode** track is **COMPLETE** (M0–M3, `ec0f6f3`; **1.42× lossless @
 k=2** via drafter quantization — memory `project_internlm2_eagle.md`). The earlier batched-decode /

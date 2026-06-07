@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import sys
 import time
+from dataclasses import replace
 from pathlib import Path
 
 import mlx.core as mx
@@ -44,7 +45,7 @@ import mlx.core as mx
 from quanta.internlm2.artifact import InternLM2Artifact
 from quanta.internlm2.model import _DecoderLayer, _load_decoder_layer
 from quanta.internlm2.tokenizer import InternLM2Tokenizer
-from quanta.modeling.xattention import XAttnConfig, vertical_slash_index
+from quanta.modeling.xattention import HeadSpec, XAttnConfig, vertical_slash_index
 
 ARTIFACT = "/Users/pmrj/models/internlm2_5-7b-chat-1m-quanta_int8g64"
 REPO = Path("/Users/pmrj/Environment/agentic_ai/finally_quanta")
@@ -98,6 +99,15 @@ def _gathers() -> list[tuple[str, XAttnConfig]]:
                                     gather=True)),
         ("xattn t0.9", XAttnConfig(block=BLOCK, stride=16, threshold=0.9, min_seq=0, gather=True)),
     ]
+
+
+def _perhead_mix(nh: int, n_dense: int = 4) -> tuple[HeadSpec, ...]:
+    """A deployment-plausible per-head assignment: most heads on the cheap static ashape window, a few
+    (``n_dense``) on the dense xattn nucleus (the heads that need its quality). This is the mix that
+    bottlenecks the NAIVE gather — its one global ``max_kept`` = the dense xattn head's, so every cheap
+    head pays the dense budget — and that the grouped fold rescues (each spec-group its own ``max_kept``)."""
+    cheap, dense = HeadSpec("ashape", local=8), HeadSpec("xattn", threshold=0.9)
+    return tuple(dense if i >= nh - n_dense else cheap for i in range(nh))
 
 
 def _parity_anchor(layer: _DecoderLayer, xn: mx.array) -> bool:
@@ -211,10 +221,43 @@ def run(t_max: int = SWEEP[-1]) -> None:
         layer.attention.sparse = None
         print(f"  {t:>7}  {td:>9.1f}  " + "  ".join(f"{c:>20}" for c in cells))
 
-    ok = anchor_ok and probe_ok
+    # 4. the FOLD: a mixed per-head assignment (most cheap ashape + a few dense xattn). Naive gather sizes
+    #    every head by one global max_kept = the dense head's (so it ≈ uniform xattn, the slow one); the
+    #    grouped fold gathers each spec-group at its own max_kept, so the cheap heads run cheap. Output is
+    #    bit-equivalent (model-free gate internlm2_grouped_gather_test) — this measures the speed it folds.
+    nh = cfg.num_attention_heads
+    mix = _perhead_mix(nh)
+    naive_cfg = XAttnConfig(block=BLOCK, head_specs=mix, min_seq=0, gather=True, grouped_gather=False)
+    fold_cfg = replace(naive_cfg, grouped_gather=True)
+    print(f"\n  per-head FOLD — {nh - 4} cheap ashape + 4 dense xattn heads: naive (one global max_kept) "
+          f"vs grouped fold (per-group max_kept); fold is bit-equivalent (gate), this times it:")
+    print(f"  {'T':>7}  {'dense ms':>9}  {'naive ms / x':>16}  {'fold ms / x':>16}  {'fold/naive':>10}")
+    fold_ok = True
+    for t in sweep:
+        proj_gib = _gib(1 * nh * t * cfg.head_dim * 2 * 4)
+        if proj_gib > MEM_CEIL_GIB:
+            break
+        xn = xn_full[:, :t]
+        mx.clear_cache()
+        layer.attention.sparse = None
+        td = _bench_call(layer.attention, xn)
+        layer.attention.sparse = naive_cfg
+        tn = _bench_call(layer.attention, xn)
+        layer.attention.sparse = fold_cfg
+        tf = _bench_call(layer.attention, xn)
+        layer.attention.sparse = None
+        print(f"  {t:>7}  {td:>9.1f}  {tn:>8.1f} /{td / tn:4.1f}x  {tf:>8.1f} /{td / tf:4.1f}x  "
+              f"{tn / tf:>9.2f}x")
+        if t == sweep[-1]:
+            fold_ok = tf < tn * 0.95          # at the longest ctx the fold must materially beat naive
+    print(f"  → at T={sweep[-1]} the fold runs the cheap heads cheap instead of paying the dense head's "
+          f"block budget on all {nh} heads (naive is bottlenecked ≈ uniform xattn).")
+
+    ok = anchor_ok and probe_ok and fold_ok
     print(f"\n{'PASS' if ok else 'FAIL'} — parity anchor (keep-all gather == dense): {anchor_ok}; "
-          f"M7 chunked probe == single-shot on real weights: {probe_ok}. Speedup table above is the "
-          f"measured result (gather wins once O(T²) dominates the identical projection cost).")
+          f"M7 chunked probe == single-shot on real weights: {probe_ok}; per-head fold beats naive at "
+          f"max T: {fold_ok}. The speed tables are the measured result (gather wins once O(T²) dominates "
+          f"the identical projection cost; the fold un-bottlenecks a mixed per-head assignment).")
     if not ok:
         raise SystemExit(1)
 
