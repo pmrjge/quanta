@@ -310,9 +310,9 @@ real-weight greedy-exactness is the breakdown bench's `_greedy_match_fused`). mo
 residual ceiling is now the **MoE+mamba co-dominant weight bandwidth** (B>32 = admission policy / a
 quant-bits lever, not a kernel); the B=1 >1× spec lever stays fundamentally capped (a single stream can't
 amortize). Stream A's serving recommendation is settled: **B≈32 throughput-optimal, now ~67 tok/s**. The
-InternLM2.5 MInference track below is **paused at M7 ✅ (M8 deferred)**, not abandoned.
+InternLM2.5 MInference track below is **paused at M8 ✅ (M9 deferred)**, not abandoned.
 
-**Paused: InternLM2.5 sparse-prefill (MInference family) — M7 ✅, M8 next.** Handover
+**Paused: InternLM2.5 sparse-prefill (MInference family) — M8 ✅, M9 next.** Handover
 **`PLAN_minference.md`**. Reuse the validated block-sparse substrate (`quanta.modeling.xattention`,
 `gather_sparse_attention`/`sparse_prefill_mask`, `threshold=1.0`==dense); M0 wired a `self.sparse`
 hook into `InternLM2Attention` (default None = dense byte-unchanged). M1 measured XAttention's lossy
@@ -375,10 +375,17 @@ bit-identical, all 0.00e+00), only the long-context branch is new and output-equ
 up to fp reassociation. Model-free `parity/internlm2_vslash_chunked_test.py` (synthetic q/k/v, forced
 to chunk via a tiny `max_alloc_gb`): chunked == single-shot masses **key rel ≤2.1e-7 / slash ≤1.9e-7**
 across {1,2,3} blk/chunk × {block-aligned T=896, ragged T=823}; param-independence Δ **0.0**; chunked
-keep-all == causal **0 cells**; chunked gather == mask **1.4e-7**. **M8 next** = a wall-clock
-**gather-path prefill bench** (the actual FLOP/memory win — the mask path measures quality only) paired
-with the now-key-chunked long-context probe so vertical-slash's long-range payoff is measured where it
-lands (100K+), ppl-gated vs M6's +0.04%.
+keep-all == causal **0 cells**; chunked gather == mask **1.4e-7**. **M8 ✅** — **timed the `gather=True`
+speed path** the M1–M6 harness asserted but never measured (`parity/internlm2_prefill_bench.py`, solo,
+ONE resident decoder layer, dense causal flash SDPA vs gather selectors across T {1K…64K}): two hard
+gates — keep-all gather == dense **rel 4.7e-3** (bf16 floor) + M7's chunked probe on real weights (T=64K,
+13 chunks, masses == single-shot **rel 1.2e-7**) — then the headline **O(T²)→O(T) crossover**: **ashape L8
+0.7×@1K → 1.0×@8K → 2.3×@32K → 4.3×@64K** (kept 100%→3%), **vslash v8s8 → 3.4×@64K** (kept 4%), **xattn
+t0.9 only 1.2×@64K** (kept ~63% — the antidiagonal nucleus is the LEAST sparse, hence slowest, exactly why
+MInference assigns the cheap static ashape/vslash per head + reserves xattn for the heads needing its
+quality). Block-sparse gather prefill is **up to 4.3× per attention layer at 64K**, crossover 8–16K. **M9
+next** = the long-context per-head ppl gate (full-model teacher-forcing, dense vs M6 per-head assignment +
+gather twin, chunked probe end-to-end) — the quality companion to M8's speed.
 
 Prior InternLM2.5 **EAGLE spec-decode** track is **COMPLETE** (M0–M3, `ec0f6f3`; **1.42× lossless @
 k=2** via drafter quantization — memory `project_internlm2_eagle.md`). The earlier batched-decode /

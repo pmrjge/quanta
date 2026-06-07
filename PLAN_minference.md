@@ -356,11 +356,40 @@ across {1,2,3} blocks/chunk × {block-aligned, ragged} T; param-independence Δ 
 == causal **0 cells off**; chunked gather == mask **rel 1.4e-7**. The long-context vertical-slash probe
 now runs at O(one key chunk) memory — the precondition for measuring its long-range payoff in M8.
 
-### M8 — gather-path wall-clock prefill bench (+ long-context ppl) (remaining)
-- A real wall-clock measurement of the ``gather=True`` speed path — the actual FLOP/memory win (the mask
-  path measures quality only; with fast SDPA + an additive block mask MLX still computes the full QKᵀ).
-  Pair it with the now-key-chunked long-context probe so vertical-slash's long-range payoff is measured
-  where it lands (100K+), ppl-gated vs M6's +0.04%. Solo GPU, one model resident.
+### M8 ✅ — gather-path wall-clock prefill bench — DONE
+Timed the ``gather=True`` speed path the M1–M6 harness asserted but never measured (*"with fast SDPA + an
+additive block mask MLX still computes the full QKᵀ, so the mask path measures quality only; the gather
+path is the actual FLOP/memory win"*). `parity/internlm2_prefill_bench.py` (NEW, solo): ONE resident
+decoder layer of the int8-g64 bake (rule-8), a real corpus embedded → the layer-0 attention input, dense
+(causal flash SDPA) vs the gather selectors across a T sweep {1K…64K}. Two hard gates + the measured
+headline:
+- **parity anchor** (correctness before timing): keep-all gather == dense (output-equivalent), **rel
+  4.7e-3** — the bf16 real-weight floor (the fp32-tight 1e-3 keep-all==dense is the model-free M3/M6
+  gate). The timed gather path is correct, not a broken kernel.
+- **M7 chunked probe on real weights**: at T=64K the vslash probe key-chunks (13 chunks @ 0.134 GiB);
+  chunked masses == single-shot **key/slash rel 1.2e-7** on the real post-RoPE GQA q/k (M7's property,
+  now real-weight-confirmed); the probe is ≈1% of dense prefill time.
+- **the headline — dense vs gather wall-clock**: a clean O(T²)→O(T) crossover. **ashape L8: 0.7× @1K →
+  1.0× @8K (crossover) → 1.4× @16K → 2.3× @32K → 4.3× @64K** (kept-block fraction 100%→3%); **vslash
+  v8s8: → 3.4× @64K** (crossover ~16K, kept 4%); **xattn t0.9: only 1.2× @64K** (kept ~63% — the
+  antidiagonal nucleus is the LEAST sparse, hence slowest, exactly why MInference assigns the cheap
+  static ashape/vslash per head and reserves xattn for the heads that need its quality).
+- Gates: anchor PASS + chunked-probe-equiv PASS (the speed numbers are the measured result, recorded not
+  pass/fail — a speed characterization, like the Nemotron U4 measure-first benches);
+  ruff/compileall/pytest/`uv lock --check`/`git diff --check` clean. **M8 is purely additive** (one bench
+  file + docs; no src change), so the M0–M7 gates are untouched.
+
+**RESULT:** block-sparse gather prefill turns the keeper's O(T²) attention into O(T) — **up to 4.3× per
+attention layer at 64K** (ashape) / 3.4× (vslash), crossover at 8–16K, the static patterns the clear win
+and the adaptive nucleus the laggard. The per-head deployment number (most heads → ashape/vslash, a few
+→ xattn) + the long-context quality (Δppl) are M9.
+
+### M9 — long-context per-head ppl gate (remaining)
+- Stream the full 32-layer model at a long context (the now-key-chunked probe makes the vslash heads
+  feasible), dense vs the M6 per-head (kind, params) assignment (mask + gather twin), with a small
+  ``max_alloc_gb`` so the chunked probe is exercised end-to-end on real weights. Report the long-context
+  Δppl + the gather==mask twins + the realized per-head selector mix (expect more vslash than the 4% M6
+  saw at 7 blocks — its long-range payoff lands here). The quality companion to M8's speed. Solo GPU.
 
 ---
 
