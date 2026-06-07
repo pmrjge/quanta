@@ -325,18 +325,42 @@ streams reproduced bit-identically in the same run (xattn t=0.9 +0.31% / twin 5.
 twin 2.16e-3; vslash v3s3 +3.01% / v2s2 +7.29% / keep-all 0.00 / twin 2.76e-2; M4 perhead +0.40% / anchor
 0.00 / twin 8.88e-3 / mix 86/14/0), confirming the param-independent-masses refactor regressed nothing.
 
-### M7 — key-chunk the long-context probe + gather-path wall-clock bench (remaining)
-- **Long-context vertical-slash probe**: key-chunk the probe (currently one ``max_alloc_gb``-guarded
-  ``[B,H,lp,S]`` matmul + an ``[B,H,lp,t]`` slash gather) so it scales past the gate's short doc to 100K+
-  where vertical-slash earns real assignments (at 7 blocks it already earns 4% via M6's per-head params,
-  but its design payoff is long-range). Build on M6's param-independent masses: accumulate ``key_mass`` /
-  ``slash_mass`` over key chunks (online softmax; keep the single-shot ``mx.softmax`` path as the default so
-  the short-doc gate stays byte-identical, chunk only when the probe would exceed ``max_alloc_gb``) and
-  model-free-gate chunked masses ≈ single-shot + chunked keep-all == dense + chunked gather == mask.
-- **Gather-path prefill bench**: a real wall-clock measurement of the ``gather=True`` speed path — the
-  actual FLOP/memory win (the mask path measures quality only; with fast SDPA + an additive block mask MLX
-  still computes the full QKᵀ). Pair it with the long-context probe so vertical-slash's long-range payoff
-  is measured where it lands. Its own milestone + ppl gate vs M6.
+### M7 ✅ — key-chunk the long-context vertical-slash probe — DONE
+Made :func:`vertical_slash_index` scale past the short-doc gate to 100K+ context — where vertical-slash
+is *designed* to pay off but the old single-shot probe fail-loud ``raise``\ d (the full ``[B,H,lp,S]``
+attention + the ``[B,H,lp,t]`` slash gather exceed ``max_alloc_gb``). When the probe would exceed the
+budget, the softmax over keys is now taken in **key chunks** via the standard online-softmax (flash)
+**two pass** (:func:`_vertical_slash_index_chunked`): pass 1 accumulates the per-probe-row running max
+``m[r]`` + normalizer over key chunks (peak one ``[B,H,lp,Sc]`` chunk); pass 2 recomputes each chunk's
+FINAL globally-normalized probs and accumulates the two M6 param-independent masses — **vertical**
+per-key-block column mass (chunks cover disjoint key blocks) + **slash** per-block-offset mass (a bounded
+offset window ``δ = p0+r−key`` per chunk, accumulated since adjacent chunks' windows overlap in ``δ``).
+Peak memory is O(one key chunk), not O(S). Smallest-diff, rule-4 safe: the short-doc path
+(``gb <= max_alloc_gb``) is left **byte-for-byte unchanged** (M1–M6 gates bit-identical) — only the
+long-context branch is new, output-equivalent to the single-shot masses up to fp reassociation of the key
+reduction. The two chunk loops are the sanctioned coarse bounded chunked-prefill loops (rule 3).
+- `src/quanta/modeling/xattention.py`: replaced ``vertical_slash_index``'s long-context ``raise`` with a
+  dispatch to the new ``_vertical_slash_index_chunked`` (flash two-pass); docstring de-staled.
+- `parity/internlm2_vslash_chunked_test.py` (NEW, model-free, fp32, synthetic q/k/v): (1) **mass parity**
+  chunked == single-shot (forced to chunk via a tiny ``max_alloc_gb``) at {1,2,3} blocks/chunk and both
+  block-aligned (T=896) + ragged (T=823, partial last query block & last key chunk); (2)
+  **param-independence** preserved under chunking; (3) **chunked keep-all == causal**; (4) **chunked
+  gather == mask** (budget non-binding ⇒ identical set). Run:
+  `uv run python -m parity.internlm2_vslash_chunked_test`.
+- Gates: M0 xattn + M2 ashape + M3 vslash + M4 perhead + M5 perhead-params + M6 vslash-perhead +
+  `xattention_parity` still green & **bit-identical** (single-shot path unchanged, all 0.00e+00);
+  `internlm2_vslash_chunked_test` green; pytest/ruff/compileall/`uv lock --check`/`git diff --check` clean.
+
+**RESULTS (model-free):** chunked masses == single-shot to **key rel ≤ 2.1e-7 / slash rel ≤ 1.9e-7**
+across {1,2,3} blocks/chunk × {block-aligned, ragged} T; param-independence Δ **0.0**; chunked keep-all
+== causal **0 cells off**; chunked gather == mask **rel 1.4e-7**. The long-context vertical-slash probe
+now runs at O(one key chunk) memory — the precondition for measuring its long-range payoff in M8.
+
+### M8 — gather-path wall-clock prefill bench (+ long-context ppl) (remaining)
+- A real wall-clock measurement of the ``gather=True`` speed path — the actual FLOP/memory win (the mask
+  path measures quality only; with fast SDPA + an additive block mask MLX still computes the full QKᵀ).
+  Pair it with the now-key-chunked long-context probe so vertical-slash's long-range payoff is measured
+  where it lands (100K+), ppl-gated vs M6's +0.04%. Solo GPU, one model resident.
 
 ---
 

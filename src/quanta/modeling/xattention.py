@@ -256,11 +256,13 @@ def vertical_slash_index(
     Returns ``(key_mass [B,H,Tk] float, slash_mass [B,H,Tq] float)`` — the two raw masses, no
     thresholding (``key_mass`` doubles as the gather-budget priority). The probe is one ``[B,H,lp,S]``
     attention matrix (``lp`` = last-block size ≤ ``block``); a plain ``q@kᵀ`` matmul (not
-    ``mx.fast.sdpa``) because the *attention weights* are needed, not the output. Guarded by
-    ``max_alloc_gb`` (fail loud, never OOM — the key-chunked long-context probe is a later milestone).
-    Data-dependent but built ONCE from the last block (a prefill-only pattern; decode stays dense); the
-    per-(query,key) execution mask the selection feeds is still strictly causal, so no future *content*
-    leaks into earlier positions.
+    ``mx.fast.sdpa``) because the *attention weights* are needed, not the output. When the full probe
+    fits ``max_alloc_gb`` (the short-doc default) it is computed single-shot below; past that (long
+    context, 100K+) it is taken in KEY CHUNKS via :func:`_vertical_slash_index_chunked` (online/flash
+    softmax) so peak memory is one chunk and it never OOMs — the masses are output-equivalent up to fp
+    reassociation. Data-dependent but built ONCE from the last block (a prefill-only pattern; decode
+    stays dense); the per-(query,key) execution mask the selection feeds is still strictly causal, so no
+    future *content* leaks into earlier positions.
     """
     bsz, h, t, _ = q.shape
     s = k.shape[2]
@@ -273,10 +275,11 @@ def vertical_slash_index(
 
     gb = bsz * h * lp * s * 4 / 1e9               # fp32 probe attention [B,H,lp,S]
     if gb > cfg.max_alloc_gb:
-        raise MemoryError(
-            f"vertical_slash probe [B,H,{lp},{s}] ~= {gb:.1f} GB exceeds max_alloc_gb="
-            f"{cfg.max_alloc_gb}; the long-context probe needs key-chunking (not yet implemented)."
-        )
+        # Long-context probe: the full [B,H,lp,S] attention exceeds the budget (OOM at 100K+). Take the
+        # probe softmax in KEY CHUNKS (online/flash) so peak memory is one chunk, not O(S). The masses
+        # equal this single-shot path up to fp reassociation (gated model-free). The short-doc default
+        # below (gb <= max_alloc_gb) is left byte-for-byte unchanged, so the M1–M6 gates are bit-identical.
+        return _vertical_slash_index_chunked(q_last, k, scale, cfg, p0, lp, t, s, tq, tk)
 
     qpos = mx.arange(p0, p0 + lp)[:, None]        # [lp,1] abs query positions
     kpos = mx.arange(s)[None, :]                  # [1,S]
@@ -300,6 +303,84 @@ def vertical_slash_index(
     g = mx.where(valid[None, None], mx.take_along_axis(a, gi, axis=-1), 0.0)  # [B,H,lp,n_off]
     slash_tok = _pad_to(g.sum(axis=2), blk, axis=2)          # [B,H,tq*blk]
     slash_mass = slash_tok.reshape(bsz, h, tq, blk).sum(axis=3)   # [B,H,tq] per block-offset
+    return key_mass, slash_mass
+
+
+def _vertical_slash_index_chunked(
+    q_last: mx.array, k: mx.array, scale: float, cfg: XAttnConfig,
+    p0: int, lp: int, t: int, s: int, tq: int, tk: int,
+) -> tuple[mx.array, mx.array]:
+    """Key-chunked long-context vertical-slash probe (the M7 lever) — the same param-independent masses
+    as the single-shot :func:`vertical_slash_index`, at O(one key chunk) peak memory instead of O(S).
+
+    The single-shot probe materializes the whole ``[B,H,lp,S]`` attention; past ``max_alloc_gb`` that
+    OOMs at 100K+. Here the probe softmax over keys is taken in key chunks via the standard
+    **online-softmax (flash) two pass**: pass 1 accumulates the per-probe-row running max ``m[r]`` and
+    normalizer ``l[r]`` over key chunks (peak one ``[B,H,lp,Sc]`` chunk); pass 2 recomputes each chunk's
+    FINAL normalized probs ``a = exp(sc - m)/l`` and accumulates the two masses:
+
+    * **vertical** ``key_mass[b,h,kb]`` — per-key-block column mass (sum over probe rows), written into
+      this chunk's key blocks (chunks cover disjoint whole key blocks).
+    * **slash** ``slash_mass[b,h,ob]`` — per-block-offset mass. Each chunk contributes a bounded offset
+      window ``δ = p0 + r - key`` (``key`` in ``[ks,ke)``); windows from adjacent chunks overlap in
+      ``δ``-space, so they accumulate (``+=``) into the per-token ``slash_tok`` before pooling to blocks.
+
+    Output-equivalent to single-shot up to fp reassociation of the key reduction. The two chunk loops are
+    the sanctioned coarse, bounded chunked-prefill loops (like :func:`gather_sparse_attention`), never a
+    per-token/per-key hot loop (rule 3). Returns ``(key_mass [B,H,tk], slash_mass [B,H,tq])`` fp32.
+    """
+    bsz, h = q_last.shape[0], q_last.shape[1]
+    blk = cfg.block
+    # key chunk = the largest whole-block span whose [B,H,lp,Sc] probe (+ its exp) fits max_alloc_gb
+    # (1.5x margin); >= one block. The chunk boundary lands on a key-block edge so vertical pools cleanly.
+    per_blk = 1.5 * bsz * h * lp * blk * 4
+    nblk_chunk = max(1, int(cfg.max_alloc_gb * 1e9 // per_blk))
+    sc_chunk = nblk_chunk * blk
+    qpos = mx.arange(p0, p0 + lp)[:, None]                    # [lp,1] abs probe-query positions
+
+    # ---- pass 1: online-softmax (flash) running max m[r] + normalizer denom[r] over key chunks ----
+    m = mx.full((bsz, h, lp), NEG_INF, dtype=mx.float32)
+    denom = mx.zeros((bsz, h, lp), dtype=mx.float32)
+    for ks in range(0, s, sc_chunk):
+        ke = min(ks + sc_chunk, s)
+        kpos = mx.arange(ks, ke)[None, :]
+        sc = ((q_last @ mx.swapaxes(k[:, :, ks:ke, :], -1, -2)) * scale).astype(mx.float32)
+        sc = mx.where(kpos <= qpos, sc, NEG_INF)             # causal
+        m_new = mx.maximum(m, sc.max(axis=-1))
+        denom = denom * mx.exp(m - m_new) + mx.exp(sc - m_new[..., None]).sum(axis=-1)
+        m = m_new
+        mx.eval(m, denom)
+    inv_denom = (1.0 / denom)[..., None]                     # [B,H,lp,1]
+
+    # ---- pass 2: accumulate the masses from the final, globally-normalized probs ----
+    key_mass = mx.zeros((bsz, h, tk), dtype=mx.float32)
+    slash_tok = mx.zeros((bsz, h, tq * blk), dtype=mx.float32)   # per-token offset, summed over rows
+    r = mx.arange(lp)[:, None]
+    for ks in range(0, s, sc_chunk):
+        ke = min(ks + sc_chunk, s)
+        kpos = mx.arange(ks, ke)[None, :]
+        sc = ((q_last @ mx.swapaxes(k[:, :, ks:ke, :], -1, -2)) * scale).astype(mx.float32)
+        sc = mx.where(kpos <= qpos, sc, NEG_INF)
+        a = mx.exp(sc - m[..., None]) * inv_denom            # [B,H,lp,Sc] final global-softmax probs
+        # vertical: per-key-block column mass (sum over probe rows) into this chunk's disjoint key blocks
+        col = _pad_to(a.sum(axis=2), blk, axis=2)            # [B,H, ceil(Sc/blk)*blk]
+        nbc = col.shape[2] // blk
+        kb0 = ks // blk
+        key_mass[:, :, kb0:kb0 + nbc] = (
+            key_mass[:, :, kb0:kb0 + nbc] + col.reshape(bsz, h, nbc, blk).sum(axis=3)
+        )
+        # slash: bounded offset window δ = p0 + r - key for key in [ks,ke); accumulate (windows overlap).
+        d_hi = p0 + (lp - 1) - ks
+        d_lo = max(0, p0 - (ke - 1))
+        w = d_hi - d_lo + 1
+        dwin = mx.arange(d_lo, d_lo + w)[None, :]            # [1,w]
+        c_idx = (p0 + r - dwin).astype(mx.int32)             # [lp,w] key index for each offset
+        valid = (c_idx >= ks) & (c_idx < ke) & (dwin <= p0 + r)
+        gi = mx.broadcast_to(mx.clip(c_idx - ks, 0, ke - ks - 1)[None, None], (bsz, h, lp, w))
+        g = mx.where(valid[None, None], mx.take_along_axis(a, gi, axis=-1), 0.0)   # [B,H,lp,w]
+        slash_tok[:, :, d_lo:d_lo + w] = slash_tok[:, :, d_lo:d_lo + w] + g.sum(axis=2)
+        mx.eval(key_mass, slash_tok)
+    slash_mass = slash_tok.reshape(bsz, h, tq, blk).sum(axis=3)    # [B,H,tq] per block-offset
     return key_mass, slash_mass
 
 

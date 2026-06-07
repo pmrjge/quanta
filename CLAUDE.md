@@ -310,9 +310,9 @@ real-weight greedy-exactness is the breakdown bench's `_greedy_match_fused`). mo
 residual ceiling is now the **MoE+mamba co-dominant weight bandwidth** (B>32 = admission policy / a
 quant-bits lever, not a kernel); the B=1 >1× spec lever stays fundamentally capped (a single stream can't
 amortize). Stream A's serving recommendation is settled: **B≈32 throughput-optimal, now ~67 tok/s**. The
-InternLM2.5 MInference track below is **paused at M6 ✅ (M7 deferred)**, not abandoned.
+InternLM2.5 MInference track below is **paused at M7 ✅ (M8 deferred)**, not abandoned.
 
-**Paused: InternLM2.5 sparse-prefill (MInference family) — M6 ✅, M7 next.** Handover
+**Paused: InternLM2.5 sparse-prefill (MInference family) — M7 ✅, M8 next.** Handover
 **`PLAN_minference.md`**. Reuse the validated block-sparse substrate (`quanta.modeling.xattention`,
 `gather_sparse_attention`/`sparse_prefill_mask`, `threshold=1.0`==dense); M0 wired a `self.sparse`
 hook into `InternLM2Attention` (default None = dense byte-unchanged). M1 measured XAttention's lossy
@@ -363,9 +363,22 @@ irrelevance; mixed keep-all==dense; gather==mask) + real-model gate (ppl harness
 vslash param v2s2+v3s3): **perhd-p keep-all == dense EXACTLY**, gather==mask (7.45e-4), measured **+0.04% ppl
 — beats M5's +0.15%** with the FLOP-budgeted search assigning **73% ashape:L4 / 22% xattn:t0.9 / 4%
 vslash:v3s3 / 1% xattn:t0.95** (4% of heads now run the WIDER vslash, vs M5's 1% — per-head vslash params pay
-off even at 7 blocks; M1–M5 reproduced bit-identically). M7 next = **key-chunk the long-context probe**
-(accumulate the param-independent masses over key chunks so it scales to 100K+; single-shot stays the
-short-doc default) + a wall-clock **gather-path prefill bench**, ppl-gated vs M6.
+off even at 7 blocks; M1–M5 reproduced bit-identically). **M7 ✅** — **key-chunked the long-context
+vertical-slash probe** so it scales to 100K+ where the old single-shot probe fail-loud `raise`d (the
+full `[B,H,lp,S]` attention exceeds `max_alloc_gb`): when over budget, the probe softmax is taken in
+**key chunks** via an online-softmax (flash) two-pass (`_vertical_slash_index_chunked`) — pass 1
+accumulates the per-probe-row running max + normalizer over chunks (peak one `[B,H,lp,Sc]` chunk), pass
+2 recomputes each chunk's final probs and accumulates the M6 param-independent masses (vertical
+per-key-block; slash via a bounded overlapping offset-window). Peak memory O(one key chunk), not O(S);
+**rule-4 safe** — the short-doc path (`gb ≤ max_alloc_gb`) is **byte-for-byte unchanged** (M1–M6 gates
+bit-identical, all 0.00e+00), only the long-context branch is new and output-equivalent to single-shot
+up to fp reassociation. Model-free `parity/internlm2_vslash_chunked_test.py` (synthetic q/k/v, forced
+to chunk via a tiny `max_alloc_gb`): chunked == single-shot masses **key rel ≤2.1e-7 / slash ≤1.9e-7**
+across {1,2,3} blk/chunk × {block-aligned T=896, ragged T=823}; param-independence Δ **0.0**; chunked
+keep-all == causal **0 cells**; chunked gather == mask **1.4e-7**. **M8 next** = a wall-clock
+**gather-path prefill bench** (the actual FLOP/memory win — the mask path measures quality only) paired
+with the now-key-chunked long-context probe so vertical-slash's long-range payoff is measured where it
+lands (100K+), ppl-gated vs M6's +0.04%.
 
 Prior InternLM2.5 **EAGLE spec-decode** track is **COMPLETE** (M0–M3, `ec0f6f3`; **1.42× lossless @
 k=2** via drafter quantization — memory `project_internlm2_eagle.md`). The earlier batched-decode /
