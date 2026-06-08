@@ -235,10 +235,17 @@ def _install_stub_batched_modules(stub_model_cls=_StubBatchedModel,
 
     # batched_runtime stub
     br = types.ModuleType("quanta.qwen35.batched_runtime")
+    # Mirror the REAL from_inner keyword-only contract (max_batch / kv_quantized / kv_group_size /
+    # packed / loopkill — the last three landed with #153 option-B + the packed-experts work); the
+    # stub consumes only max_batch but must ACCEPT the full set or the engine's real call
+    # (omlx.py: from_inner(..., max_batch=, packed=)) raises. Kept explicit (not **kwargs) so a future
+    # signature growth fails loud here instead of silently drifting.
     br.Qwen35BatchedResidentModel = type(
         "Qwen35BatchedResidentModel", (stub_model_cls,),
-        {"from_inner": classmethod(lambda cls, layers, embed_w, norm_w, lm_head_w, cfg,
-                                   *, max_batch=32: cls(max_batch=max_batch))})
+        {"from_inner": classmethod(
+            lambda cls, layers, embed_w, norm_w, lm_head_w, cfg, *, max_batch=32,
+            kv_quantized=False, kv_group_size=64, packed=False, loopkill=None:
+            cls(max_batch=max_batch))})
     sys.modules["quanta.qwen35.batched_runtime"] = br
     installed.append("quanta.qwen35.batched_runtime")
 
