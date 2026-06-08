@@ -252,14 +252,21 @@ class DSV4BatchedResidentModel:
         return {"n_layers": self.num_layers, "group_size": gs, "bits": BITS,
                 "quantized": q, "single_stream": True}
 
-    def make_paged_state(self, manager, seq):
-        """A per-stream paged :class:`~quanta.dsv4.decode.DSV4Cache`: every layer's latent KV is a
+    def make_paged_state(self, manager, seq, *, max_rollback: int = 1):
+        """A per-stream paged :class:`~quanta.dsv4.decode.PagedDSV4Cache`: every layer's latent KV is a
         :class:`~quanta.paged.PagedLatentCacheView` into the shared ``manager`` (prefix blocks dedup),
         while the derived ckv/ikv/ring stay per-stream (restored from a boundary snapshot in
-        :meth:`prefill_paged`)."""
+        :meth:`prefill_paged`).
+
+        ``max_rollback`` sizes the per-stream derived ring for speculative rollback — leave it 1 for
+        plain decode; the tree-spec-over-paged hook passes ``depth + 1`` so a rejected draft suffix
+        rolls back losslessly (the same sizing the discrete :func:`quanta.dsv4.spec._make_caches`
+        uses). The returned cache also satisfies the batched tree-spec ``replicate(B)`` contract
+        (sequence-level COW fork) — see :class:`~quanta.dsv4.decode.PagedDSV4Cache`."""
         from quanta.dsv4.decode import paged_cache
         gs, q = _latent_quant(self.cfg.head_dim)
-        return paged_cache(manager, seq, self.num_layers, quantized=q, group_size=gs)
+        return paged_cache(manager, seq, self.num_layers, quantized=q, group_size=gs,
+                           max_rollback=max_rollback)
 
     def prefill_paged(self, suffix_ids, state, *, offset: int, recurrent_in,
                       block_size: int) -> tuple[mx.array, list[tuple[int, list]]]:

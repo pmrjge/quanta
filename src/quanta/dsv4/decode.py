@@ -374,6 +374,24 @@ class DSV4Cache:
                         f"{lc.ring.shape[1]} positions, need back to {need}). Spec-decode draft "
                         f"suffixes are within bounds; enlarge the ring for deeper rollback.")
 
+    # --- forward lifecycle (no-ops here; PagedDSV4Cache drives the paged manager) ----------------
+    # Spec-decode (#158-160) brackets EVERY forward with ``begin_forward`` / ``end_forward`` and frees
+    # a discarded verify replica with ``release``, so ONE spec loop drives both the discrete and the
+    # paged cache. The discrete cache writes latent directly via ``append_kv`` (no manager lifecycle),
+    # so all three are no-ops and the discrete spec path is byte-identical to pre-#158 (rule 4).
+    def begin_forward(self, token_ids) -> None:
+        """No-op (discrete writes via ``append_kv``). :meth:`PagedDSV4Cache.begin_forward` ``advance``s
+        the paged manager to open the positions BEFORE the forward writes them."""
+
+    def end_forward(self) -> None:
+        """No-op (discrete). :meth:`PagedDSV4Cache.end_forward` ``commit``s the paged manager (content-
+        hash the just-filled blocks for prefix reuse) AFTER the forward."""
+
+    def release(self) -> None:
+        """No-op (Python GC reclaims the shared array refs). :meth:`PagedDSV4Cache.release` ``free``s
+        the sequence's manager blocks — a forked verify replica MUST release its COW blocks or the
+        block pool leaks (rule 6: account for every allocated block)."""
+
 
 def _layer_overlap(lc: _LayerCache) -> bool:
     """Whether the layer's compressor uses overlapping windows (ratio==4 ⟺ overlap; ratio-128 layers
@@ -508,6 +526,27 @@ class PagedDSV4Cache(DSV4Cache):
         raise NotImplementedError(
             "PagedDSV4Cache replicates by forking the sequence (replicate(B) -> "
             "PagedKVCacheManager.replicate); the per-layer _copy is the wrong hook for paged latent.")
+
+    # --- forward lifecycle (paged manager: advance before write, commit after, free on discard) ----
+    def begin_forward(self, token_ids) -> None:
+        """``advance`` the manager to open this forward's positions (grow ``seq.length`` + record the
+        token ids) BEFORE the forward's ``append_kv`` writes them. Per the manager contract ``advance``
+        does NOT move the write cursor (``n_written``), so ``offset`` is unchanged here — the batched
+        verify's ``offset == q+1+t`` precondition still holds, and the subsequent writes fit the
+        opened window."""
+        self._manager.advance(self._seq, [int(t) for t in token_ids])
+
+    def end_forward(self) -> None:
+        """``commit`` the manager (content-hash the just-filled full blocks for prefix reuse) AFTER the
+        forward. Hashing reads only the recorded token ids, not the (lazily-written) KV, so it is
+        order-safe before the spec loop's per-forward ``mx.eval``."""
+        self._manager.commit(self._seq)
+
+    def release(self) -> None:
+        """``free`` the sequence's blocks (ref--). A discarded verify replica forked by
+        :meth:`replicate` MUST be released or its COW draft-tail blocks leak the pool; the shared
+        prefix blocks survive at ref 0 for the original (and LRU reuse)."""
+        self._manager.free(self._seq)
 
 
 def paged_cache(manager: "PagedKVCacheManager", seq: "SeqHandle", n_layers: int, *,

@@ -53,8 +53,58 @@ def _make_caches(model, *, max_rollback: int = 1):
     return DSV4Cache(model.num_layers, max_rollback=max_rollback)
 
 
+def _resolve_caches(model, make_state, max_rollback: int):
+    """The decode cache for a spec run: the caller's ``make_state`` factory when given, else the
+    model's own :func:`_make_caches`.
+
+    ``make_state`` is the tree-spec-over-paged hook (#158-160): a callable ``make_state(max_rollback)
+    -> cache`` the serving layer wires to build a **paged** :class:`~quanta.dsv4.decode.PagedDSV4Cache`
+    (latent in the shared block pool; ``replicate(B)`` forks the sequence COW) instead of the discrete
+    per-stream :class:`~quanta.dsv4.decode.DSV4Cache`. The spec loop is otherwise identical — it
+    prefills the prompt into whatever cache it gets and drives the SAME ``replicate``/``truncate``/
+    ``offset`` contract (the paged cache satisfies it via M0). ``make_state=None`` (default) is
+    byte-identical to the pre-#158 path (rule 4).
+
+    The returned cache MUST be fresh (``offset == 0``) — the spec loop owns the prefill; a pre-filled
+    cache would double-count positions. Fail loud (rule 6) rather than silently mis-offset."""
+    if make_state is None:
+        return _make_caches(model, max_rollback=max_rollback)
+    caches = make_state(max_rollback=max_rollback)
+    if caches.offset != 0:
+        raise ValueError(
+            f"spec make_state must return a FRESH cache (offset 0); got offset={caches.offset}. "
+            f"The spec loop owns the prefill — pass an empty paged cache, not a pre-filled one.")
+    return caches
+
+
+# --- paged forward lifecycle bracket (#158-160) -------------------------------------------------
+# A PAGED cache (:class:`~quanta.dsv4.decode.PagedDSV4Cache`) needs the manager ``advance`` (open the
+# positions) driven BEFORE a forward writes them and ``commit`` AFTER, plus ``free`` on a discarded
+# verify replica. The discrete cache writes latent directly, so its ``begin_forward``/``end_forward``/
+# ``release`` are no-ops (rule 4: the discrete spec path is byte-identical to pre-#158). The spec loop
+# brackets every forward through these helpers; ``getattr`` keeps the model-free stub caches (which
+# track their own length and never define the hooks) unaffected.
+def _begin_forward(cache, token_ids) -> None:
+    fn = getattr(cache, "begin_forward", None)
+    if fn is not None:
+        fn(token_ids)
+
+
+def _end_forward(cache) -> None:
+    fn = getattr(cache, "end_forward", None)
+    if fn is not None:
+        fn()
+
+
+def _release(cache) -> None:
+    fn = getattr(cache, "release", None)
+    if fn is not None:
+        fn()
+
+
 def spec_generate(model, mtp, embed: mx.array, head: mx.array, prompt_ids,
-                  *, max_new: int, eos_id: int | None = None) -> tuple[list[int], dict]:
+                  *, max_new: int, eos_id: int | None = None, make_state=None
+                  ) -> tuple[list[int], dict]:
     """Lossless native-MTP self-speculation (1 draft head). Returns ``(tokens, stats)``.
 
     ``model``: the resident DSV4 model; ``mtp``: the MTP draft head (``mtp(prev_hidden, next_ids,
@@ -66,10 +116,12 @@ def spec_generate(model, mtp, embed: mx.array, head: mx.array, prompt_ids,
     prompt_ids = list(prompt_ids)
     if not prompt_ids:
         raise ValueError("spec_generate needs a non-empty prompt")
-    caches = _make_caches(model)
+    caches = _resolve_caches(model, make_state, max_rollback=1)
 
     # --- prefill: verified token at position q = len(prompt)-1, plus its feature ---
+    _begin_forward(caches, prompt_ids)                  # paged: advance; discrete: no-op
     logits, caps = model(mx.array(prompt_ids), caches=caches, offset=0, capture_layers=(last,))
+    _end_forward(caches)                                # paged: commit; discrete: no-op
     mx.eval(logits, caps[last])
     q = len(prompt_ids) - 1
     prev_hidden = caps[last][-1][None, None]            # [1,1,hc,dim] main hidden at position q
@@ -84,8 +136,10 @@ def spec_generate(model, mtp, embed: mx.array, head: mx.array, prompt_ids,
         draft = int(mx.argmax(dlog[0, 0]).item())
 
         # --- verify both in ONE main forward over [cur, draft] at offset q+1 ---
+        _begin_forward(caches, [cur, draft])
         vlog, vcaps = model(mx.array([cur, draft]), caches=caches, offset=q + 1,
                             capture_layers=(last,))
+        _end_forward(caches)
         bpred = mx.argmax(vlog[0], axis=-1)             # [2]; bpred[0]=greedy@q+2, bpred[1]=greedy@q+3
         mx.eval(bpred, vcaps[last])
         b0, b1 = int(bpred[0].item()), int(bpred[1].item())
@@ -119,7 +173,7 @@ def spec_generate(model, mtp, embed: mx.array, head: mx.array, prompt_ids,
 
 
 def spec_generate_k(model, mtp, embed: mx.array, head: mx.array, prompt_ids,
-                    *, k: int, max_new: int, eos_id: int | None = None
+                    *, k: int, max_new: int, eos_id: int | None = None, make_state=None
                     ) -> tuple[list[int], dict]:
     """Lossless self-speculation with ``k`` **chained** MTP drafts per round.
 
@@ -142,15 +196,18 @@ def spec_generate_k(model, mtp, embed: mx.array, head: mx.array, prompt_ids,
     if k < 1:
         raise ValueError(f"k must be >= 1 (got {k})")
     if k == 1:
-        return spec_generate(model, mtp, embed, head, prompt_ids, max_new=max_new, eos_id=eos_id)
+        return spec_generate(model, mtp, embed, head, prompt_ids, max_new=max_new, eos_id=eos_id,
+                             make_state=make_state)
 
     last = model.cfg.num_hidden_layers - 1
     prompt_ids = list(prompt_ids)
     if not prompt_ids:
         raise ValueError("spec_generate_k needs a non-empty prompt")
-    caches = _make_caches(model, max_rollback=k)    # ring must support full-suffix rejection
+    caches = _resolve_caches(model, make_state, max_rollback=k)  # ring must support full-suffix reject
 
+    _begin_forward(caches, prompt_ids)                  # paged: advance; discrete: no-op
     logits, caps = model(mx.array(prompt_ids), caches=caches, offset=0, capture_layers=(last,))
+    _end_forward(caches)
     mx.eval(logits, caps[last])
     q = len(prompt_ids) - 1
     prev_hidden = caps[last][-1][None, None]            # [1,1,hc,dim] main hidden at position q
@@ -174,8 +231,10 @@ def spec_generate_k(model, mtp, embed: mx.array, head: mx.array, prompt_ids,
 
         # --- verify [cur, d_1, ..., d_k] in ONE main forward at offset q+1 ---
         verify_seq = [cur, *drafts]
+        _begin_forward(caches, verify_seq)
         vlog, vcaps = model(mx.array(verify_seq), caches=caches, offset=q + 1,
                             capture_layers=(last,))
+        _end_forward(caches)
         bpred = mx.argmax(vlog[0], axis=-1)              # [k+1]
         mx.eval(bpred, vcaps[last])
         bp = [int(bpred[i].item()) for i in range(k + 1)]  # bp[i] = main greedy at position q+2+i
@@ -289,9 +348,13 @@ def batch_verify(model, cache: DSV4Cache, cur: int, paths: list[list[int]],
     per_pos_hidden: list[mx.array | None] = []            # depth+1 × [B, 1, hc, dim]
     for t in range(depth + 1):
         toks = [seq[t] for seq in verify_seqs]
+        for r, tk in zip(replicas, toks, strict=True):    # paged: advance each replica; discrete: no-op
+            _begin_forward(r, [tk])
         logits_t, hidden_t = model.batch_step(
             tokens=toks, caches=replicas, offset=q + 1 + t, capture_layer=last_layer,
         )
+        for r in replicas:                                # paged: commit each replica; discrete: no-op
+            _end_forward(r)
         per_pos_logits.append(logits_t)
         per_pos_hidden.append(hidden_t)
     # Single eval at the end — covers logits + every captured hidden + every replica's grown state.
@@ -330,6 +393,9 @@ def batch_verify(model, cache: DSV4Cache, cur: int, paths: list[list[int]],
             f"(every batch_step at depth t={best_j} returned None). Spec loop relies on the MTP "
             f"feature; refusing to silently drop it (rule 6).")
     best_hidden = per_pos_hidden[best_j][best_hidden_b:best_hidden_b + 1]       # [1,1,hc,dim]
+    mx.eval(best_hidden)                       # materialize BEFORE freeing the replicas' paged blocks
+    for r in replicas:                         # paged: free COW blocks (rule 6, no pool leak); discrete: no-op
+        _release(r)
 
     return best_j, best_bonus, best_path, best_hidden
 
@@ -337,7 +403,7 @@ def batch_verify(model, cache: DSV4Cache, cur: int, paths: list[list[int]],
 def spec_generate_tree(model, mtp, embed: mx.array, head: mx.array, prompt_ids,
                        *, width: int, depth: int, max_new: int,
                        eos_id: int | None = None,
-                       batched: bool = True) -> tuple[list[int], dict]:
+                       batched: bool = True, make_state=None) -> tuple[list[int], dict]:
     """**W-parallel chain-verify** tree drafting over the native DSV4 MTP head — lossless (#157).
 
     Each round drafts a ``(width, depth)`` tree from the MTP head, enumerates the ``W ** D``
@@ -385,6 +451,16 @@ def spec_generate_tree(model, mtp, embed: mx.array, head: mx.array, prompt_ids,
     ``model`` to be a :class:`quanta.dsv4.batched_runtime.DSV4BatchedResidentModel` (the only
     runtime with ``batch_step``); single-stream :class:`DSV4ResidentModel` callers must pass
     ``batched=False`` or wrap their inner via ``DSV4BatchedResidentModel.from_inner``.
+
+    ``make_state`` (default ``None``) is the **tree-spec-over-paged** hook (#158-160): a callable
+    ``make_state(max_rollback) -> cache`` the serving layer wires to build a **paged**
+    :class:`~quanta.dsv4.decode.PagedDSV4Cache` (latent in the shared block pool, ``replicate(B)``
+    forks the sequence COW) instead of the discrete per-stream cache. The spec loop then prefills the
+    prompt into that paged cache and drives the SAME ``replicate``/``truncate``/``offset`` contract;
+    output is bit-identical to the discrete path (the paged cache is a behavior-exact substitute —
+    gated in ``parity/dsv4_spec_paged_test.py`` model-free + a real-weight gate). ``None`` is
+    byte-identical to the pre-#158 path (rule 4). See :meth:`DSV4BatchedResidentModel.make_paged_state`
+    for the factory the serving layer passes.
     """
     if width < 1 or depth < 1:
         raise ValueError(f"width must be >= 1, depth must be >= 1 (got width={width}, depth={depth})")
@@ -394,7 +470,7 @@ def spec_generate_tree(model, mtp, embed: mx.array, head: mx.array, prompt_ids,
         # chain (no path-level fan-out to batch), so the short-circuit ignores the flag and the
         # gate ``test_width1_matches_spec_generate_k`` covers it for both flag values.
         return spec_generate_k(model, mtp, embed, head, prompt_ids,
-                               k=depth, max_new=max_new, eos_id=eos_id)
+                               k=depth, max_new=max_new, eos_id=eos_id, make_state=make_state)
 
     last = model.cfg.num_hidden_layers - 1
     prompt_ids = list(prompt_ids)
@@ -402,11 +478,13 @@ def spec_generate_tree(model, mtp, embed: mx.array, head: mx.array, prompt_ids,
         raise ValueError("spec_generate_tree needs a non-empty prompt")
     # max_rollback = depth + 1: per-path verify pushes ``depth+1`` new tokens; the round-start
     # (q+1) state must remain reachable for the per-path truncate. The +1 covers the commit-forward
-    # in the same ring window.
-    caches = _make_caches(model, max_rollback=depth + 1)
+    # in the same ring window. ``make_state`` (when given) builds a paged cache at this depth (#158-160).
+    caches = _resolve_caches(model, make_state, max_rollback=depth + 1)
 
     # --- prefill: verified token at position q = len(prompt)-1, plus its feature ---
+    _begin_forward(caches, prompt_ids)                  # paged: advance; discrete: no-op
     logits, caps = model(mx.array(prompt_ids), caches=caches, offset=0, capture_layers=(last,))
+    _end_forward(caches)
     mx.eval(logits, caps[last])
     q = len(prompt_ids) - 1
     prev_hidden = caps[last][-1][None, None]            # [1,1,hc,dim] main hidden at position q
@@ -456,8 +534,10 @@ def spec_generate_tree(model, mtp, embed: mx.array, head: mx.array, prompt_ids,
 
             for path_drafts in paths:
                 verify_seq = [cur, *path_drafts]
+                _begin_forward(caches, verify_seq)
                 vlog, vcaps = model(mx.array(verify_seq), caches=caches, offset=q + 1,
                                     capture_layers=(last,))
+                _end_forward(caches)
                 bpred = mx.argmax(vlog[0], axis=-1)        # [depth+1]
                 mx.eval(bpred, vcaps[last])
                 bp = [int(bpred[i].item()) for i in range(depth + 1)]
@@ -488,7 +568,9 @@ def spec_generate_tree(model, mtp, embed: mx.array, head: mx.array, prompt_ids,
         # committed offset. best_j == 0 commits only cur (cache stays at q+1 — no extra forward).
         commit_seq = [cur, *best_path[:best_j]]
         if commit_seq:
+            _begin_forward(caches, commit_seq)             # paged: advance the ORIGINAL seq; discrete: no-op
             _ = model(mx.array(commit_seq), caches=caches, offset=q + 1)
+            _end_forward(caches)
             mx.eval(caches.offset)                         # materialize the cache update
 
         # Emit accepted drafts + the bonus (the main model's greedy at the first un-accepted tree

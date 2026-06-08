@@ -465,10 +465,32 @@ latent by COW (only per-path draft-tail writes clone a block). `batch_step` is a
 `truncate_kv` — so only `replicate`/`_copy` needed wiring. Gated model-free over the REAL single-stream
 paged latent lifecycle (`parity/dsv4_paged_replicate_test.py`): replicate(B=3) COW-isolated (prefix
 bit-shared, tails diverge, parent read-only), derived state shared-by-ref + diverges losslessly, `_copy`
-fail-loud; DSV4 paged/tree-verify regressions green. **Remaining:** DSV4 spec-loop/serving dispatch +
-real-model gate (solo); qwen35 (GDN recurrent state) + Nemotron (un-sliceable Mamba `(ssm,conv)`) cache
-halves. NOTE per settled findings (MTP-M4): tree-spec is a B=1 latency lever capped <1× on the hybrids,
-so the hybrid wiring's *value* is limited — DSV4 (pure attention) is the keeper where it helps.
+fail-loud; DSV4 paged/tree-verify regressions green. **M1 ✅ (DSV4 spec-loop half + real gate)** — the
+spec loop now drives a paged cache end-to-end. (1) **`make_state` factory** threaded through
+`spec_generate{,_k,_tree}` (`dsv4/spec.py`, default `None` = the discrete path byte-identical, rule 4):
+a `make_state(max_rollback)->cache` the serving layer wires to build a `PagedDSV4Cache`
+(`DSV4BatchedResidentModel.make_paged_state` gained `max_rollback`); validates the cache is FRESH
+(offset 0 — the loop owns the prefill, rule 6). (2) **forward-lifecycle bracket** — a paged cache needs
+the manager `advance` (open positions) BEFORE a forward writes and `commit` AFTER, plus `free` on a
+discarded verify replica; added `begin_forward`/`end_forward`/`release` to the cache contract (no-op on
+discrete `DSV4Cache` ⇒ the discrete spec path is byte-identical; advance/commit/free on `PagedDSV4Cache`)
+and bracketed EVERY spec forward (prefill, per-round verify, the `batch_verify` per-replica `batch_step`,
+the sequential per-path verify, the commit-forward). **The bracket was the real integration** — without
+it the real model's `append_kv` hit an un-advanced paged position and crashed ("writing to 1 exceeds
+advanced length 0"); `advance` doesn't move the write cursor so the batched-verify `offset==q+1+t`
+precondition still holds. Gated **model-free** (`parity/dsv4_spec_paged_test.py`: a stub main model that
+appends-only like the real model drives a REAL `PagedDSV4Cache` through the full tree-spec loop — paged
+== discrete **bit-identical** across batched∈{T,F}×MTP∈{perfect,wrong}, W4D2 B=16, width-1 chain, eos,
+fresh-cache guard) and **real-weight solo** (`parity/dsv4_spec_paged_real.py`, ~180 GiB int4g64 + native
+MTP): tree-spec over a real paged cache == discrete == **greedy bit-identical** (32 tok, mean_accept 2.91,
+W2D2) — and the manager stats prove the `release` path bounds the pool (172 allocated blocks after 1720
+COW verify forks, no leak). **DSV4 tree-spec-over-paged is COMPLETE** (the pure-attention keeper where
+tree-spec is a real B=1 latency lever). **Remaining:** Nemotron (un-sliceable Mamba `(ssm,conv)`) cache
+half (M3); **qwen35 is N/A** — its serving is UNPAGED (`paged_kv=False`, no `make_paged_state`; #153
+option-B is unpaged), so there is no paged cache to make replicate-able and tree-spec already runs over
+its discrete `Qwen35Cache` (M2 = documented N/A). NOTE per settled findings (MTP-M4): tree-spec is a B=1
+latency lever capped <1× on the hybrids, so the Nemotron wiring's *value* is limited — DSV4 (pure
+attention, now done) is the keeper where it helps.
 
 Optional, non-blocking: extend
 the #18 bench to B=48/64 on a free solo GPU (largely subsumed — #153 M4 already benched DSV4 at B=48).
