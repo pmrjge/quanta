@@ -486,9 +486,13 @@ MTP): tree-spec over a real paged cache == discrete == **greedy bit-identical** 
 W2D2) — and the manager stats prove the `release` path bounds the pool (172 allocated blocks after 1720
 COW verify forks, no leak). **DSV4 tree-spec-over-paged is COMPLETE** (the pure-attention keeper where
 tree-spec is a real B=1 latency lever). **Remaining:** Nemotron (un-sliceable Mamba `(ssm,conv)`) cache
-half (M3); **qwen35 is N/A** — its serving is UNPAGED (`paged_kv=False`, no `make_paged_state`; #153
-option-B is unpaged), so there is no paged cache to make replicate-able and tree-spec already runs over
-its discrete `Qwen35Cache` (M2 = documented N/A). NOTE per settled findings (MTP-M4): tree-spec is a B=1
+half (M3); **M2 ✅ qwen35 = N/A (documented + pinned)** — its serving is UNPAGED (`paged_kv=False`, no
+`make_paged_state`; #153 option-B is unpaged), so there is no paged cache to make replicate-able and
+tree-spec already runs over its discrete `Qwen35Cache` (gated e2e by `qwen35_batched_tree_verify_test`).
+The N/A is pinned by `parity/qwen35_spec_paged_na_test.py`: the **paged-contract discriminant**
+(DSV4+Nemotron expose `make_paged_state`+`paged_kv_spec`; Qwen3.5 exposes NEITHER) fails loud if Qwen3.5
+ever gains paging (rule 6, no silent drift), and confirms its discrete `Qwen35Cache.replicate(B)`
+satisfies the tree-spec cache contract. NOTE per settled findings (MTP-M4): tree-spec is a B=1
 latency lever capped <1× on the hybrids, so the Nemotron wiring's *value* is limited — DSV4 (pure
 attention, now done) is the keeper where it helps.
 
