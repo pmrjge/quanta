@@ -448,8 +448,29 @@ per-layer COW-isolated, parent read-only); the model-side tree-spec-over-paged *
 `parity/sample_min_p_test.py`. (3) **#150 `ReasoningParser`** — reconciled the oMLX shim with the
 formal Protocol that landed in `quanta.shim.tool_parsers` (`parse(text)->dict`, concrete
 `Qwen3ReasoningParser`): omlx's stale `extract`-based stub → `parse`, conformance helper checks
-`.parse`, gated `parity/omlx_reasoning_parser_test.py`. Only remaining non-MiniMax work is the
-#158-160 tree-spec-over-paged wiring (a real milestone, not polish). Optional, non-blocking: extend
+`.parse`, gated `parity/omlx_reasoning_parser_test.py`.
+
+**#158-160 tree-spec-over-paged wiring — IN PROGRESS (the real milestone, not polish).** Lets a *paged*
+request also run batched tree-spec verify (today tree-spec uses discrete per-stream caches per the #152
+scope guard; paged owns prefix-sharing + block mgmt). The blocker was the cache: `spec_generate_tree`'s
+`batch_verify` does `cache.replicate(B)` + `truncate`, but DSV4's `paged_cache()` returned a plain
+`DSV4Cache` that inherits the discrete `_copy` (shallow per-layer → builds a NON-paged `_LayerCache`,
+dropping the paged view). **M0 ✅ (DSV4 cache half)** — `PagedDSV4Cache(DSV4Cache)` (`dsv4/decode.py`):
+`replicate(B)` forks the seq B ways via the new sequence-level `PagedKVCacheManager.replicate` (one fork
+clones ALL layers together — the correct level; the per-layer `PagedKVCacheView._copy`/`PagedDSV4Cache._copy`
+stay fail-loud as the wrong hook) and rebuilds B paged bundles, each carrying its source layer's
+per-stream derived state (ckv/ikv/ring) by structural sharing; the W^D paths share the whole prefix
+latent by COW (only per-path draft-tail writes clone a block). `batch_step` is already cache-agnostic
+(#153 serving drives paged `DSV4Cache` through it) and `offset`/`truncate` already read `kv_length()`/
+`truncate_kv` — so only `replicate`/`_copy` needed wiring. Gated model-free over the REAL single-stream
+paged latent lifecycle (`parity/dsv4_paged_replicate_test.py`): replicate(B=3) COW-isolated (prefix
+bit-shared, tails diverge, parent read-only), derived state shared-by-ref + diverges losslessly, `_copy`
+fail-loud; DSV4 paged/tree-verify regressions green. **Remaining:** DSV4 spec-loop/serving dispatch +
+real-model gate (solo); qwen35 (GDN recurrent state) + Nemotron (un-sliceable Mamba `(ssm,conv)`) cache
+halves. NOTE per settled findings (MTP-M4): tree-spec is a B=1 latency lever capped <1× on the hybrids,
+so the hybrid wiring's *value* is limited — DSV4 (pure attention) is the keeper where it helps.
+
+Optional, non-blocking: extend
 the #18 bench to B=48/64 on a free solo GPU (largely subsumed — #153 M4 already benched DSV4 at B=48).
 Cadence (standing user instruction): single thread, NO subagents, commit each milestone, then STOP for
 the user to compact.

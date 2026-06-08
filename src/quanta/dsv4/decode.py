@@ -436,20 +436,90 @@ class _PagedLayerCache(_LayerCache):
         self._view.truncate(length)
 
 
+def _copy_derived_state(dst: _LayerCache, src: _LayerCache) -> None:
+    """Share ``src``'s per-stream DERIVED state (ratio + compressed-KV codes + indexer-KV + raw-hidden
+    ring) into ``dst`` by reference — lossless under MLX immutability (a later append on either side
+    creates new arrays, leaving the other untouched), the same structural sharing
+    :func:`_layer_shallow_copy` uses. The paged LATENT is NOT touched here: it lives in ``dst``'s own
+    forked paged view."""
+    dst.ratio = src.ratio
+    dst._ckv_bf16 = src._ckv_bf16
+    dst._ckv_q = src._ckv_q
+    dst._ckv_s = src._ckv_s
+    dst._ckv_b = src._ckv_b
+    dst.ikv = src.ikv
+    dst.ring = src.ring
+
+
+class PagedDSV4Cache(DSV4Cache):
+    """A paged :class:`DSV4Cache` that ALSO satisfies the batched tree-spec verify ``replicate(B)``
+    contract — the cache half of tree-spec-over-paged (#158-160).
+
+    Every layer's latent KV is a :class:`~quanta.paged.PagedLatentCacheView` into the shared ``manager``
+    (prefix blocks dedup'd across requests/turns); the derived compressed-KV / indexer-KV / raw-hidden
+    ring stay per-stream (inherited verbatim). The forward path is byte-identical to the plain paged
+    cache the prior ``paged_cache`` built.
+
+    The override is :meth:`replicate`: the discrete :meth:`DSV4Cache._copy` shallow-copies each layer
+    into a fresh *non-paged* ``_LayerCache`` (dropping the paged view) — wrong for a paged cache. Here
+    ``replicate(B)`` forks the underlying sequence B ways at the manager level
+    (:meth:`~quanta.paged.PagedKVCacheManager.replicate` — one fork clones ALL layers together, the
+    correct level), so the W^D verify paths share the whole prefix latent by copy-on-write (the fork
+    increfs the prefix blocks; only a per-path draft-tail write clones a block) and rebuilds B paged
+    bundles, each carrying its source layer's per-stream derived state by structural sharing. The
+    serving-loop dispatch that routes a paged request's spec-decode through here is the runtime half.
+    """
+
+    def __init__(self, manager: "PagedKVCacheManager", seq: "SeqHandle", n_layers: int, *,
+                 quantized: bool = True, group_size: int = 128, max_rollback: int = 1) -> None:
+        self._manager = manager
+        self._seq = seq
+        self._n_layers = n_layers
+        self._quantized = quantized
+        self._group_size = group_size
+        self._max_rollback = max_rollback
+        self.layers = [
+            _PagedLayerCache(manager.view_one(seq, i), quantized=quantized,
+                             group_size=group_size, max_rollback=max_rollback)
+            for i in range(n_layers)
+        ]
+
+    def replicate(self, b: int) -> list["DSV4Cache"]:
+        """``b`` paged replicas over copy-on-write forks of this cache's sequence (the paged form of
+        :meth:`DSV4Cache.replicate`). Each replica's latent shares the prefix blocks (COW) and its
+        per-stream derived state is shared by reference; divergent draft appends/truncates on a replica
+        leave the original (and siblings) bit-identical, so the commit-forward through the un-replicated
+        cache is exactly as in the discrete path."""
+        if b < 1:
+            raise ValueError(f"replicate(B) requires B >= 1 (got {b})")
+        forked = self._manager.replicate(self._seq, b)        # B COW-forked seqs (prefix blocks shared)
+        out: list[DSV4Cache] = []
+        for fseq in forked:
+            rep = PagedDSV4Cache(self._manager, fseq, self._n_layers, quantized=self._quantized,
+                                 group_size=self._group_size, max_rollback=self._max_rollback)
+            for dst, src in zip(rep.layers, self.layers, strict=True):
+                _copy_derived_state(dst, src)
+            out.append(rep)
+        return out
+
+    def _copy(self) -> "DSV4Cache":
+        # The discrete per-layer shallow copy builds a NON-paged _LayerCache (drops the paged view); the
+        # paged path replicates by forking the sequence (see replicate()). Fail loud (rule 6).
+        raise NotImplementedError(
+            "PagedDSV4Cache replicates by forking the sequence (replicate(B) -> "
+            "PagedKVCacheManager.replicate); the per-layer _copy is the wrong hook for paged latent.")
+
+
 def paged_cache(manager: "PagedKVCacheManager", seq: "SeqHandle", n_layers: int, *,
                 quantized: bool = True, group_size: int = 128, max_rollback: int = 1) -> DSV4Cache:
-    """A :class:`DSV4Cache` whose every layer's latent KV is a paged view into ``manager`` (ALL DSV4
-    layers are attention, so every latent stream is paged). Derived ckv/ikv/ring stay per-stream.
+    """A :class:`PagedDSV4Cache` whose every layer's latent KV is a paged view into ``manager`` (ALL
+    DSV4 layers are attention, so every latent stream is paged). Derived ckv/ikv/ring stay per-stream.
     ``quantized``/``group_size`` MUST match the discrete cache's settled values (the runtime threads
     the latent's :func:`quanta.dsv4.batched_runtime._latent_quant` result) so the paged round-trip is
-    bit-identical to the discrete stream."""
-    obj = DSV4Cache.__new__(DSV4Cache)
-    obj.layers = [
-        _PagedLayerCache(manager.view_one(seq, i), quantized=quantized,
-                         group_size=group_size, max_rollback=max_rollback)
-        for i in range(n_layers)
-    ]
-    return obj
+    bit-identical to the discrete stream. The returned cache also supports the batched tree-spec verify
+    ``replicate(B)`` contract (sequence-level COW fork) — see :class:`PagedDSV4Cache`."""
+    return PagedDSV4Cache(manager, seq, n_layers, quantized=quantized,
+                          group_size=group_size, max_rollback=max_rollback)
 
 
 @dataclass(frozen=True)
