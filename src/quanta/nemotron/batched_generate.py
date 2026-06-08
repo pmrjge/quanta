@@ -8,9 +8,8 @@ amortizes the always-on expert reads across streams. Per-stream stop conditions 
 new) free a slot for the next pending prompt; a slot's per-stream state is reset on admit.
 
 Reuses :func:`quanta.generate.sample_logits` for the per-stream sampler (same temperature /
-top-k / top-p surface the single-stream Nemotron generate exposes). ``min_p`` is accepted for
-API symmetry with the broader serving surface but **not** implemented — raises if non-zero
-(rule-6: no silent failures).
+top-k / top-p / min-p surface the single-stream Nemotron generate exposes). ``min_p`` is
+forwarded to the sampler (drops tokens below ``min_p * max_prob``; ``min_p == 0`` is a no-op).
 """
 
 from __future__ import annotations
@@ -66,14 +65,10 @@ def batched_generate(
     lists in caller order. Each prompt's per-stream state is admitted into a freed slot, prefilled,
     and stepped each round; per-stream stop fires on ``eos_ids`` or the per-stream new-token cap.
 
-    ``temperature``/``top_k``/``top_p``: passed through to :func:`sample_logits`. ``min_p > 0`` is
-    **not implemented** (the existing sampler has no min_p path) — raises ``NotImplementedError``
-    rather than silently dropping the constraint. ``seed`` seeds a per-stream rng (so identical
-    prompts under sampling still produce identical streams when given identical per-stream
-    sub-keys — and the result is deterministic with respect to the admit order)."""
-    if min_p > 0.0:
-        raise NotImplementedError("min_p is not supported by the underlying sampler "
-                                  "(quanta.generate.sample_logits); pass min_p=0.0")
+    ``temperature``/``top_k``/``top_p``/``min_p``: passed through to :func:`sample_logits` (``min_p``
+    drops tokens below ``min_p * max_prob``; ``min_p == 0`` is a no-op). ``seed`` seeds a per-stream
+    rng (so identical prompts under sampling still produce identical streams when given identical
+    per-stream sub-keys — and the result is deterministic with respect to the admit order)."""
     if max_new <= 0:
         raise ValueError(f"max_new must be positive, got {max_new}")
 
@@ -105,7 +100,7 @@ def batched_generate(
         key_s, sub = mx.random.split(keys[pi])
         keys[pi] = key_s
         tok = int(sample_logits(logits[0, -1], temperature=temperature, top_k=top_k,
-                                 top_p=top_p, key=sub).item())
+                                 top_p=top_p, min_p=min_p, key=sub).item())
         return _Slot(idx=pi, state=state, next_id=tok, key=keys[pi])
 
     # admit until max_batch or out of pending
@@ -136,7 +131,7 @@ def batched_generate(
             for s, logits in zip(active, logits_list, strict=True):
                 s.key, sub = mx.random.split(s.key)
                 s.next_id = int(sample_logits(logits[0, -1], temperature=temperature, top_k=top_k,
-                                               top_p=top_p, key=sub).item())
+                                               top_p=top_p, min_p=min_p, key=sub).item())
 
         # harvest finished slots, admit new pending ones
         for fs in slots:

@@ -140,11 +140,59 @@ def _check_cow() -> bool:
     return ok
 
 
+def _check_replicate() -> bool:
+    # B-way sequence-level replicate (the paged analog of DSV4Cache.replicate(B)). seqA: 6 tokens =>
+    # 1 full block + a partial tail of 2 (block_size 4). replicate(B) forks B COW siblings sharing the
+    # partial tail; each writes a DISTINCT divergent token into it, so each must COW-clone the tail.
+    base_n, B = 6, 3
+    k, v = _stream(seed=1, n=base_n)
+    xk, xv = _stream(seed=3, n=B)  # B distinct divergent tokens (one per branch)
+
+    mgr = _paged_manager(quantized=True)
+    seqA = mgr.new_sequence()
+    _paged_final(mgr, seqA, k, v, layer=0)
+
+    cow_before = mgr.get_stats().cow_copies
+    branches = mgr.replicate(seqA, B)
+    branches_ok = (len(branches) == B and all(br.seq_id != seqA.seq_id for br in branches)
+                   and len({br.seq_id for br in branches}) == B)
+
+    for j, br in enumerate(branches):  # each branch appends its own divergent token into the shared tail
+        mgr.advance(br, [9100 + j])
+        for L in range(NUM_LAYERS):
+            mgr.view(br, L).update(xk[:, :, j:j + 1], xv[:, :, j:j + 1])
+        mgr.commit(br)
+
+    cow = mgr.get_stats().cow_copies - cow_before
+    gathered = []
+    each_exact = True
+    for j, br in enumerate(branches):  # branch j == discrete(base + its own divergent token)
+        bk, bv = mgr.gather(br, 0)
+        mx.eval(bk, bv)
+        gathered.append(bk)
+        ref_k = mx.concatenate([k, xk[:, :, j:j + 1]], axis=2)
+        ref_v = mx.concatenate([v, xv[:, :, j:j + 1]], axis=2)
+        dref_k, dref_v = _discrete_final(ref_k, ref_v, quantized=True)
+        if _max_abs(dref_k, bk) != 0.0 or _max_abs(dref_v, bv) != 0.0:
+            each_exact = False
+    diverged = all(_max_abs(gathered[i], gathered[i + 1]) > 0.0 for i in range(B - 1))
+
+    pk, _pv = mgr.gather(seqA, 0)  # parent prefix still readable + unchanged length (read-only)
+    mx.eval(pk)
+    parent_ok = (pk.shape[2] == base_n)
+
+    ok = branches_ok and each_exact and diverged and parent_ok and cow >= B
+    print(f"(d) replicate(B={B}): branches_ok={branches_ok} each_exact={each_exact} diverged={diverged} "
+          f"parent_ok={parent_ok} cow_copies={cow} -> {'PASS' if ok else 'FAIL'}")
+    return ok
+
+
 def run() -> None:
     ok = True
     ok = _check_identical(quantized=True) and ok
     ok = _check_identical(quantized=False) and ok
     ok = _check_cow() and ok
+    ok = _check_replicate() and ok
     print("PASS" if ok else "FAIL")
     if not ok:
         raise SystemExit(1)

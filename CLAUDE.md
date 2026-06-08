@@ -437,9 +437,22 @@ is fully landed:
   dequant-to-bf16: **COMPLETE** (`a6b3b49`/`d17882e`/`f720fda`, marked complete `b62596e`;
   resident **63→20 GiB**, greedy-exact, ppl unchanged). Handover **`PLAN_qwen35_experts.md`**.
 
-Optional, non-blocking: extend the #18 bench to B=48/64 on a free solo GPU (largely subsumed —
-#153 M4 already benched DSV4 at B=48). Cadence (standing user instruction): single thread, NO
-subagents, commit each milestone, then STOP for the user to compact.
+**Deferred-polish items CLOSED (model-free gated):** (1) **paged sequence-level replicate** —
+`PagedKVCacheManager.replicate(seq, b)` (B-way COW branch, the paged analog of `DSV4Cache.replicate`;
+one `fork` clones all layers together — the per-layer `PagedKVCacheView._copy` stays fail-loud as the
+wrong hook), gated in `parity/paged_cache_test.py` (B=3 → each branch == discrete(base+token),
+per-layer COW-isolated, parent read-only); the model-side tree-spec-over-paged *wiring* remains the
+#158-160 follow-up (scope-guarded by #152). (2) **Nemotron batched `min_p`** — added to the shared
+`quanta.generate.sample_logits` (drops tokens below `min_p·max_prob`, `min_p=0` byte-identical = rule
+4) + wired through `nemotron.batched_generate` (the old `NotImplementedError` removed), gated
+`parity/sample_min_p_test.py`. (3) **#150 `ReasoningParser`** — reconciled the oMLX shim with the
+formal Protocol that landed in `quanta.shim.tool_parsers` (`parse(text)->dict`, concrete
+`Qwen3ReasoningParser`): omlx's stale `extract`-based stub → `parse`, conformance helper checks
+`.parse`, gated `parity/omlx_reasoning_parser_test.py`. Only remaining non-MiniMax work is the
+#158-160 tree-spec-over-paged wiring (a real milestone, not polish). Optional, non-blocking: extend
+the #18 bench to B=48/64 on a free solo GPU (largely subsumed — #153 M4 already benched DSV4 at B=48).
+Cadence (standing user instruction): single thread, NO subagents, commit each milestone, then STOP for
+the user to compact.
 
 ---
 

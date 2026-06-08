@@ -165,6 +165,23 @@ class PagedKVCacheManager:
                 alloc.incref(blk)
         return nseq
 
+    def replicate(self, seq: SeqHandle, b: int) -> list[SeqHandle]:
+        """Branch ``seq`` into ``b`` independent copy-on-write siblings — the sequence-level, paged
+        analog of the discrete ``DSV4Cache.replicate(B)`` the batched tree-spec verify uses. Each
+        branch shares every block (ref++) until it writes its partial tail, at which point COW isolates
+        the divergence, so the original prefix stays read-only and the B paths cost one shared block
+        set plus only their per-path tails.
+
+        This is the CORRECT level for paged branching: one :meth:`fork` clones ALL layers of the
+        sequence together (they share one block table per layer). The per-layer
+        :meth:`PagedKVCacheView._copy` is the wrong hook — a view sees a single layer and cannot fork
+        the shared sequence. Wiring this into the tree-spec verify loop (so serving spec-decode can run
+        over paged caches instead of the discrete ones the #152 scope guard mandates today) is the
+        deferred #158-160 follow-up; the primitive is gated in ``parity/paged_cache_test.py``."""
+        if b < 1:
+            raise ValueError(f"replicate(b) requires b >= 1 (got {b})")
+        return [self.fork(seq) for _ in range(b)]
+
     # --- prefix matching -----------------------------------------------------
     def match_prefix(self, seq: SeqHandle, token_ids: list[int]) -> int:
         """Re-reference resident full blocks that match the leading full blocks of ``token_ids`` (in
@@ -606,10 +623,14 @@ class PagedKVCacheView:
         self._m.truncate(self._seq, length)
 
     def _copy(self) -> "PagedKVCacheView":
+        # A per-layer view cannot replicate paged state: branching must fork the WHOLE sequence at once
+        # (all layers share one block table per layer), so the correct primitive is the sequence-level
+        # PagedKVCacheManager.replicate(seq, b) / .fork(seq) — not a per-view copy. Fail loud (rule 6)
+        # rather than silently clone a single layer. Wiring tree-spec verify onto paged caches is #158-160.
         raise NotImplementedError(
-            "paged per-layer replicate is a deferred follow-up; tree-spec verify (#158-160) uses "
-            "discrete caches (the #152 scope guard). Use PagedKVCacheManager.fork for sequence-level "
-            "branching.")
+            "paged per-layer replicate is the wrong abstraction (a view sees one layer); use "
+            "PagedKVCacheManager.replicate(seq, b) for B-way COW branching (or .fork(seq) for one). "
+            "Tree-spec verify (#158-160) still uses discrete caches per the #152 scope guard.")
 
 
 class PagedLatentCacheView:

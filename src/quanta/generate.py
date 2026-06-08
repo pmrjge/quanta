@@ -35,12 +35,15 @@ def sample_logits(
     temperature: float = 0.0,
     top_k: int = 0,
     top_p: float = 1.0,
+    min_p: float = 0.0,
     key: mx.array | None = None,
 ) -> mx.array:
     """Sample one next token per row from ``[..., V]`` logits — fully vectorized, no loops.
 
     ``temperature == 0`` is greedy (argmax). Otherwise apply temperature, then optional
-    top-k and top-p (nucleus) truncation, then categorical sampling.
+    top-k, top-p (nucleus), and min-p truncation, then categorical sampling. ``min_p`` drops
+    tokens whose probability is below ``min_p * max_prob``; ``min_p == 0`` disables it, leaving
+    the sampler byte-identical to the top-k/top-p-only path (rule 4).
     """
     if temperature <= 0.0:
         return mx.argmax(logits, axis=-1)
@@ -60,6 +63,10 @@ def sample_logits(
         keep_ordered = before < top_p
         keep = mx.take_along_axis(keep_ordered, mx.argsort(order, axis=-1), axis=-1)  # scatter back
         logits = mx.where(keep, logits, NEG_INF)
+
+    if 0.0 < min_p <= 1.0:  # drop tokens below ``min_p * max_prob`` (after top-k/top-p)
+        probs = mx.softmax(logits, axis=-1)
+        logits = mx.where(probs < min_p * mx.max(probs, axis=-1, keepdims=True), NEG_INF, logits)
 
     return mx.random.categorical(logits, axis=-1, key=key)
 

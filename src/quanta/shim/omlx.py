@@ -539,42 +539,51 @@ class _SingleTokenStepper:
         return row
 
 
-# --- Reasoning-parser contract (LOCAL STUB) ---------------------------------------------------------
-# stub — replaced when #150 (Qwen oMLX shim agent) lands the formal `ReasoningParser` Protocol in
-# `quanta.shim.tool_parsers` (or `quanta.shim.parsers_contract`). We define this stub so DSV4 /
-# Nemotron code can structurally conform NOW; once the real Protocol is importable, the stub becomes
-# a no-op (the runtime check still passes — both are duck-typed Protocols over the same surface).
+# --- Reasoning-parser contract ----------------------------------------------------------------------
+# #150 has LANDED: the formal `ReasoningParser` Protocol now lives in `quanta.shim.tool_parsers`
+# (method ``parse(text) -> {"reasoning": str | None, "answer": str}``, with a concrete
+# `Qwen3ReasoningParser`). We import it directly; the ``except ImportError`` branch is a faithful
+# fallback over the SAME ``parse`` surface (kept only so this module still imports if `tool_parsers`
+# is ever stripped). Note the surface changed from the old ``extract(text) -> tuple`` stub: #150 chose
+# a dict return, so the conformance check below keys off ``parse`` (not ``extract``).
 #
-# AUDIT (this commit): DSV4 has no custom reasoning parser in `quanta.shim.tool_parsers` (the engine
-# emits raw ``<think>…</think>`` text and oMLX's stock ``thinking.extract_thinking`` handles it — see
-# the per-model contract docstring at the top of this file). Nemotron likewise has no custom parser
-# ("Kimi tool-patch, Nemotron none" — project memory). So the conformance surface below has nothing
-# to register today; it's plumbed only so a future parser added by either model would conform without
-# touching this file.
-try:  # prefer the formal Protocol when the Qwen agent (#150) has landed it
+# AUDIT: DSV4 / Nemotron register NO custom reasoning parser — both emit raw ``<think>…</think>`` text
+# that oMLX's stock ``thinking.extract_thinking`` handles (see the per-model contract docstring at the
+# top of this file; "Kimi tool-patch, Nemotron none" — project memory). So the conformance surface
+# below has nothing to register today; it's plumbed so a future model-specific parser conforms without
+# touching this file (a non-standard-markup model like Qwen3.5 would register `Qwen3ReasoningParser`).
+try:  # the formal Protocol (#150) — present in-tree
     from quanta.shim.tool_parsers import ReasoningParser as _ReasoningParser  # type: ignore[attr-defined]
-except ImportError:  # stub Protocol — same surface as the eventual real one
+except ImportError:  # faithful fallback over the same surface (``parse(text) -> dict``)
     class _ReasoningParser(Protocol):
-        """Minimal reasoning-parser contract used until #150 lands the formal Protocol.
+        """Reasoning-span parser contract (mirror of :class:`quanta.shim.tool_parsers.ReasoningParser`).
 
-        A reasoning parser, given the model's raw output, returns ``(reasoning, content)`` — the
-        ``<think>…</think>`` body and the remainder. Mirrors :func:`omlx.api.thinking.extract_thinking`
-        so a quanta parser can be a drop-in replacement for the stock one when the model's markup is
-        non-standard (DSV4 / Nemotron currently use the stock markup, so neither registers here)."""
+        ``parse`` takes the model's raw assistant turn and returns a dict with at minimum
+        ``{"reasoning": str | None, "answer": str}`` — the ``<think>…</think>`` body (``None`` when no
+        reasoning span was emitted) and the visible remainder. DSV4 / Nemotron use the stock markup, so
+        neither registers a custom parser here."""
 
-        def extract(self, text: str) -> tuple[str, str]: ...
+        def parse(self, text: str) -> dict: ...
+
+
+def _assert_reasoning_conformant(parsers: tuple[_ReasoningParser, ...]) -> None:
+    """Fail loud (rule 6) if any registered reasoning parser does not satisfy the `ReasoningParser`
+    contract — i.e. is missing the ``parse(text) -> dict`` method. Extracted from
+    :func:`_conformant_reasoning_parsers` so the enforcement is unit-testable with a deliberately
+    malformed parser (the public tuple is empty today, so the loop is otherwise un-exercised)."""
+    for p in parsers:
+        if not hasattr(p, "parse"):
+            raise OmlxShimError(
+                f"reasoning parser {type(p).__name__} does not conform to ReasoningParser (no .parse)")
 
 
 def _conformant_reasoning_parsers() -> tuple[_ReasoningParser, ...]:
     """Return the tuple of reasoning parsers the engine knows about for DSV4 / Nemotron — currently
-    empty (both use oMLX's stock parser). When #150 lands, the formal Protocol replaces ``_ReasoningParser``
-    and any model-specific parser registered in :mod:`quanta.shim.tool_parsers` would be added here.
-    The contract conformance check (the ``hasattr`` below) stays exact under both Protocols."""
+    empty (both use oMLX's stock parser; #150's formal Protocol is imported above). Any model-specific
+    parser registered in :mod:`quanta.shim.tool_parsers` would be added here and validated for
+    conformance (the ``parse`` method) before use."""
     parsers: tuple[_ReasoningParser, ...] = ()
-    for p in parsers:  # pragma: no cover - empty today; enforces shape when populated
-        if not hasattr(p, "extract"):
-            raise OmlxShimError(
-                f"reasoning parser {type(p).__name__} does not conform to ReasoningParser (no .extract)")
+    _assert_reasoning_conformant(parsers)
     return parsers
 
 
