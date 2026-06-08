@@ -45,6 +45,9 @@ data = { purelib = "pth_data" }
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    "slow: model-free parity-gate sweep — one subprocess per gate (~minutes). Runs by default so rot is caught; skip the inner loop with -m 'not slow'.",
+]
 
 [tool.ruff]
 line-length = 100
