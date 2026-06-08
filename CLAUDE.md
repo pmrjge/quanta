@@ -485,16 +485,34 @@ fresh-cache guard) and **real-weight solo** (`parity/dsv4_spec_paged_real.py`, ~
 MTP): tree-spec over a real paged cache == discrete == **greedy bit-identical** (32 tok, mean_accept 2.91,
 W2D2) — and the manager stats prove the `release` path bounds the pool (172 allocated blocks after 1720
 COW verify forks, no leak). **DSV4 tree-spec-over-paged is COMPLETE** (the pure-attention keeper where
-tree-spec is a real B=1 latency lever). **Remaining:** Nemotron (un-sliceable Mamba `(ssm,conv)`) cache
-half (M3); **M2 ✅ qwen35 = N/A (documented + pinned)** — its serving is UNPAGED (`paged_kv=False`, no
-`make_paged_state`; #153 option-B is unpaged), so there is no paged cache to make replicate-able and
-tree-spec already runs over its discrete `Qwen35Cache` (gated e2e by `qwen35_batched_tree_verify_test`).
-The N/A is pinned by `parity/qwen35_spec_paged_na_test.py`: the **paged-contract discriminant**
-(DSV4+Nemotron expose `make_paged_state`+`paged_kv_spec`; Qwen3.5 exposes NEITHER) fails loud if Qwen3.5
-ever gains paging (rule 6, no silent drift), and confirms its discrete `Qwen35Cache.replicate(B)`
-satisfies the tree-spec cache contract. NOTE per settled findings (MTP-M4): tree-spec is a B=1
-latency lever capped <1× on the hybrids, so the Nemotron wiring's *value* is limited — DSV4 (pure
-attention, now done) is the keeper where it helps.
+tree-spec is a real B=1 latency lever). **M2 ✅ qwen35 = N/A (documented + pinned)** — its serving is
+UNPAGED (`paged_kv=False`, no `make_paged_state`; #153 option-B is unpaged), so there is no paged cache
+to make replicate-able and tree-spec already runs over its discrete `Qwen35Cache` (gated e2e by
+`qwen35_batched_tree_verify_test`). The N/A is pinned by `parity/qwen35_spec_paged_na_test.py`: the
+**paged-contract discriminant** (DSV4+Nemotron expose `make_paged_state`+`paged_kv_spec`; Qwen3.5 exposes
+NEITHER) fails loud if Qwen3.5 ever gains paging (rule 6, no silent drift), and confirms its discrete
+`Qwen35Cache.replicate(B)` satisfies the tree-spec cache contract. **M3 ✅ Nemotron (paged triple, full
+impl + real gate)** — the hardest half: Nemotron's decode state is a `(caches, ssm, conv)` TRIPLE (no
+cache object for the lifecycle hooks) with an un-sliceable Mamba `(ssm,conv)`. (1) **paged
+`replicate_state`** (`batched_runtime.py`) — when the KV slots are paged views, fork the WHOLE sequence
+B ways (`PagedKVCacheManager.replicate`) + re-point each layer's view onto its fork (new
+`PagedKVCacheView.rebind`/`PagedLatentCacheView.rebind`), instead of the discrete `KVCache._copy`; the
+Mamba state rides the same per-replica list-spine clone. (2) **triple-level lifecycle** — a new
+`quanta.paged.manager_seq_of(caches)` bridge recovers `(manager, seq)` from the paged views, so the spec
+loop drives `advance`/`commit`/`free` (a single stub cache or discrete list ⇒ `None` ⇒ no-op, rule 4).
+(3) **`make_state` factory** threaded through `spec_generate{,_k,_tree}` (fresh-state guard, rule 6),
+bracketing EVERY forward incl. the hybrid `(ssm,conv)` snapshot/restore re-run + the commit-replay + the
+per-replica `batch_step`. Gated **model-free** (`parity/nemotron_spec_paged_test.py`: a stub that writes
+k/v like the real model drives a REAL paged triple — paged == discrete **bit-identical** across
+batched∈{T,F}×MTP∈{perfect,wrong}, W4D2 B=16 forked seqs, width-1 chain k=3, eos, fresh-guard) and
+**real-weight solo** (`parity/nemotron_spec_paged_real.py`, ~68 GiB Super-120B int4g64 + random MTP):
+paged tree-spec == discrete **BIT-IDENTICAL** (32 tok; bit-exact not just ≥0.99 — from-scratch paged KV
+== discrete KV exactly, the #174 bf16-ULP came from prefix-reuse resume which the spec loop's full
+prefill doesn't trigger), manager stats prove `release` bounds the pool (32 blocks after 928 COW verify
+forks, no leak). **The #158-160 tree-spec-over-paged track is COMPLETE (M0–M3).** Per settled findings
+(MTP-M4) this Nemotron path is a <1× B=1 lever — the capability is now wired + lossless-gated, but DSV4
+(pure attention) stays the keeper where tree-spec actually helps; serving throughput uses multi-stream
+paged decode, not tree-spec path-replication.
 
 Optional, non-blocking: extend
 the #18 bench to B=48/64 on a free solo GPU (largely subsumed — #153 M4 already benched DSV4 at B=48).

@@ -56,6 +56,7 @@ from __future__ import annotations
 
 import mlx.core as mx
 
+from quanta.paged import manager_seq_of
 from quanta.spec.tree import build_tree, enumerate_paths
 
 
@@ -107,8 +108,59 @@ def _forward(model, token_ids, *, caches, ssm, conv, offset, capture_layers):
     return out, None
 
 
+def _resolve_state(model, make_state, *, max_rollback):
+    """The decode state triple for a spec run: the caller's ``make_state`` factory when given (the
+    tree-spec-over-paged hook, #158-160), else the model's own :func:`_capture_state`.
+
+    ``make_state`` is a callable ``make_state(max_rollback) -> (caches, ssm, conv)`` the serving layer
+    wires to build a **paged** triple (each attention layer's KV slot is a paged view into the shared
+    :class:`~quanta.paged.PagedKVCacheManager`; the Mamba ``(ssm, conv)`` summary stays per-stream). The
+    spec loop then prefills the prompt into it and drives the SAME replicate/truncate/offset contract,
+    bracketing every forward with the paged manager lifecycle. ``make_state=None`` (default) is the
+    discrete :func:`_capture_state` path, byte-identical to pre-#158 (rule 4).
+
+    The returned state MUST be fresh (every attention KV at offset 0) — the spec loop owns the prefill;
+    a pre-filled paged state would double-count positions (rule 6, loud)."""
+    if make_state is None:
+        return _capture_state(model)
+    st = make_state(max_rollback=max_rollback)
+    caches, ssm, conv = st if (isinstance(st, tuple) and len(st) == 3) else (st, None, None)
+    for c in caches or ():
+        if c is not None and getattr(c, "offset", 0) != 0:
+            raise ValueError(
+                f"nemotron spec make_state must return a FRESH state (every KV at offset 0); got "
+                f"offset={c.offset}. The spec loop owns the prefill — pass an empty paged state.")
+    return caches, ssm, conv
+
+
+# --- paged forward lifecycle bracket (#158-160) ----------------------------------------------------
+# Nemotron's decode state is a ``(caches, ssm, conv)`` triple, NOT a cache object, so there is no object
+# to carry the lifecycle hooks DSV4's PagedDSV4Cache has. Instead the (manager, seq) is recovered from
+# the paged KV views (:func:`quanta.paged.manager_seq_of`): ``advance`` opens a forward's positions
+# BEFORE it writes them, ``commit`` content-hashes the just-filled blocks AFTER, and ``free`` releases a
+# discarded verify replica's COW blocks (rule 6: no pool leak). ``advance`` does NOT move the write
+# cursor, so a batched-verify replica's ``offset == q+1+t`` precondition still holds. A DISCRETE state
+# has no paged views ⇒ ``manager_seq_of`` is ``None`` and all three are no-ops (rule 4: byte-unchanged).
+def _begin_forward(caches, token_ids) -> None:
+    h = manager_seq_of(caches)
+    if h is not None:
+        h[0].advance(h[1], [int(t) for t in token_ids])
+
+
+def _end_forward(caches) -> None:
+    h = manager_seq_of(caches)
+    if h is not None:
+        h[0].commit(h[1])
+
+
+def _release(caches) -> None:
+    h = manager_seq_of(caches)
+    if h is not None:
+        h[0].free(h[1])
+
+
 def spec_generate(model, mtp, embed: mx.array, head: mx.array, prompt_ids,
-                  *, max_new: int, eos_id=None) -> tuple[list[int], dict]:
+                  *, max_new: int, eos_id=None, make_state=None) -> tuple[list[int], dict]:
     """Lossless native-MTP self-speculation (1 draft head). Returns ``(tokens, stats)``.
 
     ``model``: the resident Nemotron model; ``mtp``: the MTP draft head (called
@@ -127,11 +179,13 @@ def spec_generate(model, mtp, embed: mx.array, head: mx.array, prompt_ids,
     if not prompt_ids:
         raise ValueError("spec_generate needs a non-empty prompt")
     stop = _as_stop_set(eos_id)
-    caches, ssm, conv = _capture_state(model)
+    caches, ssm, conv = _resolve_state(model, make_state, max_rollback=1)
 
     # --- prefill: verified token at position q = len(prompt)-1, plus its feature ---
+    _begin_forward(caches, prompt_ids)                  # paged: advance; discrete: no-op
     logits, caps = _forward(model, mx.array(prompt_ids), caches=caches, ssm=ssm, conv=conv,
                             offset=0, capture_layers=(last,))
+    _end_forward(caches)                                # paged: commit; discrete: no-op
     mx.eval(logits) if caps is None else mx.eval(logits, caps[last])
     q = len(prompt_ids) - 1
     prev_hidden = caps[last][-1][None, None]            # [1,1,hidden] main hidden at position q
@@ -157,8 +211,10 @@ def spec_generate(model, mtp, embed: mx.array, head: mx.array, prompt_ids,
         pre_offset = q + 1
 
         # --- verify both in ONE main forward over [cur, draft] at offset q+1 ---
+        _begin_forward(caches, [cur, draft])
         vlog, vcaps = _forward(model, mx.array([cur, draft]), caches=caches, ssm=ssm, conv=conv,
                                offset=pre_offset, capture_layers=(last,))
+        _end_forward(caches)
         bpred = mx.argmax(vlog[0], axis=-1)             # [2]; bpred[0]=greedy@q+2, bpred[1]=greedy@q+3
         mx.eval(bpred) if vcaps is None else mx.eval(bpred, vcaps[last])
         b0, b1 = int(bpred[0].item()), int(bpred[1].item())
@@ -178,9 +234,11 @@ def spec_generate(model, mtp, embed: mx.array, head: mx.array, prompt_ids,
                 ssm[i] = ssm_pre[i]
             for i in range(len(conv)):
                 conv[i] = conv_pre[i]
-            _rollback(model, caches, pre_offset)
+            _rollback(model, caches, pre_offset)        # paged: manager.truncate (KV blocks)
+            _begin_forward(caches, [cur])               # re-run [cur] to re-advance KV + Mamba state
             rlog, rcaps = _forward(model, mx.array([cur]), caches=caches, ssm=ssm, conv=conv,
                                    offset=pre_offset, capture_layers=(last,))
+            _end_forward(caches)
             mx.eval(rlog) if rcaps is None else mx.eval(rlog, rcaps[last])
             prev_hidden = rcaps[last][-1][None, None]   # main hidden at the committed (cur) position
         else:
@@ -245,7 +303,7 @@ def _rollback(model, caches, length: int) -> None:
 
 
 def spec_generate_k(model, mtp, embed: mx.array, head: mx.array, prompt_ids,
-                    *, k: int, max_new: int, eos_id=None) -> tuple[list[int], dict]:
+                    *, k: int, max_new: int, eos_id=None, make_state=None) -> tuple[list[int], dict]:
     """Multi-step lossless native-MTP self-speculation: chain ``k`` draft tokens per round.
 
     ``k == 1`` delegates to :func:`spec_generate` (the parity-tested single-step path) — bit-identical
@@ -275,18 +333,20 @@ def spec_generate_k(model, mtp, embed: mx.array, head: mx.array, prompt_ids,
         raise ValueError(f"spec_generate_k k={k} must be >= 1")
     if k == 1:                                                  # parity-tested single-step path
         return spec_generate(model, mtp, embed, head, prompt_ids,
-                             max_new=max_new, eos_id=eos_id)
+                             max_new=max_new, eos_id=eos_id, make_state=make_state)
 
     last = model.cfg.num_hidden_layers - 1
     prompt_ids = list(prompt_ids)
     if not prompt_ids:
         raise ValueError("spec_generate_k needs a non-empty prompt")
     stop = _as_stop_set(eos_id)
-    caches, ssm, conv = _capture_state(model)
+    caches, ssm, conv = _resolve_state(model, make_state, max_rollback=k)
 
     # --- prefill: verified token at position q = len(prompt)-1, plus its feature ---
+    _begin_forward(caches, prompt_ids)                  # paged: advance; discrete: no-op
     logits, caps = _forward(model, mx.array(prompt_ids), caches=caches, ssm=ssm, conv=conv,
                             offset=0, capture_layers=(last,))
+    _end_forward(caches)                                # paged: commit; discrete: no-op
     mx.eval(logits) if caps is None else mx.eval(logits, caps[last])
     q = len(prompt_ids) - 1
     prev_hidden = caps[last][-1][None, None]            # [1,1,hidden] main hidden at position q
@@ -313,8 +373,10 @@ def spec_generate_k(model, mtp, embed: mx.array, head: mx.array, prompt_ids,
 
         # --- verify all k+1 tokens in ONE main forward over [cur, d_1, ..., d_k] at offset q+1 ---
         verify_in = [cur, *drafts]
+        _begin_forward(caches, verify_in)
         vlog, vcaps = _forward(model, mx.array(verify_in), caches=caches, ssm=ssm, conv=conv,
                                offset=pre_offset, capture_layers=(last,))
+        _end_forward(caches)
         bpred = mx.argmax(vlog[0], axis=-1)                          # [k+1]
         mx.eval(bpred) if vcaps is None else mx.eval(bpred, vcaps[last])
         gpreds = [int(bpred[i].item()) for i in range(k + 1)]
@@ -343,10 +405,12 @@ def spec_generate_k(model, mtp, embed: mx.array, head: mx.array, prompt_ids,
             if conv_pre is not None:
                 for i in range(len(conv)):
                     conv[i] = conv_pre[i]
-            _rollback(model, caches, pre_offset)
+            _rollback(model, caches, pre_offset)                    # paged: manager.truncate (KV blocks)
             replay = [cur, *drafts[:j]]                              # j + 1 tokens (1 <= len <= k)
+            _begin_forward(caches, replay)
             rlog, rcaps = _forward(model, mx.array(replay), caches=caches, ssm=ssm, conv=conv,
                                    offset=pre_offset, capture_layers=(last,))
+            _end_forward(caches)
             mx.eval(rlog) if rcaps is None else mx.eval(rlog, rcaps[last])
             prev_hidden = rcaps[last][-1][None, None]                # hidden at the LAST committed pos
         else:                                                         # perfect chain — verify state OK
@@ -448,9 +512,13 @@ def batch_verify(model, state, cur: int, paths: list[list[int]],
     per_pos_hidden: list[mx.array | None] = []            # depth+1 × [B, 1, hidden]
     for t in range(depth + 1):
         toks = [seq[t] for seq in verify_seqs]
+        for rep, tk in zip(replicas, toks, strict=True):  # paged: advance each replica's seq; discrete: no-op
+            _begin_forward(rep[0], [tk])
         logits_t, hidden_t = model.batch_step(
             tokens=toks, replicas=replicas, offset=q + 1 + t, capture_layer=last_layer,
         )
+        for rep in replicas:                              # paged: commit each replica's seq; discrete: no-op
+            _end_forward(rep[0])
         per_pos_logits.append(logits_t)
         per_pos_hidden.append(hidden_t)
     mx.eval(*per_pos_logits, *(h for h in per_pos_hidden if h is not None))
@@ -483,13 +551,16 @@ def batch_verify(model, state, cur: int, paths: list[list[int]],
             f"(every batch_step at depth t={best_j} returned None). Spec loop relies on the MTP "
             f"feature; refusing to silently drop it (rule 6).")
     best_hidden = per_pos_hidden[best_j][best_hidden_b:best_hidden_b + 1]       # [1, 1, hidden]
+    mx.eval(best_hidden)                       # materialize BEFORE freeing the replicas' paged blocks
+    for rep in replicas:                       # paged: free each replica's COW blocks (rule 6); discrete: no-op
+        _release(rep[0])
 
     return best_j, best_bonus, best_path, best_hidden
 
 
 def spec_generate_tree(model, mtp, embed: mx.array, head: mx.array, prompt_ids,
                        *, width: int, depth: int, max_new: int,
-                       eos_id=None, batched: bool = True) -> tuple[list[int], dict]:
+                       eos_id=None, batched: bool = True, make_state=None) -> tuple[list[int], dict]:
     """**W-parallel chain-verify** tree drafting over the native Nemotron-H MTP head — lossless,
     hybrid-safe (task #157).
 
@@ -547,18 +618,20 @@ def spec_generate_tree(model, mtp, embed: mx.array, head: mx.array, prompt_ids,
         # (no path-level fan-out to batch), so the short-circuit ignores the flag and the gate
         # ``test_width1_matches_spec_generate_k_both_flags`` covers it for both flag values.
         return spec_generate_k(model, mtp, embed, head, prompt_ids,
-                               k=depth, max_new=max_new, eos_id=eos_id)
+                               k=depth, max_new=max_new, eos_id=eos_id, make_state=make_state)
 
     last = model.cfg.num_hidden_layers - 1
     prompt_ids = list(prompt_ids)
     if not prompt_ids:
         raise ValueError("spec_generate_tree needs a non-empty prompt")
     stop = _as_stop_set(eos_id)
-    caches, ssm, conv = _capture_state(model)
+    caches, ssm, conv = _resolve_state(model, make_state, max_rollback=depth + 1)
 
     # --- prefill: verified token at q = len(prompt)-1, plus its feature ---
+    _begin_forward(caches, prompt_ids)                   # paged: advance; discrete: no-op
     logits, caps = _forward(model, mx.array(prompt_ids), caches=caches, ssm=ssm, conv=conv,
                             offset=0, capture_layers=(last,))
+    _end_forward(caches)                                 # paged: commit; discrete: no-op
     mx.eval(logits) if caps is None else mx.eval(logits, caps[last])
     q = len(prompt_ids) - 1
     prev_hidden = caps[last][-1][None, None]              # [1,1,hidden] main hidden at q
@@ -614,8 +687,10 @@ def spec_generate_tree(model, mtp, embed: mx.array, head: mx.array, prompt_ids,
 
             for path_drafts in paths:
                 verify_in = [cur, *path_drafts]
+                _begin_forward(caches, verify_in)
                 vlog, vcaps = _forward(model, mx.array(verify_in), caches=caches, ssm=ssm,
                                        conv=conv, offset=pre_offset, capture_layers=(last,))
+                _end_forward(caches)
                 bpred = mx.argmax(vlog[0], axis=-1)        # [depth+1]
                 mx.eval(bpred) if vcaps is None else mx.eval(bpred, vcaps[last])
                 bp = [int(bpred[i].item()) for i in range(depth + 1)]
@@ -648,8 +723,10 @@ def spec_generate_tree(model, mtp, embed: mx.array, head: mx.array, prompt_ids,
         # committed offset. ``best_j == 0`` still replays ``[cur]`` (one token) — the single
         # post-cur prefill that the chained spec also runs to position state at the bonus.
         replay = [cur, *best_path[:best_j]]
+        _begin_forward(caches, replay)                   # paged: advance the ORIGINAL seq; discrete: no-op
         rlog, rcaps = _forward(model, mx.array(replay), caches=caches, ssm=ssm, conv=conv,
                                offset=pre_offset, capture_layers=(last,))
+        _end_forward(caches)
         mx.eval(rlog) if rcaps is None else mx.eval(rlog, rcaps[last])
         # The replay's final-position hidden is the bit-exact recompute of best_hidden (same input,
         # same starting state); we keep best_hidden as the value carried forward (avoid a needless

@@ -622,6 +622,15 @@ class PagedKVCacheView:
         # per-layer truncate is driven at the sequence level by the manager (all layers move together)
         self._m.truncate(self._seq, length)
 
+    def rebind(self, seq: SeqHandle) -> "PagedKVCacheView":
+        """A view of the SAME (manager, layer) into a DIFFERENT sequence (a COW fork). Rebuilds a
+        tuple-state model's per-attention-layer caches when :func:`quanta.nemotron.batched_runtime.
+        replicate_state` forks the prefix for batched tree-spec verify (#158-160) — the per-layer
+        replicate hook :meth:`_copy` rightly refuses (a view sees one layer); the correct branch is the
+        sequence-level :meth:`PagedKVCacheManager.replicate`, and ``rebind`` re-points each layer's view
+        onto a forked sequence."""
+        return PagedKVCacheView(self._m, seq, self._layer)
+
     def _copy(self) -> "PagedKVCacheView":
         # A per-layer view cannot replicate paged state: branching must fork the WHOLE sequence at once
         # (all layers share one block table per layer), so the correct primitive is the sequence-level
@@ -664,3 +673,30 @@ class PagedLatentCacheView:
     def truncate(self, length: int) -> None:
         # per-layer truncate is driven at the sequence level by the manager (all layers move together)
         self._m.truncate(self._seq, length)
+
+    def rebind(self, seq: SeqHandle) -> "PagedLatentCacheView":
+        """A latent view of the SAME (manager, layer) into a DIFFERENT sequence (a COW fork) — the
+        single-stream sibling of :meth:`PagedKVCacheView.rebind` (see there)."""
+        return PagedLatentCacheView(self._m, seq, self._layer)
+
+
+def manager_seq_of(caches) -> tuple[PagedKVCacheManager, SeqHandle] | None:
+    """The shared ``(manager, sequence)`` behind a model's per-layer ``caches`` list when its entries
+    are paged views (:class:`PagedKVCacheView` / :class:`PagedLatentCacheView`), else ``None`` (a
+    discrete cache list has no manager).
+
+    The bridge tree-spec-over-paged (#158-160) uses for a **tuple-state** model (Nemotron) whose decode
+    state is a ``(caches, ssm, conv)`` triple rather than a single cache object: there is no object to
+    carry ``begin_forward``/``end_forward``/``release``, so the spec loop recovers the manager + seq
+    from the paged views and drives the lifecycle (``advance`` before a forward writes, ``commit`` after,
+    ``free`` on a discarded replica) + forks verify replicas at the sequence level. Returns ``None`` for
+    a discrete state ⇒ the lifecycle bracket is a no-op there (rule 4: discrete spec is byte-unchanged).
+
+    ``caches`` that is not a per-layer list/tuple (e.g. a single stub cache object in the model-free
+    spec gates) is treated as non-paged (``None``) — only a layer list can hold paged views."""
+    if not isinstance(caches, (list, tuple)):
+        return None
+    for c in caches:
+        if isinstance(c, (PagedKVCacheView, PagedLatentCacheView)):
+            return c._m, c._seq
+    return None

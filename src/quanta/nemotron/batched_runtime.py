@@ -52,7 +52,7 @@ from quanta.nemotron.attention import KVCache
 from quanta.nemotron.config import NemotronHConfig
 from quanta.nemotron.model import NemotronBlock
 from quanta.nemotron.runtime import NemotronResidentModel
-from quanta.paged import PagedKVCacheView
+from quanta.paged import PagedKVCacheView, manager_seq_of
 
 
 def make_stream_state(cfg: NemotronHConfig) -> tuple[list, list, list]:
@@ -98,6 +98,23 @@ def replicate_state(state: tuple[list, list, list], b: int) -> list[tuple[list, 
         raise ValueError(f"replicate_state(B) requires B >= 1 (got {b})")
     caches, ssm, conv = state
     out: list[tuple[list, list, list]] = []
+
+    handle = manager_seq_of(caches)            # (manager, seq) when the KV slots are PAGED views
+    if handle is not None:
+        # PAGED (#158-160): fork the WHOLE sequence B ways (COW) and re-point each attention layer's
+        # view onto its fork — the sequence-level branch the per-layer ``view._copy`` rightly refuses
+        # (a view sees one layer; the block table is per-sequence). Each replica then shares the prefix
+        # latent by COW and clones only its per-path draft-tail block; the Mamba ``(ssm, conv)`` summary
+        # is carried by the SAME per-replica list-spine clone as the discrete path (immutable arrays).
+        manager, seq = handle
+        for fseq in manager.replicate(seq, b):
+            caches_r = [c.rebind(fseq) if c is not None else None for c in caches]
+            ssm_r = list(ssm) if ssm is not None else None
+            conv_r = list(conv) if conv is not None else None
+            out.append((caches_r, ssm_r, conv_r))
+        return out
+
+    # DISCRETE (unchanged): shallow per-layer KV copy (shared immutable codes/scales) + list spines.
     for _ in range(b):
         caches_r = [c._copy() if c is not None else None for c in caches]
         ssm_r = list(ssm) if ssm is not None else None
