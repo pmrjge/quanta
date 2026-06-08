@@ -772,11 +772,22 @@ git diff --check
 `pytest tests/` now subprocess-runs **every model-free `parity/*_test.py` gate** (the `slow`-marked
 sweep in `tests/test_parity_modelfree.py`, ~4 min for ~98 gates) — this is what catches stub-vs-real
 interface rot (the kind that silently broke `dsv4_tree_spec_test` + `qwen35_omlx_engine_test`). Use
-`-m "not slow"` for the fast inner loop. Standalone streaming/parallel equivalent (doubles as a CI
-step): `uv run python -m parity.run_modelfree_sweep [--jobs N]`. Discovery is filesystem-only and
-auto-includes new gates; **real-weight (SOLO, 9-306 GiB) gates are excluded** (source names a
-`~/models` artifact path or `set_wired_limit`) so the sweep never loads a resident model — those
-stay SOLO, run by hand.
+`-m "not slow"` for the fast inner loop (it still runs the instant **fail-open guards**: a pinned
+partition manifest, the `*_real_test.py` naming guard, and a misnamed-gate scanner). Standalone
+streaming/parallel equivalent (doubles as a CI step): `uv run python -m parity.run_modelfree_sweep
+[--jobs N]`. Discovery is filesystem-only and auto-includes new gates; **real-weight (SOLO, 9-306
+GiB) gates are excluded** by a multi-signal detector (`*_real_test.py` name, a `~/models`/
+`set_wired_limit`/`expanduser` source marker, or an explicit `# parity-gate: real-weight` sentinel)
+so the sweep never loads a resident model — those stay SOLO, run by hand. Hardening (all gated in
+`tests/test_parity_modelfree.py`): the detector **fails toward exclusion** and is backstopped by the
+**count manifest** (`EXPECTED_{TOTAL,MODEL_FREE,REAL_WEIGHT}` in `parity/_modelfree.py`) — adding
+any gate trips it, forcing conscious classification, so a real-weight gate that *evades* the markers
+overshoots the model-free bucket and fails LOUD instead of silently loading 306 GiB; `run_gate`
+rejects a **vacuous pass** (rc-0 with a printed Traceback or `PARITY-CHECKS: 0`); and a gate that
+needs the offline `reference` extra (≈11 import `safetensors`) is **skipped, not failed**, on a
+base-deps-only env (`uv sync --extra reference` for full local coverage). A green sweep proves
+**interface + logic on stubs, not real-model numeric parity** (that is the excluded SOLO gates).
+**When you add a `parity/*_test.py` gate, bump the matching `EXPECTED_*` count.**
 
 ---
 

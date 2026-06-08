@@ -1,4 +1,4 @@
-"""Standalone sweep: run every MODEL-FREE parity gate and report a pass/fail matrix.
+"""Standalone sweep: run every MODEL-FREE parity gate and report a pass/fail/skip matrix.
 
 The committed, reusable form of the throwaway hygiene driver that first caught two silently-rotted
 gates (``dsv4_tree_spec_test``, ``qwen35_omlx_engine_test`` — stub signatures drifting from the real
@@ -9,10 +9,13 @@ as a fast pre-commit / periodic health check of the model-free gate suite::
     uv run python -m parity.run_modelfree_sweep --jobs 6       # concurrent (model-free ⇒ safe)
     uv run python -m parity.run_modelfree_sweep --timeout 120
 
-Exits nonzero iff any gate failed (so it doubles as a CI step). Real-weight (SOLO, 9-306 GiB) gates
-are excluded by construction (see :mod:`parity._modelfree`); this never loads a resident model. For
-the pytest-integrated form see ``tests/test_parity_modelfree.py``; both share ``parity._modelfree``
-so they can't disagree on the gate set or how a gate is run.
+Exits nonzero iff any gate FAILED (a SKIP — a gate needing the offline ``reference`` extra on a
+base-deps-only env — is not a failure), so it doubles as a CI step. Real-weight (SOLO, 9-306 GiB)
+gates are excluded by construction (see :mod:`parity._modelfree`); this never loads a resident
+model. A green run proves interface + logic on synthetic stubs, NOT real-model numeric parity —
+that lives in the excluded SOLO gates. For the pytest-integrated form see
+``tests/test_parity_modelfree.py``; both share ``parity._modelfree`` so they can't disagree on the
+gate set or how a gate is run.
 """
 
 from __future__ import annotations
@@ -26,12 +29,19 @@ from parity._modelfree import (
     GateResult,
     discover_model_free_gates,
     run_gate,
+    summary_banner,
 )
 
 
 def _print_row(i: int, n: int, r: GateResult) -> None:
-    tag = "PASS" if r.ok else f"FAIL(rc{r.returncode})"
-    print(f"[{i:>3}/{n}] {tag:>10}  {r.module:<46} {r.seconds:5.1f}s | {r.summary}", flush=True)
+    if r.skipped:
+        tag = "SKIP"
+    elif r.ok:
+        tag = "PASS"
+    else:
+        tag = f"FAIL(rc{r.returncode})"
+    detail = r.skip_reason or r.suspect_reason or r.summary
+    print(f"[{i:>3}/{n}] {tag:>10}  {r.module:<46} {r.seconds:5.1f}s | {detail}", flush=True)
 
 
 def main() -> int:
@@ -43,7 +53,8 @@ def main() -> int:
     args = ap.parse_args()
 
     gates = discover_model_free_gates()
-    print(f"[sweep] {len(gates)} model-free parity gates "
+    print(f"[sweep] {summary_banner()}", flush=True)
+    print(f"[sweep] running {len(gates)} model-free gates "
           f"(jobs={args.jobs}, timeout={args.timeout}s)\n", flush=True)
 
     def _run(mod: str) -> GateResult:
@@ -64,13 +75,21 @@ def main() -> int:
                 results.append(r)
                 _print_row(i, len(gates), r)
 
-    fails = [r for r in results if not r.ok]
-    print(f"\n[sweep] {len(results) - len(fails)} pass / {len(fails)} fail of {len(results)}",
-          flush=True)
+    fails = [r for r in results if r.failed]
+    skips = [r for r in results if r.skipped]
+    passes = [r for r in results if r.ok]
+    print(f"\n[sweep] {len(passes)} pass / {len(fails)} fail / {len(skips)} skip "
+          f"of {len(results)}", flush=True)
+    if skips:
+        print("\nSKIPPED (missing offline `reference` extra — run `uv sync --extra reference` "
+              "for full coverage):", flush=True)
+        for r in skips:
+            print(f"  SKIP  {r.module}  | {r.skip_reason}", flush=True)
     if fails:
         print("\nFAILURES:", flush=True)
         for r in fails:
-            print(f"  FAIL(rc{r.returncode})  {r.module}  | {r.summary}", flush=True)
+            print(f"  FAIL(rc{r.returncode})  {r.module}  | {r.suspect_reason or r.summary}",
+                  flush=True)
     return 1 if fails else 0
 
 
