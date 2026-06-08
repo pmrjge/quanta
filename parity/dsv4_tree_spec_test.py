@@ -7,6 +7,14 @@ paths) so the main model always sees a contiguous chain. MODEL-FREE — a stub m
 + stub cache; no checkpoint, no GPU, a few KB of tensors — safe alongside another large GPU-resident
 job (rule-8: no large allocations).
 
+Scope: this gate exercises the **sequential per-path** verify (``batched=False``) — the path the
+single-stream stub main model (no ``.batch_step``) and ``test_truncate_pattern``'s per-path
+snapshot/restore rollback assertion are written against. The BATCHED tree-verify path
+(``batched=True``, the default since the ``replicate`` + ``batch_step`` fan-out landed) has its own
+dedicated model-free gate in ``parity/dsv4_batched_tree_verify_test.py``; the two are complementary,
+not redundant. Every ``spec_generate_tree`` call below pins ``batched=False`` explicitly so a future
+default flip can't silently route these single-stream stubs through ``batch_verify`` again.
+
 Asserts:
   (1) For a "perfect-leftmost" MTP (top-1 child = main-greedy at every node), the leftmost path
       always accepts ALL ``depth`` drafts → ``mean_accept == depth + 1`` and output is bit-identical
@@ -237,7 +245,7 @@ def test_perfect_leftmost_w2d2() -> None:
     prompt = [2, 5, 7]
     greedy = _greedy_reference(prompt, MAXN, eos_id=None)
     spec, st = spec_generate_tree(_StubMainModel(), _PerfectLeftmostMTP(2), embed, head, prompt,
-                                  width=2, depth=2, max_new=MAXN, eos_id=None)
+                                  width=2, depth=2, max_new=MAXN, eos_id=None, batched=False)
     assert spec == greedy, f"spec != greedy: spec={spec} greedy={greedy}"
     assert abs(st["mean_accept"] - 3.0) < 1e-9, (
         f"mean_accept expected 3 (depth+1), got {st['mean_accept']}"
@@ -254,7 +262,7 @@ def test_perfect_leftmost_w4d2() -> None:
     prompt = [2, 5, 7]
     greedy = _greedy_reference(prompt, MAXN, eos_id=None)
     spec, st = spec_generate_tree(_StubMainModel(), _PerfectLeftmostMTP(4), embed, head, prompt,
-                                  width=4, depth=2, max_new=MAXN, eos_id=None)
+                                  width=4, depth=2, max_new=MAXN, eos_id=None, batched=False)
     assert spec == greedy, f"spec != greedy: spec={spec} greedy={greedy}"
     assert abs(st["mean_accept"] - 3.0) < 1e-9, (
         f"mean_accept expected 3 (depth+1), got {st['mean_accept']}"
@@ -271,7 +279,7 @@ def test_wrong_all_w2d2() -> None:
     prompt = [2, 5, 7]
     greedy = _greedy_reference(prompt, MAXN, eos_id=None)
     spec, st = spec_generate_tree(_StubMainModel(), _WrongAllMTP(2), embed, head, prompt,
-                                  width=2, depth=2, max_new=MAXN, eos_id=None)
+                                  width=2, depth=2, max_new=MAXN, eos_id=None, batched=False)
     assert spec == greedy, f"spec != greedy: spec={spec} greedy={greedy}"
     assert abs(st["mean_accept"] - 1.0) < 1e-9, (
         f"mean_accept expected 1 (all wrong), got {st['mean_accept']}"
@@ -287,7 +295,7 @@ def test_width1_matches_spec_generate_k() -> None:
     # Use a width-1 PerfectLeftmostMTP — its top-1 IS the greedy, so chain accepts all depth drafts.
     spec_tree, st_tree = spec_generate_tree(
         _StubMainModel(), _PerfectLeftmostMTP(1), embed, head, prompt,
-        width=1, depth=2, max_new=MAXN, eos_id=None,
+        width=1, depth=2, max_new=MAXN, eos_id=None, batched=False,
     )
     spec_k, st_k = spec_generate_k(_StubMainModel(), _PerfectLeftmostMTP(1), embed, head, prompt,
                                    k=2, max_new=MAXN, eos_id=None)
@@ -308,12 +316,12 @@ def test_eos_stops() -> None:
     greedy_e = _greedy_reference(prompt, MAXN, eos_id=EOS)
     # perfect-leftmost MTP + eos
     spec_p, _ = spec_generate_tree(_StubMainModel(), _PerfectLeftmostMTP(2), embed, head, prompt,
-                                   width=2, depth=2, max_new=MAXN, eos_id=EOS)
+                                   width=2, depth=2, max_new=MAXN, eos_id=EOS, batched=False)
     assert spec_p == greedy_e, f"perfect MTP + eos: spec != greedy: {spec_p} vs {greedy_e}"
     assert spec_p and spec_p[-1] == EOS and EOS not in spec_p[:-1]
     # wrong-all MTP + eos
     spec_w, _ = spec_generate_tree(_StubMainModel(), _WrongAllMTP(2), embed, head, prompt,
-                                   width=2, depth=2, max_new=MAXN, eos_id=EOS)
+                                   width=2, depth=2, max_new=MAXN, eos_id=EOS, batched=False)
     assert spec_w == greedy_e, f"wrong MTP + eos: spec != greedy: {spec_w} vs {greedy_e}"
     print(f"[OK] eos stops (perfect + wrong): all bit-identical to greedy, "
           f"final={spec_p[-1] if spec_p else None} (=EOS)")
@@ -330,7 +338,7 @@ def test_truncate_pattern() -> None:
     base = _StubMainModel()
     cache = _StubCache()
     spec, st = spec_generate_tree(_WrapCache(base, cache), _PerfectLeftmostMTP(2), embed, head,
-                                  prompt, width=2, depth=2, max_new=MAXN, eos_id=None)
+                                  prompt, width=2, depth=2, max_new=MAXN, eos_id=None, batched=False)
     paths_per_round = st["paths_per_round"]
     rounds = st["rounds"]
     # Each round contributes exactly ``paths_per_round`` truncations (one per path verify).
