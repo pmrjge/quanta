@@ -761,12 +761,22 @@ nothing to Taylor-approximate in forming `H` — GPTQ *is* the second-order
 Run targeted first, then broad, before committing:
 
 ```bash
-uv run --with pytest pytest tests/ -q
+uv run --with pytest pytest tests/ -m "not slow" -q   # fast inner loop (env + discovery, ~instant)
+uv run --with pytest pytest tests/ -q                 # full: ALSO runs the model-free parity sweep
 uv run --with ruff ruff check src tests
 uv run python -m compileall -q src tests
 uv lock --check
 git diff --check
 ```
+
+`pytest tests/` now subprocess-runs **every model-free `parity/*_test.py` gate** (the `slow`-marked
+sweep in `tests/test_parity_modelfree.py`, ~4 min for ~98 gates) — this is what catches stub-vs-real
+interface rot (the kind that silently broke `dsv4_tree_spec_test` + `qwen35_omlx_engine_test`). Use
+`-m "not slow"` for the fast inner loop. Standalone streaming/parallel equivalent (doubles as a CI
+step): `uv run python -m parity.run_modelfree_sweep [--jobs N]`. Discovery is filesystem-only and
+auto-includes new gates; **real-weight (SOLO, 9-306 GiB) gates are excluded** (source names a
+`~/models` artifact path or `set_wired_limit`) so the sweep never loads a resident model — those
+stay SOLO, run by hand.
 
 ---
 
