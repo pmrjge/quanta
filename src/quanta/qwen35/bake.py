@@ -174,50 +174,81 @@ def _bake_mtp(writer: ArtifactWriter, ck: Qwen35SourceCheckpoint, cfg: Qwen35Con
 
 
 def _bake_long_context(out_dir: Path, cfg: Qwen35Config) -> None:
-    """Inject the quanta dynamic-YaRN 1M policy into the **already-written** artifact ``config.json``.
+    """Bake the quanta dynamic-YaRN 1M policy into the **already-written** artifact ``config.json`` so
+    the artifact is a FIRST-CLASS 1M-context model for ANY loader — the context length is accounted
+    for in the config itself, not via a separate runtime flag.
 
     ``ArtifactWriter.finalize`` copies the source ``config.json`` verbatim (+ ``quantization_config``);
-    here we add a self-describing ``quanta_long_context`` block carrying the baked policy fields read
-    off :class:`Qwen35Config` (``max_context`` / ``yarn_factor`` / ``yarn_original_max`` /
-    ``yarn_dynamic``), at the top level and mirrored into the nested ``text_config``, so the resident
-    runtime serves the 1M target by default.
+    here we add three things (to the top level AND the nested ``text_config``; this is the artifact's
+    own config, NOT a source mutation):
 
-    Crucially it does **NOT** touch ``max_position_embeddings``: :meth:`Qwen35Config.from_pretrained`
-    derives ``yarn_original_max`` (the dynamic-YaRN baseline below which no scaling is applied) FROM
-    ``max_position_embeddings``, so raising it to ``max_context`` would set ``yarn_original_max`` to
-    1M and make ``effective_yarn_factor`` return 1.0 for every sequence — silently disabling dynamic
-    YaRN. The native window stays native (262144); the 1M reach comes from ``yarn_factor`` (=4) ×
-    that native baseline (≈1.05M ≥ the 1.01M target), exactly as ``effective_yarn_factor`` computes.
-    ``config.json`` is the artifact's own config, NOT the source's — this is not a source mutation.
+    * **``max_position_embeddings`` raised to ``cfg.max_context``** (≈1.01M) — so a reader sees a 1M
+      model, not the 262144 native window.
+    * a **standard YaRN block** (``rope_type='yarn'`` / ``factor`` / ``original_max_position_embeddings``
+      = the native window) merged onto ``rope_parameters`` (Qwen3.5's key) AND mirrored as
+      ``rope_scaling`` (the HF generic key), so external runtimes apply YaRN too.
+    * a **``quanta_long_context``** block carrying the full policy incl. ``yarn_dynamic``.
+
+    The dynamic-YaRN *baseline* stays native because :meth:`Qwen35Config.from_pretrained` reads
+    ``yarn_original_max`` from ``rope.original_max_position_embeddings`` — DECOUPLED from
+    ``max_position_embeddings`` — so raising the served window to 1M does **not** disable dynamic YaRN:
+    ``effective_yarn_factor`` still returns 1.0 below the native window and ramps to ``factor`` beyond.
     """
     cfg_path = out_dir / "config.json"
     conf = json.loads(cfg_path.read_text())
+    native = cfg.yarn_original_max
     policy = {
         "max_context": cfg.max_context,
         "yarn_factor": cfg.yarn_factor,
-        "yarn_original_max": cfg.yarn_original_max,
+        "yarn_original_max": native,
         "yarn_dynamic": cfg.yarn_dynamic,
     }
-    conf["quanta_long_context"] = policy
+    yarn_block = {
+        "rope_type": "yarn",
+        "factor": float(cfg.yarn_factor),
+        "original_max_position_embeddings": native,
+    }
+
+    def _apply(d: dict) -> None:
+        d["max_position_embeddings"] = cfg.max_context          # declare the 1M served window
+        d["quanta_long_context"] = policy                       # quanta dynamic policy (self-describing)
+        d["rope_scaling"] = {**(d.get("rope_scaling") or {}), **yarn_block}  # HF-generic YaRN mirror
+        rp = d.get("rope_parameters")
+        if isinstance(rp, dict):                                # Qwen3.5's rope key — keep mRoPE, add YaRN
+            rp.update(yarn_block)
+
+    _apply(conf)
     tc = conf.get("text_config")
     if isinstance(tc, dict):
-        tc["quanta_long_context"] = policy
+        _apply(tc)
     cfg_path.write_text(json.dumps(conf, indent=2))
 
 
-def _copy_metadata_sidecars(source: Path, out_dir: Path) -> None:
+def _copy_metadata_sidecars(source: Path, out_dir: Path, cfg: Qwen35Config) -> None:
     """Copy the source tokenizer + generation metadata (:data:`_METADATA_SIDECARS`) into the artifact
-    so the baked bundle is self-contained and servable. Each file is copied only if present; missing
-    optional files are skipped. ``generation_config.json`` carries the two-eos stop set the tokenizer
-    serves, so its absence on a re-opened artifact would lose ``<|im_end|>`` — fail loud (rule-6)."""
+    so the baked bundle is self-contained and servable. Each file is copied only if present.
+
+    ``generation_config.json`` carries the authoritative chat stop set. If the source ships **none**
+    (Nex-N2-Pro), SYNTHESIZE one from the config's resolved eos ids (which ``from_pretrained`` derived
+    from the tokenizer's ChatML specials ``<|im_end|>`` + ``<|endoftext|>``) rather than refusing — so
+    the artifact ALWAYS has an explicit, correct stop set and a re-opened artifact never falls back to
+    the wrong lone eos (rule 6: never silently serve the wrong eos)."""
     for name in _METADATA_SIDECARS:
         src = source / name
         if src.exists():
             shutil.copyfile(src, out_dir / name)
-    if not (out_dir / "generation_config.json").exists():
-        raise FileNotFoundError(
-            f"{source}/generation_config.json missing — refusing to bake an artifact without the "
-            "authoritative two-eos stop set (would silently serve the wrong eos; rule-6)")
+    gen_path = out_dir / "generation_config.json"
+    if not gen_path.exists():
+        eos = cfg.eos_token_ids
+        synthesized: dict = {
+            "eos_token_id": list(eos) if len(eos) != 1 else int(eos[0]),
+            "pad_token_id": cfg.pad_token_id,
+            "_quanta_note": ("source shipped no generation_config.json; eos resolved from the "
+                             "tokenizer ChatML specials (<|im_end|>, <|endoftext|>) — rule 6"),
+        }
+        if cfg.bos_token_id is not None:
+            synthesized["bos_token_id"] = cfg.bos_token_id
+        gen_path.write_text(json.dumps(synthesized, indent=2))
 
 
 def bake_qwen35(
@@ -307,7 +338,7 @@ def bake_qwen35(
     }
     writer.finalize(policy)  # flushes shards + writes index/config/manifest
     _bake_long_context(Path(out_dir), cfg)  # bake the dynamic-YaRN 1M policy into config.json
-    _copy_metadata_sidecars(Path(source), Path(out_dir))  # tokenizer + generation_config (two-eos)
+    _copy_metadata_sidecars(Path(source), Path(out_dir), cfg)  # tokenizer + generation_config (two-eos)
 
     out = Path(out_dir)
     total_bytes = sum(p.stat().st_size for p in out.glob("model-*.safetensors"))

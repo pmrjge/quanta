@@ -15,9 +15,37 @@ That is the mistake this project exists to not repeat.
 
 ---
 
-## Active task (transient — full handover in PLAN_nemotron_ultra.md)
+## Active task (transient — full handover in PLAN_nex_n2_pro.md, prior in PLAN_nemotron_ultra.md)
 
-**In flight: Nemotron-3-Ultra-550B serving runtime.** (The second agentic-stack model is **deferred to
+**NOW IN FLIGHT: Nex-N2-Pro serving runtime + int4/int6 bake.** Handover **`PLAN_nex_n2_pro.md`**.
+Nex-N2-Pro (`nex-agi/Nex-N2-Pro`, 739 GiB/122 shards bf16 at `~/models/Nex-N2-Pro`) is the
+post-trained **Qwen3.5-397B-A17B** (`qwen3_5_moe`) — the EXACT architecture the in-tree
+**`quanta.qwen35`** module already targets (60L hybrid: 45 Gated-DeltaNet linear + 15 gated-GQA full;
+512e top-10 + shared; partial mRoPE 0.25, θ1e7; dynamic-YaRN-to-1M already coded). So this is
+validate-at-scale + bake (the Super→Ultra pattern), NOT build-from-scratch. Plan **N0→N3 + all
+optimizations** (packed-int4 `gather_qmm`, paged-KV + **prefix caching**, **MInference sparse-prefill on
+the 15 full-attn layers**, fused Gated-DeltaNet decode-step, multi-stream batched decode); user requires
+**the artifact `config.json` to declare the 1M context** (first-class, not separate). Cohort
+**int6-RTN-or-int4-RTN by measured ppl-vs-VRAM**; one model resident at a time. **N0 ✅ (this commit)** —
+groundwork (model-free / header-only, no 739 GB load). The fit-test caught two real Nex-vs-35B-contract
+divergences: **(1) EOS** — Nex ships **no `generation_config.json`** + `config.json` eos is the lone
+`<|endoftext|>` 248044 (never ends a turn); `from_pretrained` now derives the ChatML stop set
+**{248046 `<|im_end|>`, 248044 `<|endoftext|>`}** from the tokenizer (35B path byte-unchanged), and the
+bake **synthesizes** a correct `generation_config.json`. **(2) MTP** — Nex declares
+`mtp_num_hidden_layers=1` but ships **ZERO `mtp.*` weights**; `from_pretrained` refines
+`num_mtp_modules→0` by index presence (rule 6) ⇒ **native-MTP spec-decode is N/A for Nex** (bake
+`include_mtp=False`). **1M-in-config**: `_bake_long_context` now writes **standard HF YaRN**
+(`rope_type=yarn`/`factor=4`/`original_max_position_embeddings=262144`) + raises
+`max_position_embeddings` to **1,010,000** + a `quanta_long_context` block; `from_pretrained` reads
+`yarn_original_max` from `rope.original_max` (DECOUPLED from `max_position_embeddings`) so the served
+window declares 1M while the dynamic-YaRN baseline stays 262144 (`eff@8k=1.0`, `eff@1M=3.85`). New
+`quanta/qwen35/quant_policy.py` (key→scheme from the bake's own suffix partition; rule-6 coverage **1038
+text tensors = 453 dense/465 int8/120 expert_int4**, +333 vision excluded). **FIT: int4-g64 ≈ 214.1 GiB /
+int6-g64 ≈ 304.1 GiB — both ≤ 490.4** (276/186 GiB headroom). Gates: `parity/nex_n2_pro_fit_test.py`
+(real-path SOLO, headers only) + `parity/qwen35_config_eos_yarn_test.py` (model-free, 21 checks).
+**N1 next** = layer parity @ 397B vs a transformers `Qwen3_5Moe` reference (SOLO, layer-streamed).
+
+**Prior (paused): Nemotron-3-Ultra-550B serving runtime.** (The second agentic-stack model is **deferred to
 MiniMax-M3 when it ships** — **Mellum2 was dropped, its context length is too short**; the `minimax`
 module is already substantially ported in-tree.) Handover **`PLAN_nemotron_ultra.md`**. Quantize
 Nemotron-Ultra (hybrid Mamba2+attn+MoE, `nemotron_h` — already supported; the 120B-Super sibling is

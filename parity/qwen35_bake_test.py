@@ -222,24 +222,30 @@ def _roundtrip_and_yarn() -> tuple[bool, dict]:
         except ValueError:
             dense_refuse = True
 
-        # the baked dynamic-YaRN 1M policy fields are present in config.json
+        # the baked dynamic-YaRN 1M policy in config.json. NEW contract (N0): the artifact config must
+        # DECLARE the 1M served window as a first-class field — max_position_embeddings is RAISED to
+        # max_context + a standard YaRN block is written — while the dynamic-YaRN BASELINE
+        # (yarn_original_max) stays native, read DECOUPLED from rope.original_max_position_embeddings,
+        # so short sequences still pay no tax and dynamic YaRN survives the raised window.
         conf = json.loads((Path(d) / "config.json").read_text())
         qlc = conf.get("quanta_long_context", {})
-        # native max_position_embeddings must be PRESERVED (not raised to max_context) so the reloaded
-        # cfg derives yarn_original_max from the native window — else dynamic YaRN never activates.
-        # (the real config — like this tiny one — nests it under text_config; assert it stays native
-        # both there and at the top level, i.e. neither was bumped to max_context.)
         tc = conf.get("text_config", conf)
-        native_preserved = (tc.get("max_position_embeddings") == 4096
-                            and conf.get("max_position_embeddings") != 1_010_000)
+        native = 4096
+        served_raised = (tc.get("max_position_embeddings") == 1_010_000
+                         and conf.get("max_position_embeddings") == 1_010_000)
+        rope = tc.get("rope_parameters", {})
+        yarn_block_ok = (rope.get("rope_type") == "yarn" and rope.get("factor") == 4.0
+                         and rope.get("original_max_position_embeddings") == native
+                         and tc.get("rope_scaling", {}).get("rope_type") == "yarn")
         yarn_ok = (qlc.get("max_context") == 1_010_000 and qlc.get("yarn_factor") == 4.0
-                   and qlc.get("yarn_dynamic") is True and "yarn_original_max" in qlc
-                   and native_preserved)
-        # regression guard: the reloaded artifact cfg actually scales for a > native sequence and
-        # reaches the 1M target (yarn_factor x native baseline) — the bug that #115 must not ship.
-        dyn_ok = (cfg.effective_yarn_factor(cfg.max_position_embeddings) == 1.0
-                  and cfg.effective_yarn_factor(cfg.max_position_embeddings * 4) > 1.0
-                  and cfg.max_position_embeddings * cfg.yarn_factor >= 1_000_000 / 256)
+                   and qlc.get("yarn_dynamic") is True and qlc.get("yarn_original_max") == native
+                   and served_raised and yarn_block_ok)
+        # regression guard: the reloaded artifact cfg keeps the BASELINE native (short ctx pays no tax)
+        # yet scales beyond it and reaches the 1M target — dynamic YaRN survives the raised window.
+        dyn_ok = (cfg.yarn_original_max == native and cfg.max_position_embeddings == 1_010_000
+                  and cfg.effective_yarn_factor(native) == 1.0
+                  and cfg.effective_yarn_factor(native * 4) > 1.0
+                  and cfg.yarn_original_max * cfg.yarn_factor >= 1_000_000 / 256)
 
         ok = shapes_ok and raw_ok and dense_refuse and yarn_ok and dyn_ok
         return ok, {"shapes": shapes_ok, "raw_codes": raw_ok, "dense_refuse": dense_refuse,

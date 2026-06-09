@@ -55,6 +55,39 @@ import json
 from dataclasses import dataclass, field
 from pathlib import Path
 
+# Canonical Qwen3.5 ChatML stop set — the turn-ender <|im_end|> + the doc separator <|endoftext|>.
+# Used as a documented fallback ONLY when a source ships no generation_config.json AND no parseable
+# tokenizer.json (so the real ids can't be resolved); the resolver below prefers the actual ids.
+_CHATML_EOS_FALLBACK: tuple[int, ...] = (248046, 248044)
+
+
+def _resolve_chat_eos_ids(model_dir: Path, tok: dict) -> tuple[int, ...]:
+    """The ChatML stop set {<|im_end|>, <|endoftext|>} resolved by STRING→id from ``tokenizer.json``'s
+    ``added_tokens``, for sources that ship **no** ``generation_config.json`` (e.g. Nex-N2-Pro).
+
+    Such a checkpoint's ``config.json`` often carries a lone numeric ``eos_token_id`` that is
+    ``<|endoftext|>`` (a document separator), NOT the chat turn-ender ``<|im_end|>`` the model
+    actually emits — serving that alone would never end a turn (rule 6). We map the tokenizer's
+    ``eos_token`` string (plus the two canonical ChatML specials) to ids via the tokenizer's own
+    ``added_tokens`` table, so the stop set is the model's real ids, not a guess. Returns ``()`` when
+    ``tokenizer.json`` is absent/unparseable (the caller decides whether that is fatal)."""
+    tj = model_dir / "tokenizer.json"
+    if not tj.exists():
+        return ()
+    try:
+        added = json.loads(tj.read_text()).get("added_tokens", [])
+    except (OSError, json.JSONDecodeError):
+        return ()
+    by_content = {t["content"]: int(t["id"]) for t in added if "content" in t and "id" in t}
+    eos_str = tok.get("eos_token")
+    if isinstance(eos_str, dict):
+        eos_str = eos_str.get("content")
+    ids: list[int] = []
+    for s in (eos_str, "<|im_end|>", "<|endoftext|>"):
+        if s in by_content and by_content[s] not in ids:
+            ids.append(by_content[s])
+    return tuple(ids)
+
 
 @dataclass(frozen=True)
 class Qwen35Config:
@@ -254,7 +287,30 @@ class Qwen35Config:
         eos = gen.get("eos_token_id", tc.get("eos_token_id"))
         eos_ids = tuple(int(x) for x in (eos if isinstance(eos, list) else [eos] if eos is not None
                                          else []))
+        # No generation_config.json (Nex-N2-Pro ships none): config.json's lone eos_token_id can be
+        # <|endoftext|> (a doc separator), NOT the chat turn-ender <|im_end|> the model emits —
+        # serving that alone would never stop a turn (rule 6). Resolve the real ChatML stop set from
+        # the tokenizer; fall back to the canonical ids only if even that is unresolvable. When a
+        # generation_config IS present (the Qwen3.6-35B keeper), this branch never fires → unchanged.
+        if not gen:
+            eos_ids = _resolve_chat_eos_ids(d, tok) or _CHATML_EOS_FALLBACK
+
         native_max = int(tc.get("max_position_embeddings", 262_144))
+        # Long-context (dynamic-YaRN) policy — read back from the artifact config when present so a
+        # baked 1M artifact is SELF-DESCRIBING: the bake writes a standard rope YaRN block
+        # (rope_type/factor/original_max_position_embeddings) + a quanta_long_context block AND raises
+        # max_position_embeddings to the 1M target. The YaRN *baseline* (yarn_original_max, below which
+        # no scaling applies) is read from rope.original_max_position_embeddings — DECOUPLED from
+        # max_position_embeddings — so raising the served window to 1M does NOT disable dynamic YaRN.
+        # For the raw bf16 source (no YaRN fields) every field falls to the native window + the 1M
+        # dataclass default, preserving the pre-bake behavior exactly.
+        qlc = (tc.get("quanta_long_context") or cfg.get("quanta_long_context") or {})
+        yarn_orig = int(rope.get("original_max_position_embeddings",
+                                 qlc.get("yarn_original_max", native_max)))
+        yarn_factor = float(rope.get("factor", qlc.get("yarn_factor", 4.0)))
+        yarn_dynamic = bool(qlc.get("yarn_dynamic", True))
+        max_context = int(qlc.get("max_context",
+                                  native_max if native_max > yarn_orig else 1_010_000))
         # pad_token_id is present-but-null in Qwen3.6's config.json text_config; ``.get(k, default)``
         # returns None (not the default) for an explicit null, so coalesce gen → text_config → default.
         # Guards a re-opened artifact that lacks generation_config.json from crashing on int(None).
@@ -262,6 +318,22 @@ class Qwen35Config:
         if pad_raw is None:
             pad_raw = tc.get("pad_token_id")
         pad_token_id = int(pad_raw) if pad_raw is not None else 248044
+
+        # MTP: a checkpoint may DECLARE a native MTP head in config yet ship no MTP weights (Nex-N2-Pro
+        # dropped it in post-training; the base Qwen3.5/3.6 keeps it). Trust the weights, not the
+        # config — if the index is present and carries no ``mtp.*`` key, the head is absent → 0, so the
+        # runtime/bake never reach for weights that do not exist (rule 6). No index (synthetic config)
+        # ⇒ trust the config value unchanged.
+        num_mtp = int(tc.get("mtp_num_hidden_layers", 0))
+        if num_mtp > 0:
+            idx = d / "model.safetensors.index.json"
+            if idx.exists():
+                try:
+                    wmap = json.loads(idx.read_text()).get("weight_map", {})
+                    if not any(k.startswith("mtp.") for k in wmap):
+                        num_mtp = 0
+                except (OSError, json.JSONDecodeError):
+                    pass
 
         return cls(
             vocab_size=int(tc["vocab_size"]),
@@ -291,19 +363,22 @@ class Qwen35Config:
             scoring_func=str(tc.get("scoring_func", "softmax")),
             norm_topk_prob=bool(tc.get("norm_topk_prob", True)),
             router_aux_loss_coef=float(tc.get("router_aux_loss_coef", 0.0)),
-            num_mtp_modules=int(tc.get("mtp_num_hidden_layers", 0)),
+            num_mtp_modules=num_mtp,
             mtp_use_dedicated_embeddings=bool(tc.get("mtp_use_dedicated_embeddings", False)),
             hidden_act=str(tc.get("hidden_act", "silu")),
             norm_eps=float(tc.get("rms_norm_eps", 1e-6)),
             max_position_embeddings=native_max,
             eos_token_id=int(eos_ids[0]) if eos_ids else 248046,
-            eos_token_ids=eos_ids or (248046, 248044),
+            eos_token_ids=eos_ids or _CHATML_EOS_FALLBACK,
             pad_token_id=pad_token_id,
             tie_word_embeddings=bool(cfg.get("tie_word_embeddings", tc.get("tie_word_embeddings",
                                                                           False))),
             bos_token_id=(int(gen["bos_token_id"]) if gen.get("bos_token_id") is not None else None),
             add_bos_token=bool(tok.get("add_bos_token", False)),
-            yarn_original_max=native_max,  # scale relative to the native window
+            max_context=max_context,          # baked served window (1.01M for the YaRN artifact)
+            yarn_factor=yarn_factor,          # YaRN scale read back from the artifact (else default 4)
+            yarn_original_max=yarn_orig,      # the dynamic-YaRN baseline (native window, decoupled)
+            yarn_dynamic=yarn_dynamic,
             quantization_config=dict(cfg.get("quantization_config") or {}),
             vision_config=dict(cfg.get("vision_config") or {}),
         )
