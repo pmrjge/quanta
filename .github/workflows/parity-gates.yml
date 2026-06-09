@@ -1,0 +1,39 @@
+name: parity-gates
+
+# Enforcement for the model-free parity gates (the runner that catches stub-vs-real interface rot).
+# Runs the full suite — the instant fail-open guards (partition manifest / naming / misnamed-gate
+# scanner) AND the slow model-free sweep (one isolated subprocess per gate). Real-weight (SOLO,
+# 9-306 GiB) gates are excluded by construction, so CI never tries to load a resident model (it
+# couldn't anyway — no artifacts on a runner).
+#
+# Apple silicon (macos-14, arm64): MLX requires arm64; the gates import mlx. The `reference` extra is
+# installed so the ~11 gates that import `safetensors` actually RUN here (not SKIP) — a green CI
+# means real coverage, not a base-deps env quietly skipping them.
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: parity-gates-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  model-free-gates:
+    runs-on: macos-14
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+      - name: Sync (with offline `reference` extra so safetensors gates run, not skip)
+        run: uv sync --extra reference
+      - name: Lint
+        run: uv run --with ruff ruff check src tests
+      - name: Partition manifest is in sync (fail-open backstop)
+        run: uv run python -m parity.run_modelfree_sweep --update-manifest && git diff --exit-code parity/gate_manifest.json
+      - name: Full parity suite (fast guards + model-free sweep)
+        run: uv run --with pytest pytest tests/ -q
+      - name: Standalone sweep, strict (no gate may silently SKIP in CI)
+        run: uv run python -m parity.run_modelfree_sweep --jobs 4 --strict-skips

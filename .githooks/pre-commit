@@ -1,0 +1,19 @@
+#!/bin/sh
+# quanta pre-commit: the FAST parity fail-open guards on every commit (~seconds, no model load).
+#
+# Runs the model-free runner's structural guards (identity-pinned partition manifest, the
+# `*_real_test.py` naming guard, the misnamed-gate scanner, the allowlist-staleness guard, and the
+# classifier unit tests). These catch the dangerous drift — a real-weight gate slipping into the
+# swept bucket, a gate hidden behind a non-`_test.py` name — at commit time, before it can hide.
+#
+# The full model-free sweep (interface rot, ~4 min) is the `slow` lane: it runs in CI and in a plain
+# `pytest tests/`. We deliberately keep this hook to `-m "not slow"` so commits stay fast.
+#
+# Activate once per clone:   git config core.hooksPath .githooks
+# Bypass in a genuine emergency (discouraged):   git commit --no-verify
+set -e
+root="$(git rev-parse --show-toplevel)"
+cd "$root"
+echo "[pre-commit] quanta parity fail-open guards (fast lane)…"
+uv run --with pytest pytest tests/ -m "not slow" -q
+echo "[pre-commit] OK"

@@ -772,22 +772,32 @@ git diff --check
 `pytest tests/` now subprocess-runs **every model-free `parity/*_test.py` gate** (the `slow`-marked
 sweep in `tests/test_parity_modelfree.py`, ~4 min for ~98 gates) — this is what catches stub-vs-real
 interface rot (the kind that silently broke `dsv4_tree_spec_test` + `qwen35_omlx_engine_test`). Use
-`-m "not slow"` for the fast inner loop (it still runs the instant **fail-open guards**: a pinned
-partition manifest, the `*_real_test.py` naming guard, and a misnamed-gate scanner). Standalone
-streaming/parallel equivalent (doubles as a CI step): `uv run python -m parity.run_modelfree_sweep
-[--jobs N]`. Discovery is filesystem-only and auto-includes new gates; **real-weight (SOLO, 9-306
-GiB) gates are excluded** by a multi-signal detector (`*_real_test.py` name, a `~/models`/
-`set_wired_limit`/`expanduser` source marker, or an explicit `# parity-gate: real-weight` sentinel)
-so the sweep never loads a resident model — those stay SOLO, run by hand. Hardening (all gated in
-`tests/test_parity_modelfree.py`): the detector **fails toward exclusion** and is backstopped by the
-**count manifest** (`EXPECTED_{TOTAL,MODEL_FREE,REAL_WEIGHT}` in `parity/_modelfree.py`) — adding
-any gate trips it, forcing conscious classification, so a real-weight gate that *evades* the markers
-overshoots the model-free bucket and fails LOUD instead of silently loading 306 GiB; `run_gate`
-rejects a **vacuous pass** (rc-0 with a printed Traceback or `PARITY-CHECKS: 0`); and a gate that
-needs the offline `reference` extra (≈11 import `safetensors`) is **skipped, not failed**, on a
-base-deps-only env (`uv sync --extra reference` for full local coverage). A green sweep proves
+`-m "not slow"` for the fast inner loop (it still runs the instant **fail-open guards**). Standalone
+streaming/parallel equivalent: `uv run python -m parity.run_modelfree_sweep [--jobs N]
+[--strict-skips]`. Discovery is filesystem-only and auto-includes new gates; **real-weight (SOLO,
+9-306 GiB) gates are excluded** by a multi-signal, fail-toward-exclusion detector (`*_real_test.py`
+name; a `/Users/pmrj/models` or `set_wired_limit` marker; a `~/models` *load idiom* — `Path.home(`/
+`expanduser`/`os.environ`/`getenv` **with** `models`, NOT the bare `~/models` literal, which appears
+in commented-out code in model-free gates; or an explicit `# parity-gate: real-weight` sentinel) so
+the sweep never loads a resident model.
+
+**Enforcement (this is automated now, not by-hand):** a committed **pre-commit hook**
+(`.githooks/pre-commit`, activate once with `git config core.hooksPath .githooks`) runs the fast
+fail-open guards on every commit; the **CI workflow** (`.github/workflows/parity-gates.yml`,
+Apple-silicon `macos-14`, `uv sync --extra reference`) runs the full suite + `--strict-skips` on
+push/PR. Hardening (all gated in `tests/test_parity_modelfree.py`): the fail-open backstop is an
+**identity-pinned manifest** (`parity/gate_manifest.json` — the exact NAME SET of each bucket, so an
+offsetting add+remove that a count would miss is caught, and a real-weight gate that *evades*
+detection shows up as a new name in `model_free` and fails LOUD); `run_gate` rejects a **vacuous
+pass** (rc-0 with a printed Traceback, unless the gate prints the opt-in `PARITY-CHECKS: <n>` n>0
+proof-of-work — also the escape hatch for a gate that legitimately renders a Traceback;
+`PARITY-CHECKS: 0` always fails); a **misnamed-gate scanner** flags model-free gates (incl.
+pytest-style) hidden behind a non-`_test.py` name; an **allowlist-staleness** guard; and a gate
+needing an **optional extra** (the skip-eligible set is read from `pyproject.toml`, never hardcoded;
+≈11 import `safetensors`) is **skipped, not failed**, on a base-deps-only env. A green sweep proves
 **interface + logic on stubs, not real-model numeric parity** (that is the excluded SOLO gates).
-**When you add a `parity/*_test.py` gate, bump the matching `EXPECTED_*` count.**
+**When you add/remove/reclassify a `parity/*_test.py` gate, regenerate the manifest:** `uv run
+python -m parity.run_modelfree_sweep --update-manifest` and review the diff.
 
 ---
 

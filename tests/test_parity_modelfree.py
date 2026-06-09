@@ -8,13 +8,15 @@ stand in for) across many commits, invisible because nothing exercised the gates
 Two tiers:
 
 * **Fast (default lane).** Pure-function guards over the classifier and the partition — they run in
-  ``pytest tests/ -m "not slow"`` in milliseconds: the count manifest (catches a real-weight gate
-  that evades detection — it would overshoot the model-free bucket), the ``*_real_test.py`` naming
-  guard, the misnamed-gate scanner (a model-free gate hidden behind a non-``_test.py`` name), and
-  unit tests that NEGATIVE-test the skip / vacuous-pass / real-weight logic without a resident env.
+  ``pytest tests/ -m "not slow"`` in milliseconds: the identity-pinned partition manifest (catches a
+  real-weight gate that evades detection — it shows up as a new name in the model-free bucket, and
+  an offsetting add+remove that counts alone would miss), the ``*_real_test.py`` naming guard, the
+  misnamed-gate scanner (a model-free gate hidden behind a non-``_test.py`` name, incl. pytest
+  style), the allowlist-staleness guard, and unit tests that NEGATIVE-test the skip / vacuous-pass /
+  real-weight logic without a resident env.
 * **Slow (``slow`` marker, runs by default).** One isolated subprocess per model-free gate; a
-  nonzero exit (or a vacuous-pass / swallowed-exception signal) fails the case with the gate's own
-  banner. Skip the inner loop with ``pytest tests/ -m "not slow"``.
+  nonzero exit (or a vacuous-pass / swallowed-exception signal) fails the case. Skip the inner loop
+  with ``pytest tests/ -m "not slow"``.
 
 Real-weight (SOLO, 9-306 GiB) gates are excluded by construction — this never loads a resident
 model. The standalone, streaming/parallel equivalent is ``parity.run_modelfree_sweep``.
@@ -25,51 +27,49 @@ from __future__ import annotations
 import pytest
 
 from parity._modelfree import (
-    EXPECTED_MODEL_FREE,
-    EXPECTED_REAL_WEIGHT,
-    EXPECTED_TOTAL,
     GateResult,
+    _looks_like_gate,
     _missing_optional_dep,
     _suspect_reason,
-    classify_all,
     discover_model_free_gates,
     is_real_weight,
+    load_manifest,
+    manifest_diff,
+    optional_deps,
     run_gate,
     scan_misnamed_gates,
+    stale_allowlist_entries,
 )
 
 _GATES = discover_model_free_gates()
+_OPTIONAL = optional_deps()
 
 
 # --- Fast guards: the runner's safety can't silently drift ------------------------------------ #
 
 
 def test_partition_manifest() -> None:
-    """Every ``*_test.py`` gate is consciously classified. A drift here means a gate was added or
-    removed: confirm its bucket and bump the ``EXPECTED_*`` constants. The dangerous case this
-    catches: a real-weight gate that evades detection lands in the model-free bucket, so
-    ``model_free`` overshoots its pin — the silent fail-open becomes a loud, must-look failure."""
-    model_free, real_weight = classify_all()
-    total = len(model_free) + len(real_weight)
-    assert total == EXPECTED_TOTAL, (
-        f"{total} `*_test.py` gates (expected {EXPECTED_TOTAL}) — a gate was added/removed; "
-        f"confirm its bucket and update EXPECTED_TOTAL in parity/_modelfree.py."
+    """The live partition must equal the pinned name set in parity/gate_manifest.json. Identity, not
+    counts: this catches a gate added/removed/reclassified AND an offsetting add+remove that keeps
+    the count constant. The dangerous case: a real-weight gate that evades detection appears in
+    'added' (and joins model_free) — a loud, named failure instead of a 306 GiB load in CI."""
+    diff = manifest_diff()
+    assert not any(diff.values()), (
+        f"gate partition drifted from the pinned manifest: {diff}. Regenerate with "
+        f"`uv run python -m parity.run_modelfree_sweep --update-manifest` and REVIEW the diff — a "
+        f"gate in 'added' that joins model_free will be SWEPT, so it must not load real weights."
     )
-    assert len(real_weight) == EXPECTED_REAL_WEIGHT, (
-        f"{len(real_weight)} real-weight gates (expected {EXPECTED_REAL_WEIGHT}); update "
-        f"EXPECTED_REAL_WEIGHT if you intentionally added/removed a SOLO gate."
-    )
-    assert len(model_free) == EXPECTED_MODEL_FREE, (
-        f"{len(model_free)} model-free gates (expected {EXPECTED_MODEL_FREE}). If you did NOT add a "
-        f"model-free gate, a real-weight gate may have EVADED detection and landed here — check the "
-        f"newest gate and mark it `# parity-gate: real-weight` or rename it `*_real_test.py`. "
-        f"Otherwise bump EXPECTED_MODEL_FREE."
-    )
+
+
+def test_manifest_well_formed() -> None:
+    pin = load_manifest()
+    assert pin["model_free"] and pin["real_weight"], "manifest buckets must be non-empty"
+    assert not (set(pin["model_free"]) & set(pin["real_weight"])), "a gate is in both buckets"
 
 
 def test_no_swept_real_test_named() -> None:
-    """The smoking-gun guard: no SWEPT (model-free) gate may be named ``*_real_test.py`` — that name
-    is the canonical real-weight signal, so such a gate would be a fail-open instance."""
+    """Smoking-gun guard: no SWEPT (model-free) gate may be named ``*_real_test.py`` — that name is
+    the canonical real-weight signal, so such a gate would be a fail-open instance."""
     offenders = [m for m in _GATES if m.endswith("_real_test")]
     assert not offenders, (
         f"gates named like real-weight but classified model-free (swept): {offenders} — they would "
@@ -78,13 +78,20 @@ def test_no_swept_real_test_named() -> None:
 
 
 def test_no_misnamed_gates() -> None:
-    """No model-free assertion gate may hide behind a non-``*_test.py`` name (it would never be
-    swept). New offenders must be renamed ``*_test.py`` or added to ``_KNOWN_NON_GATES``."""
+    """No model-free assertion gate may hide behind a non-``*_test.py`` name (incl. pytest-style):
+    it would never be swept. New offenders must be renamed ``*_test.py`` or documented."""
     flagged = scan_misnamed_gates()
     assert not flagged, (
         f"non-`*_test.py` files that look like uncovered model-free gates: {flagged} — rename them "
         f"`*_test.py` to sweep them, or document them in _KNOWN_NON_GATES (parity/_modelfree.py)."
     )
+
+
+def test_allowlist_not_stale() -> None:
+    """Every _KNOWN_NON_GATES entry must still exist — a removed/renamed file should not leave a
+    silent suppression behind."""
+    stale = stale_allowlist_entries()
+    assert not stale, f"_KNOWN_NON_GATES entries whose file is gone (remove them): {stale}"
 
 
 # --- Fast unit tests: NEGATIVE-test the new classifier / skip / vacuous-pass logic ------------ #
@@ -94,27 +101,44 @@ def test_is_real_weight_signals() -> None:
     assert is_real_weight("x = '/Users/pmrj/models/Foo'")              # literal path marker
     assert is_real_weight("mx.set_wired_limit(490)")                   # wired-limit marker
     assert is_real_weight("", name="foo_real_test.py")                 # name convention
-    assert is_real_weight("p = expanduser('~/models/Bar')")           # ~/models fail-open shape
+    assert is_real_weight("p = Path.home() / 'models' / art")         # home-relative LOAD idiom
+    assert is_real_weight("p = expanduser('~/models/Bar')")           # expanduser load idiom
+    assert is_real_weight("d = os.environ['X']; load(d, 'models')")   # env-relative load idiom
     assert is_real_weight("# parity-gate: real-weight\nx=1")          # explicit opt-out
     assert not is_real_weight("x = mx.zeros((4, 4))")                  # plain model-free
-    assert not is_real_weight("# parity-gate: model-free\nset_wired_limit  # in a comment")
-    # Real-weight precedence beats the model-free override.
-    assert is_real_weight("# parity-gate: real-weight\n# parity-gate: model-free")
+    # The qwen35_forward_test shape: a bare `~/models` literal in COMMENTED-OUT code is NOT a load.
+    assert not is_real_weight("# cfg = Cfg.from_pretrained('~/models/Foo')  # deferred\nx = 1")
+
+
+def test_optional_deps_from_pyproject() -> None:
+    """The skip-eligible set is read from pyproject's extras (never drifts), unioned with baseline."""
+    assert {"safetensors", "transformers", "sentencepiece"} <= _OPTIONAL   # baseline reference extra
+    assert "omlx" in _OPTIONAL                                             # the omlx extra, derived
 
 
 def test_missing_optional_dep() -> None:
-    assert _missing_optional_dep("ModuleNotFoundError: No module named 'safetensors'") == "safetensors"
-    assert _missing_optional_dep("No module named 'transformers.models'") == "transformers"
-    assert _missing_optional_dep("No module named 'numpy'") is None      # base dep ⇒ a real failure
-    assert _missing_optional_dep("all good") is None
+    assert _missing_optional_dep("No module named 'safetensors'", _OPTIONAL) == "safetensors"
+    assert _missing_optional_dep("No module named 'omlx.cli'", _OPTIONAL) == "omlx"
+    assert _missing_optional_dep("No module named 'numpy'", _OPTIONAL) is None   # base dep ⇒ a fail
+    assert _missing_optional_dep("all good", _OPTIONAL) is None
 
 
 def test_suspect_reason() -> None:
     assert _suspect_reason(0, "ok\nTraceback (most recent call last):\n...")   # swallowed exception
     assert _suspect_reason(0, "ran\nPARITY-CHECKS: 0\n")                       # no assertions ran
-    assert not _suspect_reason(0, "PASS\nPARITY-CHECKS: 7\n")                  # clean pass
+    assert not _suspect_reason(0, "PASS\nPARITY-CHECKS: 7\n")                  # proof-of-work passes
+    # PARITY-CHECKS>0 is the escape hatch: a gate that legitimately renders a Traceback is trusted.
+    assert not _suspect_reason(0, "PARITY-CHECKS: 3\nTraceback (most recent call last):\n...")
     assert not _suspect_reason(0, "all good")                                  # clean, no markers
     assert not _suspect_reason(1, "Traceback (most recent call last):")       # rc!=0 already a fail
+
+
+def test_looks_like_gate() -> None:
+    assert _looks_like_gate("if __name__=='__main__':\n    assert 1 == 1")     # classic
+    assert _looks_like_gate("def test_foo():\n    assert x")                   # pytest style, no main
+    assert _looks_like_gate("def test_y():\n    np.testing.assert_allclose(a, b)")
+    assert not _looks_like_gate("x = 1\nprint('hi')")                          # no assertions
+    assert not _looks_like_gate("def helper():\n    return 1")                 # not a test/runnable
 
 
 def test_gate_result_semantics() -> None:
@@ -135,8 +159,8 @@ def test_gate_result_semantics() -> None:
 @pytest.mark.parametrize("module", _GATES, ids=lambda m: m.removeprefix("parity."))
 def test_parity_gate(module: str) -> None:
     """Run one model-free gate in isolation; assert it passed (exit 0, no vacuous-pass signal).
-    A missing ``reference``-extra dep is a SKIP, not a failure (clean base-deps-only env)."""
-    result = run_gate(module)
+    A missing optional-extra dep is a SKIP, not a failure (clean base-deps-only env)."""
+    result = run_gate(module, optional=_OPTIONAL)
     if result.skipped:
         pytest.skip(f"{module}: {result.skip_reason}")
     assert result.ok, (
