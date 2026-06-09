@@ -6,10 +6,13 @@ and ``spec_generate_k`` so this passes before those sibling agents merge). Mirro
 ``parity/dsv4_omlx_engine_test.py`` + ``parity/nemotron_omlx_engine_test.py``. Asserts:
 
   (a) **Parsers contract conformance** — :class:`quanta.shim.tool_parsers.Qwen3ReasoningParser`,
-      :class:`Qwen3ToolParser`, and :class:`KimiToolParser` explicitly implement the
-      :class:`ReasoningParser` / :class:`ToolParser` ``@runtime_checkable`` Protocols (``isinstance``
-      holds at the surface). Round-trip tested: a Qwen tool-call text -> ``parse_tool_calls`` ->
-      ``format_tool_response`` preserves the id.
+      :class:`Qwen3ToolParser`, :class:`Qwen3CoderToolParser`, and :class:`KimiToolParser` explicitly
+      implement the :class:`ReasoningParser` / :class:`ToolParser` ``@runtime_checkable`` Protocols
+      (``isinstance`` holds at the surface). Round-trip tested: a Qwen tool-call text ->
+      ``parse_tool_calls`` -> ``format_tool_response`` preserves the id. The agentic-Qwen3.5
+      (Nex-N2-Pro) nested-XML ``Qwen3CoderToolParser`` is also checked to stay OUT of the global
+      dispatcher (so Nemotron's byte-identical markup keeps delegating to oMLX — full coverage in
+      ``parity/qwen3_coder_tool_parser_test``).
 
   (b) **Batched engine equivalence** — with a STUB batched runtime that returns deterministic
       per-stream logits, driving the engine with ``B=4`` identical prompts emits the same per-stream
@@ -48,10 +51,12 @@ from quanta.shim.omlx import (
 )
 from quanta.shim.tool_parsers import (
     KimiToolParser,
+    Qwen3CoderToolParser,
     Qwen3ReasoningParser,
     Qwen3ToolParser,
     ReasoningParser,
     ToolParser,
+    parse_quanta_tool_calls,
 )
 
 EOS = 11
@@ -183,6 +188,23 @@ def _check_parsers_contract() -> bool:
     ok = ok and good
     print(f"  [{'OK' if good else 'FAIL'}] ToolParser.format_tool_response: "
           f"qwen_shape={qg_resp} kimi_shape={kg_resp} empty_id_raises={loud}")
+
+    # Qwen3CoderToolParser — the agentic Qwen3.5 (Nex-N2-Pro) nested-XML form (full coverage lives in
+    # parity/qwen3_coder_tool_parser_test). Here: Protocol conformance + extract + the dispatcher
+    # EXCLUSION that preserves Nemotron's delegation (the shared <function=> XML must stay oMLX-routed).
+    qctp = Qwen3CoderToolParser()
+    coder_text = ("<tool_call>\n<function=get_weather>\n<parameter=location>\nTokyo\n</parameter>\n"
+                  "<parameter=days>\n3\n</parameter>\n</function>\n</tool_call>")
+    cc = qctp.parse_tool_calls(coder_text)
+    cc_is = isinstance(qctp, ToolParser)
+    cc_extract = (len(cc) == 1 and cc[0]["name"] == "get_weather"
+                  and json.loads(cc[0]["arguments"]) == {"location": "Tokyo", "days": 3})
+    cc_empty = qctp.parse_tool_calls("plain prose") == []
+    cc_excluded = parse_quanta_tool_calls(coder_text) is None  # NOT in the dispatcher (Nemotron delegates)
+    good = cc_is and cc_extract and cc_empty and cc_excluded
+    ok = ok and good
+    print(f"  [{'OK' if good else 'FAIL'}] Qwen3CoderToolParser: conform={cc_is} extract={cc_extract} "
+          f"empty={cc_empty} dispatcher_excluded={cc_excluded}")
 
     return ok
 

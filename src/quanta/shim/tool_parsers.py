@@ -13,6 +13,13 @@ leaves intact. oMLX's ``parse_tool_calls`` registry natively handles xml/json/ge
   **Qwen3.5** (``<tool_call>{json}</tool_call>``) *are* oMLX-native, but we ship strict parsers for
   them too so serving never silently depends on oMLX's exact registry regexes matching these
   checkpoints (rule 6).
+* **Qwen3-Coder / Nex-N2-Pro** (agentic Qwen3.5) render the *nested-XML* tool form
+  ``<tool_call><function=NAME><parameter=KEY>value</parameter>…</function></tool_call>`` — which is
+  **byte-identical to Nemotron-3's** markup (``parity/nemotron_omlx_contract_test``). We ship the
+  strict :class:`Qwen3CoderToolParser` for it (rule 6), but it is the ONE quanta parser intentionally
+  kept OUT of :func:`parse_quanta_tool_calls`: registering it would re-route Nemotron's delegated
+  markup quanta-side (the two formats are indistinguishable by text). Serving extracts this shared
+  format via oMLX's stock ``_parse_xml_tool_calls``; the class is the per-model quanta-owned option.
 
 :func:`parse_quanta_tool_calls` tries each parser in order and returns the first match, else ``None``
 (so the oMLX patch delegates unmatched text — e.g. Nemotron's ``<function=…>`` XML — to the original
@@ -192,6 +199,49 @@ def parse_qwen_tool_calls(text: str) -> ParseResult | None:
     return cleaned.strip(), calls
 
 
+# --- Qwen3-Coder / Nex-N2-Pro: <tool_call><function=NAME><parameter=KEY>value</parameter>…</function></tool_call> ---
+#
+# The XML "pythonic" tool-call form the agentic Qwen3.5 checkpoints render (Nex-N2-Pro's
+# chat_template.jinja: ``<tool_call>\n<function=NAME>\n<parameter=KEY>\nvalue\n</parameter>\n…\n
+# </function>\n</tool_call>``; values may span multiple lines). This is the SAME markup Nemotron-3
+# emits (see ``parity/nemotron_omlx_contract_test`` — byte-identical), which serving extracts via
+# oMLX's stock ``_parse_xml_tool_calls``. Because the two formats are indistinguishable by text, this
+# parser is deliberately NOT registered in the legacy ``_PARSERS`` dispatcher below: doing so would
+# re-route Nemotron's *delegated* markup quanta-side and break the delegation contract
+# (``parse_quanta_tool_calls(NEMOTRON) is None``, gated in ``parity/tool_parsers_test``). It is exposed
+# only as the strict :class:`Qwen3CoderToolParser` contract class — the rule-6 quanta-owned parser a
+# per-model integration can use directly instead of depending on oMLX's registry regex.
+_QWEN3CODER_CALL_RE = re.compile(
+    r"<tool_call>\s*<function=(?P<name>[^>\n]+)>(?P<body>.*?)</function>\s*</tool_call>", re.DOTALL)
+_QWEN3CODER_PARAM_RE = re.compile(r"<parameter=(?P<key>[^>\n]+)>(?P<val>.*?)</parameter>", re.DOTALL)
+
+
+def parse_qwen3_coder_tool_calls(text: str) -> ParseResult | None:
+    """Parse Qwen3-Coder / Nex-N2-Pro nested-XML tool calls — ``<tool_call><function=NAME>
+    <parameter=KEY>value</parameter>…</function></tool_call>``. Values may span multiple lines and are
+    type-recovered (numbers/objects via JSON, strings raw — same as :func:`_typed`). Strict: requires a
+    ``<function=…>`` block nested in ``<tool_call>`` (so a GLM ``<arg_key>`` block, a Hermes
+    ``<tool_call>{json}</tool_call>`` body, or a MiniMax ``<minimax:tool_call>`` wrapper all yield
+    ``None``). Returns ``(cleaned_text, calls)`` or ``None`` when no such block is present.
+
+    NB: this markup is byte-identical to Nemotron's, so this parser WILL also match a Nemotron tool call
+    — which is correct (same format). It is kept out of :func:`parse_quanta_tool_calls` precisely so the
+    legacy dispatcher keeps delegating that shared format to oMLX (see the module note above)."""
+    if "<tool_call>" not in text or "<function=" not in text:
+        return None
+    calls: list[dict] = []
+    for m in _QWEN3CODER_CALL_RE.finditer(text):
+        name = m.group("name").strip()
+        args = {p.group("key").strip(): _typed(p.group("val").strip())
+                for p in _QWEN3CODER_PARAM_RE.finditer(m.group("body"))}
+        calls.append({"id": f"{name}:{len(calls)}", "name": name,
+                      "arguments": json.dumps(args, ensure_ascii=False)})
+    if not calls:
+        return None
+    cleaned = _QWEN3CODER_CALL_RE.sub("", text)
+    return cleaned.strip(), calls
+
+
 # --- unified dispatcher ----------------------------------------------------------------------------
 _PARSERS: tuple[Callable[[str], ParseResult | None], ...] = (
     parse_kimi_tool_calls,        # <|tool_calls_section_begin|> (special tokens)
@@ -289,6 +339,34 @@ class Qwen3ToolParser:
         return f"<tool_response>\n{content}\n</tool_response>"
 
 
+class Qwen3CoderToolParser:
+    """Tool-call parser for the agentic Qwen3.5 checkpoints (e.g. Nex-N2-Pro) whose chat template
+    renders tool calls as nested XML — ``<tool_call><function=NAME><parameter=KEY>value</parameter>…
+    </function></tool_call>`` — NOT the Hermes ``<tool_call>{json}</tool_call>`` form that
+    :class:`Qwen3ToolParser` handles.
+
+    Conforms to :class:`ToolParser`. Delegates the parse to :func:`parse_qwen3_coder_tool_calls`
+    (strict — requires the ``<function=…>`` inner block, so it never swallows GLM/Hermes/MiniMax
+    markup). The response formatter renders the ``<tool_response>…</tool_response>`` block the
+    template's ``role == "tool"`` branch embeds verbatim (identical to :class:`Qwen3ToolParser`'s — the
+    tool-result wrapping is the same across both Qwen3.5 tool-call dialects).
+
+    This markup is byte-identical to Nemotron-3's tool format, which serving extracts via oMLX's stock
+    ``_parse_xml_tool_calls`` (gated for this exact form by ``parity/nemotron_omlx_contract_test``);
+    this class is the rule-6 quanta-owned parser, available to a per-model integration that prefers not
+    to depend on oMLX's registry regex. Stateless — a single instance is safe to reuse across requests.
+    """
+
+    def parse_tool_calls(self, text: str) -> list[dict]:
+        result = parse_qwen3_coder_tool_calls(text)
+        return list(result[1]) if result is not None else []
+
+    def format_tool_response(self, tool_call_id: str, content: str) -> str:
+        if not isinstance(tool_call_id, str) or not tool_call_id:
+            raise ValueError(f"tool_call_id must be a non-empty str (got {tool_call_id!r})")
+        return f"<tool_response>\n{content}\n</tool_response>"
+
+
 class KimiToolParser:
     """Tool-call parser for Kimi-K2.6 (``<|tool_calls_section_begin|>…<|tool_calls_section_end|>``).
 
@@ -319,6 +397,7 @@ __all__ = [
     "MM_SECTION_BEGIN",
     "MM_SECTION_END",
     "ParseResult",
+    "Qwen3CoderToolParser",
     "Qwen3ReasoningParser",
     "Qwen3ToolParser",
     "ReasoningParser",
@@ -327,5 +406,6 @@ __all__ = [
     "parse_kimi_tool_calls",
     "parse_minimax_tool_calls",
     "parse_quanta_tool_calls",
+    "parse_qwen3_coder_tool_calls",
     "parse_qwen_tool_calls",
 ]

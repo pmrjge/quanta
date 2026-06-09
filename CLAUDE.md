@@ -88,9 +88,27 @@ chunk=8 ⇒ `_gdn_step_batched`/`decode_step_batched` split into ≤8-row bit-ex
 B=1 batched==single-stream (Design-A). Throughput (fleet baseline) **B=1 14.0 → B=32 55.7 agg tok/s (3.98×
 batching)**, the loop-kill **1.15→1.50×** (best 1.50× @ B=16, 1.48× @ B=32); resident **215→261 GiB** @
 B=1→32 (per-stream ~1.5 GiB; 229 GiB headroom under 490.4 ⇒ B can go far higher); packed-int4 `gather_qmm`
-experts re-confirmed greedy-exact at scale. **Next N3 = `qwen3_coder`/`qwen3` parsers, 1M needle gate,
-paged-KV + prefix caching, MInference on the 15 full-attn layers, fused/batched GDN decode-step,
-multi-stream >B=32** over the int4-g64 artifact.
+experts re-confirmed greedy-exact at scale. **N3-2 ✅ (this commit) — `qwen3_coder` tool parser + `qwen3`
+reasoning parser** (the agentic serving surface; upstream `--reasoning-parser qwen3 --tool-call-parser
+qwen3_coder`). The chat template renders tool calls as the **nested-XML** form
+`<tool_call>\n<function=NAME>\n<parameter=KEY>\nvalue\n</parameter>…</function>\n</tool_call>` (multi-line
+values) and **pre-opens a bare `<think>`** (output `{reasoning}\n</think>\n\n{answer}`). Decisive finding:
+**this tool markup is BYTE-IDENTICAL to Nemotron-3's** (and the reasoning is the same pre-opened `<think>`)
+— both already handled by oMLX's stock `_parse_xml_tool_calls`/`extract_thinking`, the path the quanta
+patch DELEGATES (gated by `nemotron_omlx_contract_test`), so Nex's tool+reasoning serving already
+*functions*. Per rule 6 (don't silently depend on oMLX's regex) we still ship the strict quanta-owned
+`quanta.shim.tool_parsers.Qwen3CoderToolParser` (nested-XML, JSON typed-value recovery, multi-line, multi-
+call, `<tool_response>` formatter) + the existing `Qwen3ReasoningParser` (its bare-opener case IS the
+pre-opened `<think>`). **`Qwen3CoderToolParser` is the ONE quanta parser deliberately kept OUT of the
+global `parse_quanta_tool_calls` dispatcher** — registering it would silently re-route Nemotron's delegated
+markup (indistinguishable by text), so serving keeps delegating the shared XML form to oMLX. Additive only
+(no existing parser/dispatcher touched). Gated model-free: new `parity/qwen3_coder_tool_parser_test.py`
+(**24 checks** — extract/typed/multiline/multi-call + strictness vs Hermes/GLM/MiniMax/prose + the
+**dispatcher-exclusion that preserves the Nemotron delegation** + pre-opened/explicit/truncated/none
+reasoning + reasoning⊕tool compose) + a conformance/exclusion block in `qwen35_omlx_engine_test`; full
+model-free sweep **100/100** (manifest +1 → 100/51), `tool_parsers_test` Nemotron-delegation still green.
+**Next N3 = 1M needle gate, paged-KV + prefix caching, MInference on the 15 full-attn layers,
+fused/batched GDN decode-step, multi-stream >B=32** over the int4-g64 artifact.
 
 **Prior (paused): Nemotron-3-Ultra-550B serving runtime.** (The second agentic-stack model is **deferred to
 MiniMax-M3 when it ships** — **Mellum2 was dropped, its context length is too short**; the `minimax`

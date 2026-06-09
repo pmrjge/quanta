@@ -102,16 +102,37 @@ conv kernel 4, fp32 SSM state; **MoE on all 60 layers**: 512 experts **top-10** 
     can go far higher — B>32 is an admission-policy choice, not a memory limit). This also
     **re-confirms packed-int4 `gather_qmm` experts at scale** (graduated ON, greedy-exact). Qwen3.5
     serving is UNPAGED, so `step_batch` IS the prod decode hot path the gate times directly.
-  - **Remaining N3.** The **`qwen3_coder` tool parser** (XML
-    `<tool_call><function=…><parameter=…>` — NEW, the shim's JSON parser doesn't fit) + `qwen3`
-    reasoning parser (account for the template's pre-opened `<think>`); the **1M long-doc / needle
-    gate** (the YaRN arbiter); **paged-KV + prefix caching** (only the 15 full-attn layers hold a KV
-    cache — the 45 linear layers are O(1) recurrent state, so 1M KV is ~4× cheaper than a dense
-    model); **MInference sparse-prefill** on the full-attn layers (InternLM2.5 M0–M10 substrate
-    transfers); **fused/batched Gated-DeltaNet decode step** (the Nemotron `BATCHED_FUSED_SSD_STEP`
-    win, +36% @ B=32, applied to `gdn_step`); push multi-stream batched decode past B=32.
-    **Native-MTP spec-decode is N/A for Nex** (no MTP weights) — an EAGLE-style external drafter is the
-    only B=1 latency path if wanted later.
+  - **N3-2 ✅ — `qwen3_coder` tool parser + `qwen3` reasoning parser** (the agentic serving surface;
+    `--reasoning-parser qwen3 --tool-call-parser qwen3_coder`, per the upstream serving recipe in the
+    header). The chat template (artifact `chat_template.jinja`) renders tool calls as the **nested-XML
+    "pythonic" form** — `<tool_call>\n<function=NAME>\n<parameter=KEY>\nvalue\n</parameter>\n…\n
+    </function>\n</tool_call>` (values may span multiple lines) — and pre-opens a **bare `<think>`** so
+    the model's output is `{reasoning}\n</think>\n\n{answer}`. The decisive finding: **this tool markup
+    is byte-identical to Nemotron-3's**, and the reasoning is the same pre-opened `<think>` — both
+    already handled by oMLX's stock `_parse_xml_tool_calls` + `extract_thinking`, the path the quanta
+    patch DELEGATES (gated for this exact form by `parity/nemotron_omlx_contract_test`). So Nex's
+    tool+reasoning serving already *functions* via that proven delegation. Per rule 6 (don't silently
+    depend on oMLX's regex) we still ship the strict quanta-owned parsers:
+    `quanta.shim.tool_parsers.Qwen3CoderToolParser` (new — nested-XML, typed-value recovery via JSON,
+    multi-line values, multiple calls, `<tool_response>` formatter) + the existing `Qwen3ReasoningParser`
+    (its bare-opener case IS the pre-opened `<think>`). **`Qwen3CoderToolParser` is the ONE quanta parser
+    deliberately kept OUT of the global `parse_quanta_tool_calls` dispatcher** — registering it would
+    silently re-route Nemotron's delegated markup (the two formats are indistinguishable by text), so
+    serving keeps delegating the shared XML form to oMLX and the class is the per-model option. Gated
+    model-free: new `parity/qwen3_coder_tool_parser_test.py` (**24 checks** — extract/typed/multiline/
+    multi-call + strictness vs Hermes/GLM/MiniMax/prose + the **dispatcher-exclusion that preserves the
+    Nemotron delegation contract** + the pre-opened/explicit/truncated/none reasoning splits + the
+    reasoning⊕tool compose), plus a `Qwen3CoderToolParser` conformance+exclusion block added to
+    `parity/qwen35_omlx_engine_test.py`. Additive only (no existing parser or the dispatcher touched);
+    full model-free sweep **100/100**, `tool_parsers_test` (Nemotron delegation) still green. Manifest
+    +1 model_free (100/51).
+  - **Remaining N3.** The **1M long-doc / needle gate** (the YaRN arbiter); **paged-KV + prefix
+    caching** (only the 15 full-attn layers hold a KV cache — the 45 linear layers are O(1) recurrent
+    state, so 1M KV is ~4× cheaper than a dense model); **MInference sparse-prefill** on the full-attn
+    layers (InternLM2.5 M0–M10 substrate transfers); **fused/batched Gated-DeltaNet decode step** (the
+    Nemotron `BATCHED_FUSED_SSD_STEP` win, +36% @ B=32, applied to `gdn_step`); push multi-stream
+    batched decode past B=32. **Native-MTP spec-decode is N/A for Nex** (no MTP weights) — an
+    EAGLE-style external drafter is the only B=1 latency path if wanted later.
 
 ## N0 — what landed (this commit)
 

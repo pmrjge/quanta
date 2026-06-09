@@ -96,6 +96,7 @@
     "qwen35_routing_capture_test",
     "qwen35_spec_paged_na_test",
     "qwen35_tree_spec_test",
+    "qwen3_coder_tool_parser_test",
     "sample_min_p_test",
     "sampling_test",
     "tool_parsers_test",
