@@ -77,10 +77,28 @@ def main() -> int:
                          "coverage, not an expected base-deps state")
     ap.add_argument("--update-manifest", action="store_true",
                     help="regenerate parity/gate_manifest.json from the live partition and exit")
+    ap.add_argument("--allow-drift", action="store_true",
+                    help="run even if the live partition differs from the pinned manifest. Default: "
+                         "REFUSE — a new gate that evaded real-weight detection appears as 'added' "
+                         "in model_free and would be swept (a 300 GiB load) before anyone reviews "
+                         "it. Regenerate + review with --update-manifest instead.")
     args = ap.parse_args()
 
     if args.update_manifest:
         return _update_manifest()
+
+    # The same fail-open backstop the pytest guard enforces, now applied BEFORE the standalone sweep
+    # runs anything: refuse on partition drift so an undetected real-weight gate (a NEW name in
+    # model_free) can never be swept unreviewed. --update-manifest resolves it; --allow-drift skips.
+    drift = {k: v for k, v in manifest_diff().items() if v}
+    if drift and not args.allow_drift:
+        print(f"[sweep] REFUSING — gate partition drifted from the pinned manifest: {drift}",
+              flush=True)
+        print("[sweep] A gate in 'added' joining model_free will be SWEPT; if it loads real weights "
+              "that is a 300 GiB load. Regenerate + REVIEW with `--update-manifest`, or override "
+              "with `--allow-drift` once you've confirmed every 'added' gate is model-free.",
+              flush=True)
+        return 1
 
     gates = discover_model_free_gates()
     optional = optional_deps()  # computed once (reads pyproject), shared by every gate run

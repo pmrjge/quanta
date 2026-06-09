@@ -24,12 +24,15 @@ model. The standalone, streaming/parallel equivalent is ``parity.run_modelfree_s
 
 from __future__ import annotations
 
+import os
+
 import pytest
 
 from parity._modelfree import (
     GateResult,
     _looks_like_gate,
     _missing_optional_dep,
+    _rss_gib,
     _suspect_reason,
     discover_model_free_gates,
     is_real_weight,
@@ -152,7 +155,25 @@ def test_gate_result_semantics() -> None:
     assert not crashed.ok and crashed.failed
 
 
+def test_rss_gib() -> None:
+    """The watchdog's RSS probe: positive for a live pid (this process), 0.0 for a bogus/dead one —
+    a transient `ps` miss must read as 0, never as a spurious over-ceiling that false-kills a gate."""
+    assert _rss_gib(os.getpid()) > 0.0
+    assert _rss_gib(2_000_000_000) == 0.0   # a pid that cannot exist ⇒ ps prints nothing
+
+
 # --- Slow lane: actually run every model-free gate -------------------------------------------- #
+
+
+@pytest.mark.slow
+def test_run_gate_memory_watchdog() -> None:
+    """The RSS ceiling kills + fails LOUD a swept gate that crosses it — the runtime backstop for a
+    real-weight gate that evaded static detection (it would otherwise fault in hundreds of GiB and
+    OOM the box). Forced cheaply: any mlx-importing gate blows past a 50 MiB ceiling within the
+    first poll, so no multi-GiB allocation is needed. rc 137 = the SIGKILL we sent."""
+    tripped = run_gate(_GATES[0], rss_ceiling_gib=0.05)
+    assert tripped.returncode == 137 and tripped.failed, tripped
+    assert "ceiling" in tripped.suspect_reason
 
 
 @pytest.mark.slow

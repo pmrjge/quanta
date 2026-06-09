@@ -794,7 +794,14 @@ proof-of-work — also the escape hatch for a gate that legitimately renders a T
 `PARITY-CHECKS: 0` always fails); a **misnamed-gate scanner** flags model-free gates (incl.
 pytest-style) hidden behind a non-`_test.py` name; an **allowlist-staleness** guard; and a gate
 needing an **optional extra** (the skip-eligible set is read from `pyproject.toml`, never hardcoded;
-≈11 import `safetensors`) is **skipped, not failed**, on a base-deps-only env. A green sweep proves
+≈11 import `safetensors`) is **skipped, not failed**, on a base-deps-only env. Two **runtime
+backstops** close the fail-open residual (a real-weight gate that evades the *static* `is_real_weight`
+detector — e.g. an env-var artifact path with no `models` substring): `run_gate` polls each swept
+gate's RSS and **kills + fails-loud any gate crossing a 4 GiB ceiling** (model-free gates peak
+~0.4 GiB; the smallest real load is 9 GiB, so the load is killed before it faults in hundreds of GiB
+and OOM-reboots the box), and the standalone sweep **refuses to run on manifest drift** (an
+undetected gate shows up as an `added` name and stops the sweep before it loads;
+`--update-manifest`/`--allow-drift` to resolve/override). A green sweep proves
 **interface + logic on stubs, not real-model numeric parity** (that is the excluded SOLO gates).
 **When you add/remove/reclassify a `parity/*_test.py` gate, regenerate the manifest:** `uv run
 python -m parity.run_modelfree_sweep --update-manifest` and review the diff.

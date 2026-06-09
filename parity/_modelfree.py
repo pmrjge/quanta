@@ -42,6 +42,7 @@ import json
 import re
 import subprocess
 import sys
+import threading
 import time
 import tomllib
 from dataclasses import dataclass
@@ -228,6 +229,14 @@ _REQ_NAME_RE = re.compile(r"^[A-Za-z0-9._-]+")
 _MISSING_DEP_RE = re.compile(r"No module named '([\w.]+)'")
 _TRACEBACK_SIG = "Traceback (most recent call last):"
 _CHECKS_RE = re.compile(r"PARITY-CHECKS:\s*(\d+)")
+# Runtime memory backstop (the last line of defense for the fail-open residual). Model-free gates
+# peak ~0.4 GiB (mlx import + KB-MB stubs); the SMALLEST real-weight load is 9 GiB. A swept gate
+# crossing this ceiling is a real-weight gate that EVADED static detection — e.g. an env-var
+# artifact path with no "models" substring, which `is_real_weight` cannot see. Kill it the instant
+# it crosses, BEFORE it faults in hundreds of GiB and OOM-reboots the box, and fail LOUD (rule 6).
+# 4 GiB ≈ 10× the observed model-free peak and well under the 9 GiB floor: a wide, unambiguous gap.
+_RSS_CEILING_GIB = 4.0
+_RSS_POLL_SECONDS = 0.25
 
 
 def optional_deps() -> frozenset[str]:
@@ -314,31 +323,79 @@ class GateResult:
         return not self.skipped and not self.ok
 
 
-def run_gate(module: str, *, timeout: int = DEFAULT_TIMEOUT,
-             optional: frozenset[str] | None = None) -> GateResult:
-    """Run one gate as ``python -m <module>`` in an ISOLATED subprocess (fresh mlx state, no
-    cross-gate contamination — the way the gates are designed to run). A timeout is reported as
-    returncode 124, never raised, so a single hang can't abort a whole sweep. A returncode-0 run is
-    additionally screened for vacuous-pass evidence, and a missing optional-extra dep yields a SKIP
-    rather than a false failure. ``optional`` is the extra-dep set (computed once by the sweep)."""
-    t0 = time.time()
+def _rss_gib(pid: int) -> float:
+    """Resident set size of ``pid`` in GiB via ``ps`` (portable on macOS; no psutil dep). Returns
+    0.0 when the process is already gone or ``ps`` errors — a transient read must never false-kill a
+    gate (the ceiling only fires on a sustained, polled crossing)."""
     try:
-        proc = subprocess.run(
-            [sys.executable, "-m", module],
-            cwd=REPO_ROOT, capture_output=True, text=True, timeout=timeout,
-        )
-    except subprocess.TimeoutExpired:
-        return GateResult(module, 124, time.time() - t0, f"TIMEOUT >{timeout}s")
-    out = proc.stdout + proc.stderr
+        out = subprocess.run(["ps", "-o", "rss=", "-p", str(pid)],
+                             capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return 0.0
+    kib = out.stdout.strip()
+    try:
+        return int(kib) / (1024 * 1024) if kib else 0.0
+    except ValueError:
+        return 0.0
+
+
+def run_gate(module: str, *, timeout: int = DEFAULT_TIMEOUT,
+             optional: frozenset[str] | None = None,
+             rss_ceiling_gib: float = _RSS_CEILING_GIB) -> GateResult:
+    """Run one gate as ``python -m <module>`` in an ISOLATED subprocess (fresh mlx state, no
+    cross-gate contamination — the way the gates are designed to run). Three failure modes are
+    contained, never raised:
+
+    * **Timeout** → returncode 124, so a single hang can't abort the whole sweep.
+    * **Memory ceiling** → the process is killed and FAILED LOUD the instant its polled RSS crosses
+      ``rss_ceiling_gib``. This is the runtime backstop for a real-weight gate that evaded *static*
+      detection (:func:`is_real_weight`): it would otherwise fault in hundreds of GiB and OOM the
+      machine. The subprocess is polled every :data:`_RSS_POLL_SECONDS`; output is drained
+      concurrently by a reader thread so the pipe never deadlocks.
+    * **Vacuous pass** → an rc-0 run with a swallowed-exception / ``PARITY-CHECKS: 0`` signal.
+
+    A missing optional-extra dep yields a SKIP, not a failure. ``optional`` is the extra-dep set
+    (computed once by the sweep)."""
+    t0 = time.time()
+    proc = subprocess.Popen(
+        [sys.executable, "-m", module], cwd=REPO_ROOT,
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+    )
+    chunks: list[str] = []
+    reader = threading.Thread(target=lambda: chunks.append(proc.stdout.read()), daemon=True)
+    reader.start()
+    overrun = 0.0
+    while proc.poll() is None:
+        time.sleep(_RSS_POLL_SECONDS)
+        rss = _rss_gib(proc.pid)
+        if rss > rss_ceiling_gib:
+            overrun = rss
+            proc.kill()
+            break
+        if time.time() - t0 > timeout:
+            proc.kill()
+            proc.wait()
+            reader.join()
+            return GateResult(module, 124, time.time() - t0, f"TIMEOUT >{timeout}s")
+    proc.wait()
+    reader.join()
+    out = chunks[0] if chunks else ""
     secs = time.time() - t0
-    if proc.returncode != 0:
+    if overrun:
+        reason = (f"RSS {overrun:.1f} GiB crossed the {rss_ceiling_gib:.0f} GiB model-free ceiling — "
+                  f"a real-weight gate evading static detection? Exclude it (name it `*_real_test.py`"
+                  f", add a real-weight marker, or the `# parity-gate: real-weight` sentinel) and "
+                  f"re-pin the manifest.")
+        return GateResult(module, 137, secs, reason[:120], suspect_reason=reason)
+    rc = proc.returncode
+    if rc != 0:
         dep = _missing_optional_dep(out, optional)
         if dep is not None:
-            return GateResult(module, proc.returncode, secs, _summary(out),
+            return GateResult(module, rc, secs, _summary(out),
                               skipped=True,
                               skip_reason=f"missing optional dep '{dep}' (an extra)")
-    return GateResult(module, proc.returncode, secs, _summary(out),
-                      suspect_reason=_suspect_reason(proc.returncode, out))
+    return GateResult(module, rc, secs, _summary(out),
+                      suspect_reason=_suspect_reason(rc, out))
 
 
 def summary_banner() -> str:
