@@ -78,16 +78,40 @@ conv kernel 4, fp32 SSM state; **MoE on all 60 layers**: 512 experts **top-10** 
     *secondary* signal (noisy on prose — bf16-ULP near-tie flips at low-confidence positions, a settled
     finding), a >0.90 sanity floor not a tight gate. **Decision: SHIP int4-g64** (214 GiB, ~lossless,
     90 GiB lighter than int6).
-- **N3 — serving + optimizations.** Resident e2e ppl gate (dequant-ref parity); the **`qwen3_coder`
-  tool parser** (XML `<tool_call><function=…><parameter=…>` — NEW, the shim's JSON parser doesn't fit)
-  + `qwen3` reasoning parser (account for the template's pre-opened `<think>`); the **1M long-doc /
-  needle gate** (the YaRN arbiter); packed-int4 `gather_qmm` experts; **paged-KV + prefix caching**
-  (only the 15 full-attn layers hold a KV cache — the 45 linear layers are O(1) recurrent state, so 1M
-  KV is ~4× cheaper than a dense model); **MInference sparse-prefill** on the full-attn layers
-  (InternLM2.5 M0–M10 substrate transfers); **fused/batched Gated-DeltaNet decode step** (the Nemotron
-  `BATCHED_FUSED_SSD_STEP` win, +36% @ B=32, applied to `gdn_step`); multi-stream batched decode.
-  **Native-MTP spec-decode is N/A for Nex** (no MTP weights) — an EAGLE-style external drafter is the
-  only B=1 latency path if wanted later.
+- **N3 — serving + optimizations.**
+  - **N3-1 ✅ — resident + batched serving re-gate @ 397B** (`parity/nex_n2_pro_batched_real.py`,
+    SOLO; ONE 214.7 GiB load shared across 3 gates — the Super→Ultra re-gate of the already-built,
+    35B-graduated `Qwen35BatchedResidentModel`):
+    1. **resident e2e ppl == dequant-ref.** The served kernels — packed-int4 routed experts
+       (`mx.gather_qmm`) + int8 mixer projections (`mx.quantized_matmul`) — teacher-forced on the SAME
+       645-tok prose give ppl **5.0715 / acc 0.5621**, vs the streamed dequant int4 reference
+       (`Qwen35Artifact` + `streamed_logits(packed=False)`, computed in-process first then freed)
+       **5.0729 / 0.5559** — Δ **−0.03%** (packed is marginally *better*: it fuses the dequant at full
+       precision, the bf16-dequant reference pre-rounds each weight). The resident serving forward is
+       numerically faithful at 397B (and reproduces the N2 arbiter's 5.0729 exactly — deterministic).
+    2. **batched #153 loop-kill greedy-exact.** `Qwen35BatchedResidentModel.step_batch` is
+       loop==loopkill **bit/greedy-exact at every B∈{1,4,8,16,32}**, incl. the **chunked regime** —
+       B=16/32 exceed the M0 `chunk=8`, so `_gdn_step_batched` / `Qwen35Attention.decode_step_batched`
+       split the batched mixer into ≤8-row blocks that keep every `mx.quantized_matmul` in the
+       batch-M bit-exact gemv regime (the option-B requirement, re-proven at the true 397B dims).
+    3. **Design-A equivalence.** B=1 batched (prefill + `step_batch`) == single-stream
+       `Qwen35ResidentModel` greedy-exact (24-tok autoregressive trace).
+    Throughput (the serving fleet-baseline row): **B=1 14.0 → B=32 55.7 agg tok/s = 3.98× batching**;
+    the hybrid loop-kill **1.15 / 1.41 / 1.50 / 1.48×** @ B=4/8/16/32 (best 1.50× @ B=16). Resident
+    **215 → 261 GiB** @ B=1→32 (per-stream ~1.5 GiB; **229 GiB headroom** under the 490.4 ceiling ⇒ B
+    can go far higher — B>32 is an admission-policy choice, not a memory limit). This also
+    **re-confirms packed-int4 `gather_qmm` experts at scale** (graduated ON, greedy-exact). Qwen3.5
+    serving is UNPAGED, so `step_batch` IS the prod decode hot path the gate times directly.
+  - **Remaining N3.** The **`qwen3_coder` tool parser** (XML
+    `<tool_call><function=…><parameter=…>` — NEW, the shim's JSON parser doesn't fit) + `qwen3`
+    reasoning parser (account for the template's pre-opened `<think>`); the **1M long-doc / needle
+    gate** (the YaRN arbiter); **paged-KV + prefix caching** (only the 15 full-attn layers hold a KV
+    cache — the 45 linear layers are O(1) recurrent state, so 1M KV is ~4× cheaper than a dense
+    model); **MInference sparse-prefill** on the full-attn layers (InternLM2.5 M0–M10 substrate
+    transfers); **fused/batched Gated-DeltaNet decode step** (the Nemotron `BATCHED_FUSED_SSD_STEP`
+    win, +36% @ B=32, applied to `gdn_step`); push multi-stream batched decode past B=32.
+    **Native-MTP spec-decode is N/A for Nex** (no MTP weights) — an EAGLE-style external drafter is the
+    only B=1 latency path if wanted later.
 
 ## N0 — what landed (this commit)
 

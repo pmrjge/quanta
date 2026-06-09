@@ -77,10 +77,20 @@ the project thesis), **int4 5.0729/acc 0.5559/Δ +0.68%/agree 0.9472**, **int6 5
 −0.30%/agree 0.9550**. **int4-RTN is ~lossless** (+0.68% ppl, −0.3% acc — the Nemotron-Ultra +0.3% finding
 reproduces on a bf16 source); int6 (−0.30%, noise) recovers <1pp for +90 GiB. Teacher-forced ppl is THE
 arbiter (methodology #4); top-1 agree ~0.95 is the *secondary* signal (noisy — bf16-ULP near-tie flips at
-low-confidence positions, settled), a >0.90 floor not a tight gate. **SHIP int4-g64** (214 GiB). **Next = N3**
-= serving + all optimizations (qwen3_coder/qwen3 parsers, 1M needle gate, packed-int4 `gather_qmm`, paged-KV +
-prefix caching, MInference on the 15 full-attn layers, fused/batched GDN decode-step, multi-stream) over the
-int4-g64 artifact.
+low-confidence positions, settled), a >0.90 floor not a tight gate. **SHIP int4-g64** (214 GiB). **N3-1 ✅ (this commit) — resident + batched serving re-gate
+@ 397B** (`parity/nex_n2_pro_batched_real.py`, SOLO; ONE 214.7 GiB load, 3 gates): the served kernels
+(packed-int4 routed experts via `gather_qmm` + int8 mixer via `quantized_matmul`) teacher-forced on the
+645-tok prose give ppl **5.0715 / acc 0.5621 == the streamed dequant int4 ref 5.0729 / 0.5559 (Δ −0.03%**
+— packed fuses the dequant at full precision, marginally *beating* the reference's bf16 pre-round), so the
+resident serving forward is numerically faithful at 397B; the **#153 hybrid loop-kill** `step_batch` is
+loop==loopkill **greedy-exact at every B∈{1,4,8,16,32}** incl. the **chunked B=16/32 regime** (>the M0
+chunk=8 ⇒ `_gdn_step_batched`/`decode_step_batched` split into ≤8-row bit-exact `quantized_matmul` blocks);
+B=1 batched==single-stream (Design-A). Throughput (fleet baseline) **B=1 14.0 → B=32 55.7 agg tok/s (3.98×
+batching)**, the loop-kill **1.15→1.50×** (best 1.50× @ B=16, 1.48× @ B=32); resident **215→261 GiB** @
+B=1→32 (per-stream ~1.5 GiB; 229 GiB headroom under 490.4 ⇒ B can go far higher); packed-int4 `gather_qmm`
+experts re-confirmed greedy-exact at scale. **Next N3 = `qwen3_coder`/`qwen3` parsers, 1M needle gate,
+paged-KV + prefix caching, MInference on the 15 full-attn layers, fused/batched GDN decode-step,
+multi-stream >B=32** over the int4-g64 artifact.
 
 **Prior (paused): Nemotron-3-Ultra-550B serving runtime.** (The second agentic-stack model is **deferred to
 MiniMax-M3 when it ships** — **Mellum2 was dropped, its context length is too short**; the `minimax`
