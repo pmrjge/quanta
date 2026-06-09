@@ -111,15 +111,17 @@ def _write_int8(writer: ArtifactWriter, key: str, w: mx.array, gs: int,
 
 
 def _write_expert_stack(writer: ArtifactWriter, key: str, w: mx.array, gs: int,
-                        scale_dtype: mx.Dtype | None) -> None:
-    """int4 affine-quantize a **pre-stacked 3-D** expert tensor ``[E, out, in]`` in one shot.
+                        scale_dtype: mx.Dtype | None, bits: int = _EXPERT_BITS) -> None:
+    """int``bits`` affine-quantize a **pre-stacked 3-D** expert tensor ``[E, out, in]`` in one shot.
 
-    ``mx.quantize`` groups over the trailing ``in`` dim, so the 3-D stack stays in the ``[E, out, in]``
-    layout the runtime's ``mx.gather_qmm`` consumes — packed codes ``[E, out, in*bits/32]`` + scales /
-    biases ``[E, out, in/gs]``. Stored under ``key`` as a standard ``affine_packed`` entry.
+    ``bits`` is the routed-expert width (4 for the default int4 arm, 6 for the int6 safety-net arm —
+    the N2 bits decision; MLX affine supports {2,3,4,6,8}). ``mx.quantize`` groups over the trailing
+    ``in`` dim, so the 3-D stack stays in the ``[E, out, in]`` layout the runtime's ``mx.gather_qmm``
+    consumes — packed codes ``[E, out, in*bits/32]`` + scales / biases ``[E, out, in/gs]``. Stored
+    under ``key`` as a standard ``affine_packed`` entry (its manifest records ``bits`` so the resident
+    loader decodes at the baked width — never a hardcoded default, rule 6).
     """
-    writer.add_quantized(key, *quantize_affine(w, _EXPERT_BITS, gs, scale_dtype=scale_dtype),
-                         _EXPERT_BITS, gs)
+    writer.add_quantized(key, *quantize_affine(w, bits, gs, scale_dtype=scale_dtype), bits, gs)
 
 
 def _write_suffix_sub(writer: ArtifactWriter, prefix: str, sub: dict, int8: tuple[str, ...],
@@ -140,24 +142,26 @@ def _write_suffix_sub(writer: ArtifactWriter, prefix: str, sub: dict, int8: tupl
 
 
 def _bake_moe_block(writer: ArtifactWriter, prefix: str, moe: dict, gs: int,
-                    scale_dtype: mx.Dtype | None) -> None:
+                    scale_dtype: mx.Dtype | None, expert_bits: int = _EXPERT_BITS) -> None:
     """Bake one MoE block (main-decoder layout): router gate + shared-gate bf16, shared expert int8,
-    fused pre-stacked routed experts int4 g64. ``prefix`` is e.g. ``layers.{i}.mlp.``."""
+    fused pre-stacked routed experts int``expert_bits`` g64. ``prefix`` is e.g. ``layers.{i}.mlp.``."""
     writer.add_dense(prefix + "gate.weight", moe["gate"])                       # router → bf16
     writer.add_dense(prefix + "shared_expert_gate.weight", moe["shared_expert_gate"])  # sigmoid → bf16
     for proj in SHARED_EXPERT_PROJS:                                            # shared expert → int8
         _write_int8(writer, f"{prefix}shared_expert.{proj}", moe[f"shared_{proj}"], gs, scale_dtype)
-    # fused, pre-stacked routed experts → int4 g64 (3-D, gather_qmm-ready)
+    # fused, pre-stacked routed experts → int{expert_bits} g64 (3-D, gather_qmm-ready)
     _write_expert_stack(writer, prefix + "experts.gate_up_proj", moe["experts_gate_up"],
-                        gs, scale_dtype)
-    _write_expert_stack(writer, prefix + "experts.down_proj", moe["experts_down"], gs, scale_dtype)
+                        gs, scale_dtype, expert_bits)
+    _write_expert_stack(writer, prefix + "experts.down_proj", moe["experts_down"], gs, scale_dtype,
+                        expert_bits)
 
 
 def _bake_mtp(writer: ArtifactWriter, ck: Qwen35SourceCheckpoint, cfg: Qwen35Config,
-              j: int, gs: int, scale_dtype: mx.Dtype | None) -> None:
+              j: int, gs: int, scale_dtype: mx.Dtype | None,
+              expert_bits: int = _EXPERT_BITS) -> None:
     """Bake the native MTP block like a decoder layer: fc-fusion + norms bf16; full-attn int8; MoE
-    identical to a main-decoder block (shared expert int8, fused pre-stacked routed experts int4 g64)
-    via :func:`_bake_moe_block`."""
+    identical to a main-decoder block (shared expert int8, fused pre-stacked routed experts
+    int``expert_bits`` g64) via :func:`_bake_moe_block`."""
     t = ck.mtp(j)
     p = f"mtp.{j}."
     # fc embed/hidden fusion + its pre-norms + the block's final norm → bf16
@@ -169,7 +173,7 @@ def _bake_mtp(writer: ArtifactWriter, ck: Qwen35SourceCheckpoint, cfg: Qwen35Con
     writer.add_dense(p + "post_attention_layernorm.weight", t["post_attention_layernorm"])
     _write_suffix_sub(writer, p + "self_attn.", t["attention"], _FULL_INT8, _FULL_BF16, gs, scale_dtype)
     # MoE shares the main-decoder layout (fused pre-stacked experts) → same bake path
-    _bake_moe_block(writer, p + "mlp.", t["moe"], gs, scale_dtype)
+    _bake_moe_block(writer, p + "mlp.", t["moe"], gs, scale_dtype, expert_bits)
     del t
 
 
@@ -251,6 +255,71 @@ def _copy_metadata_sidecars(source: Path, out_dir: Path, cfg: Qwen35Config) -> N
         gen_path.write_text(json.dumps(synthesized, indent=2))
 
 
+# A self-contained, text-servable artifact MUST contain these; a bake that drops any is not
+# standalone and must fail loud (rule 6) rather than ship a half-bundle that resolves against the
+# source at load time. ``manifest.json``/``model.safetensors.index.json``/``config.json`` are written
+# by the ArtifactWriter; ``generation_config.json`` (the two-eos stop set) + ``tokenizer_config.json``
+# are placed by :func:`_copy_metadata_sidecars`.
+_REQUIRED_ARTIFACT_FILES: tuple[str, ...] = (
+    "config.json", "manifest.json", "model.safetensors.index.json",
+    "generation_config.json", "tokenizer_config.json",
+)
+# Substrings that betray a NON-self-contained reference in the artifact's json metadata: an absolute
+# path, an HF hub-cache layout, or a snapshot/blob symlink target. None may appear in a standalone
+# bundle (the weight_map is relative, the config has no paths, generation_config is synthesized).
+_LEAK_MARKERS: tuple[str, ...] = ("/Users/", "/home/", ".cache", "huggingface", "/blobs/",
+                                  "/snapshots/")
+
+
+def _audit_self_contained(out_dir: Path, source: Path) -> dict:
+    """Fail loud (rule 6) unless the baked artifact is FULLY self-contained inside ``out_dir``.
+
+    Every bake must produce a standalone bundle — no reference resolves outside its own folder — so
+    the artifact can be moved/served with zero dependence on the source checkpoint or any cache. This
+    asserts, raising ``AssertionError`` on the first violation:
+
+    * **no symlinks** anywhere in the bundle (a symlink to the source/cache is not self-contained);
+    * the **required sidecars** are present (:data:`_REQUIRED_ARTIFACT_FILES`) plus a tokenizer table
+      (``tokenizer.json`` *or* ``vocab.json``) — i.e. a servable text bundle;
+    * **no path leak** — the json metadata (config/manifest/index/generation_config) contains no
+      absolute path, HF-cache, or hub-layout marker (:data:`_LEAK_MARKERS`) and no occurrence of the
+      source's own absolute path, so the bundle has zero external references;
+    * the index ``weight_map`` is **relative** (bare shard filenames, no separator) and every
+      referenced shard **exists** in ``out_dir``.
+
+    Returns a summary dict. Called at the end of every :func:`bake_qwen35` so the artifact folder is
+    proven standalone before the bake reports done."""
+    out_dir, source = Path(out_dir), Path(source)
+    links = [str(p) for p in out_dir.rglob("*") if p.is_symlink()]
+    if links:
+        raise AssertionError(f"artifact NOT self-contained: {len(links)} symlink(s), e.g. {links[0]}")
+
+    missing = [f for f in _REQUIRED_ARTIFACT_FILES if not (out_dir / f).exists()]
+    if missing:
+        raise AssertionError(f"artifact missing required sidecar(s) (not servable): {missing}")
+    if not ((out_dir / "tokenizer.json").exists() or (out_dir / "vocab.json").exists()):
+        raise AssertionError("artifact has no tokenizer table (tokenizer.json or vocab.json)")
+
+    markers = (*_LEAK_MARKERS, str(source.resolve()))
+    leaks = {name: hits for name in ("config.json", "manifest.json",
+                                     "model.safetensors.index.json", "generation_config.json")
+             if (hits := [m for m in markers if m in (out_dir / name).read_text()])}
+    if leaks:
+        raise AssertionError(f"artifact json leaks external refs (not self-contained): {leaks}")
+
+    wmap = json.loads((out_dir / "model.safetensors.index.json").read_text())["weight_map"]
+    nonrel = sorted({v for v in wmap.values() if "/" in v})
+    if nonrel:
+        raise AssertionError(f"artifact weight_map has non-relative shard refs: {nonrel[:3]}")
+    shards = sorted(set(wmap.values()))
+    absent = [s for s in shards if not (out_dir / s).exists()]
+    if absent:
+        raise AssertionError(f"artifact weight_map references absent shard(s): {absent[:3]}")
+
+    return {"symlinks": 0, "sidecars": "present", "leaks": "none",
+            "shards": len(shards), "weight_map_entries": len(wmap)}
+
+
 def bake_qwen35(
     source: str | Path,
     out_dir: str | Path,
@@ -261,17 +330,22 @@ def bake_qwen35(
     include_head: bool = True,
     include_mtp: bool = True,
     group_size: int = 64,
+    expert_bits: int = _EXPERT_BITS,
     capture_acts: bool = False,
     scale_dtype: mx.Dtype | None = None,
 ) -> dict:
-    """Bake the Qwen3.5-397B-A17B bf16 source into a self-contained int4/int8/bf16 artifact.
+    """Bake the Qwen3.5-397B-A17B bf16 source into a self-contained int{4,6}/int8/bf16 artifact.
 
-    Returns a summary ``dict`` (per-kind counts, layers, bytes). ``n_layers`` / ``expert_subset``
-    slice the bake for bounded validation; ``include_head`` toggles embed/norm/head; ``include_mtp``
-    toggles the native MTP block. ``capture_acts`` runs the streamed calibration forward (post-norm
-    acts + routing) for the QC gauge / a future GPTQ pass — off by default since the int4 recipe is
-    plain affine RTN over the stacks. ``group_size`` is the routed-expert (and non-expert) group
-    (64 per #115). The dynamic-YaRN 1M policy is baked into ``config.json`` at finalize.
+    Returns a summary ``dict`` (per-kind counts, layers, bytes, self-containment audit). ``n_layers``
+    / ``expert_subset`` slice the bake for bounded validation; ``include_head`` toggles embed/norm/
+    head; ``include_mtp`` toggles the native MTP block. ``capture_acts`` runs the streamed calibration
+    forward (post-norm acts + routing) for the QC gauge / a future GPTQ pass — off by default since
+    the int4 recipe is plain affine RTN over the stacks. ``group_size`` is the routed-expert (and
+    non-expert) group (64 per #115). ``expert_bits`` is the routed-expert width — **4** (the default
+    int4 arm, ~lossless on a bf16 source per the Nemotron-Ultra finding) or **6** (the int6 safety-net
+    arm); the N2 e2e-ppl arbiter picks between them. The dynamic-YaRN 1M policy is baked into
+    ``config.json`` at finalize, and :func:`_audit_self_contained` then fails loud unless the artifact
+    folder is fully standalone (rule 6).
     """
     cfg = Qwen35Config.from_pretrained(source)
     ck = Qwen35SourceCheckpoint(source, cfg)
@@ -307,7 +381,7 @@ def bake_qwen35(
             moe = dict(moe)
             moe["experts_gate_up"] = moe["experts_gate_up"][experts_sel]
             moe["experts_down"] = moe["experts_down"][experts_sel]
-        _bake_moe_block(writer, lp + "mlp.", moe, group_size, scale_dtype)
+        _bake_moe_block(writer, lp + "mlp.", moe, group_size, scale_dtype, expert_bits)
 
         del norms, moe
         ck.release()
@@ -315,21 +389,24 @@ def bake_qwen35(
 
     if include_head and include_mtp and cfg.num_mtp_modules > 0:
         for j in range(cfg.num_mtp_modules):
-            _bake_mtp(writer, ck, cfg, j, group_size, scale_dtype)
+            _bake_mtp(writer, ck, cfg, j, group_size, scale_dtype, expert_bits)
             ck.release()
             mx.clear_cache()
 
+    # ``expert_int4`` is the routed-expert scheme NAME (matches quant_policy.EXPERT_INT4); it counts
+    # the pre-stacked expert tensors at WHATEVER ``expert_bits`` was baked (4 or 6) — classified by
+    # bits != 8 (the only non-int8 affine entries are the experts), so int4 counts are byte-identical.
     counts = {"int8": 0, "expert_int4": 0, "dense": 0}
     for entry in writer.manifest.values():
         fmt, bits = entry["format"], entry.get("bits")
         if fmt == "affine_packed":
-            counts["expert_int4" if bits == _EXPERT_BITS else "int8"] += 1
+            counts["expert_int4" if bits == expert_bits else "int8"] += 1
         else:
             counts["dense"] += 1
 
     scale_tag = "bf16" if scale_dtype == mx.bfloat16 else "fp32"
     policy = {
-        "experts": f"int4 affine g{group_size}",
+        "experts": f"int{expert_bits} affine g{group_size}",
         "non_experts": f"int8 affine g{group_size}",
         "ssm_control_norms_router_shared_gate_head": "bf16/f32",
         "scales": scale_tag,
@@ -339,6 +416,7 @@ def bake_qwen35(
     writer.finalize(policy)  # flushes shards + writes index/config/manifest
     _bake_long_context(Path(out_dir), cfg)  # bake the dynamic-YaRN 1M policy into config.json
     _copy_metadata_sidecars(Path(source), Path(out_dir), cfg)  # tokenizer + generation_config (two-eos)
+    audit = _audit_self_contained(Path(out_dir), Path(source))  # rule 6: fail loud if not standalone
 
     out = Path(out_dir)
     total_bytes = sum(p.stat().st_size for p in out.glob("model-*.safetensors"))
@@ -347,6 +425,8 @@ def bake_qwen35(
         "experts_per_layer": (cfg.num_experts if experts_sel is None else len(experts_sel)),
         "mtp_layers": (cfg.num_mtp_modules if (include_head and include_mtp) else 0),
         "captured_layers": len(caps),
+        "expert_bits": expert_bits,
         "counts": counts,
         "bytes": total_bytes,
+        "self_contained": audit,
     }

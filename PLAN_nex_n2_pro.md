@@ -48,16 +48,36 @@ conv kernel 4, fp32 SSM state; **MoE on all 60 layers**: 512 experts **top-10** 
   whole forward path is correct at 397B (no forward bug surfaced; the qwen35 code was already correct
   from the 35B keeper, so N1 is the at-scale re-gate — the Super→Ultra pattern). The `(1+w)` fold
   lives in `runtime.py:_one_plus` (layer/q/k/final norms, NOT the gated-DeltaNet norm).
-- **N2 — bake + bits decision. int4 arm ✅ (int6 + ppl arbiter remaining).** RTN is data-free/cheap.
-  **int4-g64 baked** → `~/models/Nex-N2-Pro-quanta_int4g64` (`parity/run_bake_nex_n2_pro_int4g64.py`,
-  2.7 min, data-free RTN): **214.1 GiB / 25 shards**, 60 layers / 512 experts, counts {int8 465,
-  expert_int4 120, dense 453} (== N0 quant-policy projection exactly), MTP excluded (`include_mtp=
-  False`), **config declares the 1M window** (`max_position_embeddings 1,010,000` + standard HF YaRN +
-  synthesized `generation_config.json` eos `[248046, 248044]` + tokenizer copied — self-contained).
-  Family-consistent name `_int4g64` (the Qwen3.6-35B keeper convention; `rtn` was Nemotron-only, to
-  disambiguate from its AWQ artifact — qwen35 has no AWQ path). **Remaining:** bake int6-g64, then
-  teacher-force ppl on held-out prose, **pick by the quality-vs-VRAM rule** (int4-RTN was ~lossless
-  +0.3% on bf16-source Nemotron-Ultra → strong default; int6 ≈ 304 GiB is the safety net).
+- **N2 — bake + bits decision. ✅ COMPLETE → SHIP int4-g64.** RTN is data-free/cheap; both arms baked,
+  the e2e-ppl arbiter decided.
+  - **int4-g64** → `~/models/Nex-N2-Pro-quanta_int4g64` (`parity/run_bake_nex_n2_pro_int4g64.py`,
+    2.7 min): **214.1 GiB / 25 shards**, 60 layers / 512 experts, counts {int8 465, expert_int4 120,
+    dense 453} (== N0 quant-policy projection exactly), MTP excluded (`include_mtp=False`).
+  - **int6-g64** → `~/models/Nex-N2-Pro-quanta_int6g64` (`parity/run_bake_nex_n2_pro_int6g64.py`,
+    3.2 min, `expert_bits=6`): **304.1 GiB / 31 shards**, SAME counts {int8 465, expert_int4 120
+    (now int6), dense 453} (== the N0 int6 projection 304.1 GiB exactly). The bake gained an
+    `expert_bits` knob (`bake.py`, default 4; threaded through `_bake_moe_block`/`_bake_mtp`/
+    `_write_expert_stack`) — the int4 path is byte-identical, int6 is the same recipe at a wider grid
+    (MLX affine {2,3,4,6,8}; `Qwen35Artifact`/`gather_qmm` decode at the manifest width, never a
+    hardcoded 4).
+  - **Both artifacts are self-contained (the user's rule, now ENFORCED as code).** `bake_qwen35` ends
+    with `_audit_self_contained` (rule 6, fail-loud): no symlinks, required sidecars present
+    (config/manifest/index/synthesized `generation_config.json` eos `[248046,248044]`/tokenizer), no
+    path leak in any json metadata, relative weight_map, all shards present. Both **config declare the
+    1M window** (`max_position_embeddings 1,010,000` + standard HF YaRN, dynamic-YaRN baseline 262144).
+    Family-consistent names `_int4g64`/`_int6g64` (the Qwen3.6-35B keeper convention; `rtn` was
+    Nemotron-only to disambiguate its AWQ artifact — qwen35 has no AWQ path).
+  - **ppl arbiter** (`parity/nex_n2_pro_ppl.py`, SOLO; 3 sequential streamed forwards over the SAME
+    645-tok held-out prose via the proven `_load_block(packed=False)` reference path — bf16 source /
+    int4 dequant / int6 dequant, one block resident at a time, rule 8): **bf16 ppl 5.0386 / acc
+    0.5590** (low-single-digit on real prose — the forward is e2e-coherent at 397B, the project
+    thesis), **int4 5.0729 / acc 0.5559 / Δ +0.68% / agree 0.9472**, **int6 5.0237 / acc 0.5590 / Δ
+    −0.30% / agree 0.9550**. **int4-RTN is ~lossless** (+0.68% ppl, −0.3% acc) — the Nemotron-Ultra
+    finding (int4-RTN +0.3% on a bf16 source) reproduces; int6 (−0.30%, within noise) recovers <1pp
+    for +90 GiB. teacher-forced ppl is THE arbiter (methodology #4); top-1 agreement ~0.95 is the
+    *secondary* signal (noisy on prose — bf16-ULP near-tie flips at low-confidence positions, a settled
+    finding), a >0.90 sanity floor not a tight gate. **Decision: SHIP int4-g64** (214 GiB, ~lossless,
+    90 GiB lighter than int6).
 - **N3 — serving + optimizations.** Resident e2e ppl gate (dequant-ref parity); the **`qwen3_coder`
   tool parser** (XML `<tool_call><function=…><parameter=…>` — NEW, the shim's JSON parser doesn't fit)
   + `qwen3` reasoning parser (account for the template's pre-opened `<think>`); the **1M long-doc /

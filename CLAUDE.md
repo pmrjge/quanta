@@ -60,10 +60,27 @@ data-free RTN) → `~/models/Nex-N2-Pro-quanta_int4g64`: **214.1 GiB / 25 shards
 counts {int8 465, expert_int4 120, dense 453} (== the N0 quant-policy projection exactly), MTP excluded, and
 the **config declares the 1M window** (`max_position_embeddings 1,010,000` + standard HF YaRN + synthesized
 `generation_config.json` eos `[248046, 248044]` + tokenizer copied — self-contained; family name `_int4g64`,
-the Qwen3.6-35B keeper convention). **Next** = bake int6-g64 + teacher-force ppl (the bits-decision arbiter,
-int4 vs int6 vs bf16; int4-RTN was ~lossless +0.3% on bf16-source Nemotron-Ultra → strong default), then
-**N3** = serving + all optimizations (qwen3_coder/qwen3 parsers, 1M needle gate, packed-int4 `gather_qmm`,
-paged-KV + prefix caching, MInference on the 15 full-attn layers, fused/batched GDN decode-step, multi-stream).
+the Qwen3.6-35B keeper convention). **N2 ✅ COMPLETE → SHIP int4-g64 (this commit).** Both arms baked + the
+e2e-ppl arbiter decided. **int6-g64 baked** (`parity/run_bake_nex_n2_pro_int6g64.py`, 3.2 min, `expert_bits=6`)
+→ `~/models/Nex-N2-Pro-quanta_int6g64`: **304.1 GiB / 31 shards**, SAME counts {int8 465, expert_int4 120
+*now int6*, dense 453} (== the N0 int6 projection 304.1 exactly). The bake gained an **`expert_bits` knob**
+(`bake.py`, default 4, threaded `_write_expert_stack`/`_bake_moe_block`/`_bake_mtp`) — int4 path
+byte-identical, int6 the same recipe at a wider grid (MLX affine {2,3,4,6,8}; `Qwen35Artifact`/`gather_qmm`
+decode at the **manifest** width, never a hardcoded 4). **Every bake is now self-contained AS CODE** (the
+user's rule): `bake_qwen35` ends with `_audit_self_contained` (rule 6, **fail-loud**) — no symlinks, required
+sidecars present (config/manifest/index/synthesized `generation_config.json`/tokenizer), no path leak in any
+json, relative weight_map, all shards present; both artifacts audited green + **config declares the 1M
+window**. **ppl arbiter** (`parity/nex_n2_pro_ppl.py`, SOLO; 3 sequential streamed forwards over the SAME
+645-tok held-out prose via the proven `_load_block(packed=False)` reference path, one block resident at a
+time): **bf16 ppl 5.0386/acc 0.5590** (low-single-digit on real prose — the forward is e2e-coherent at 397B,
+the project thesis), **int4 5.0729/acc 0.5559/Δ +0.68%/agree 0.9472**, **int6 5.0237/acc 0.5590/Δ
+−0.30%/agree 0.9550**. **int4-RTN is ~lossless** (+0.68% ppl, −0.3% acc — the Nemotron-Ultra +0.3% finding
+reproduces on a bf16 source); int6 (−0.30%, noise) recovers <1pp for +90 GiB. Teacher-forced ppl is THE
+arbiter (methodology #4); top-1 agree ~0.95 is the *secondary* signal (noisy — bf16-ULP near-tie flips at
+low-confidence positions, settled), a >0.90 floor not a tight gate. **SHIP int4-g64** (214 GiB). **Next = N3**
+= serving + all optimizations (qwen3_coder/qwen3 parsers, 1M needle gate, packed-int4 `gather_qmm`, paged-KV +
+prefix caching, MInference on the 15 full-attn layers, fused/batched GDN decode-step, multi-stream) over the
+int4-g64 artifact.
 
 **Prior (paused): Nemotron-3-Ultra-550B serving runtime.** (The second agentic-stack model is **deferred to
 MiniMax-M3 when it ships** — **Mellum2 was dropped, its context length is too short**; the `minimax`
