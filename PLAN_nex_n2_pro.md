@@ -32,18 +32,32 @@ conv kernel 4, fp32 SSM state; **MoE on all 60 layers**: 512 experts **top-10** 
 
 ## Phased plan
 
-- **N0 — groundwork (model-free / header-only, no 739 GB load). ✅ COMPLETE (this commit).**
-- **N1 — layer parity @ 397B (SOLO).** The `qwen35` runtime vs an independent `transformers`
-  `Qwen3_5Moe` reference, **layer-streamed** (one real layer resident, rule 8): Gated DeltaNet
-  (recurrence/chunk/step), gated-GQA + partial mRoPE + per-head QK-norm, MoE top-10 softmax routing +
-  shared expert. This is "runtime first." Confirm `norm_topk_prob`/`scoring_func` against the oracle
-  (read with defaults today). Use Nex itself as the 397B vehicle (base Qwen3.5-397B is gone from disk).
-- **N2 — bake + bits decision.** RTN is data-free/cheap → **bake int4-g64 AND int6-g64**, teacher-force
-  ppl on held-out prose, **pick by the quality-vs-VRAM rule** (int4-RTN was ~lossless +0.3% on
-  bf16-source Nemotron-Ultra → strong default; int6 is the safety net). The dynamic-YaRN 1M policy is
-  baked into `config.json` (N0). `include_mtp=False` (Nex ships no MTP weights — see N0 finding).
-  Artifact `~/models/Nex-N2-Pro-quanta_int4rtn_g64` (and/or int6). Expected resident **int4 ≈ 214 GiB /
-  int6 ≈ 304 GiB** (N0 projection).
+- **N0 — groundwork (model-free / header-only, no 739 GB load). ✅ COMPLETE.**
+- **N1 — layer parity @ 397B (SOLO). ✅ COMPLETE.** The `qwen35` runtime vs an independent
+  `transformers` `Qwen3_5Moe` reference (transformers 5.9.0 ships `qwen3_5_moe`), **layer-streamed**
+  (one real layer resident, rule 8), `parity/nex_n2_pro_layer_parity.py`: **deltanet** our
+  `GatedDeltaNet` prefill vs `Qwen3_5MoeGatedDeltaNet` (pure-torch `torch_chunk_gated_delta_rule`
+  fallback — no FLA) **Δ 1.95e-06** + prefill==decode 1.44e-06; **attn** our `Qwen35Attention` vs
+  `Qwen3_5MoeAttention` (eager + partial-mRoPE rope + doubled-`q_proj` sigmoid output gate + per-head
+  `(1+w)` q/k norm) **Δ 2.10e-06** + fast==naive 7.5e-08 + prefill==decode 4.8e-07; **moe** router
+  top-10 **set-exact** (softmax + `norm_topk_prob` renorm — confirmed against the oracle, NOT
+  DeepSeek sigmoid/noaux_tc) w Δ 4.9e-07 + experts/sigmoid-shared vs inline-dense 1.55e-03 + chunk Δ
+  **0.0**; **block** our full `Qwen35Block` vs `Qwen3_5MoeDecoderLayer` (the end-to-end gate that
+  exercises the `Qwen3_5MoeRMSNorm` **`(1+w)`** input/post norms + residual wiring + mixer dispatch)
+  **linear L0 Δ 1.50e-06 / full L3 Δ 1.90e-06**. All fp32 cross-impl at machine precision — the
+  whole forward path is correct at 397B (no forward bug surfaced; the qwen35 code was already correct
+  from the 35B keeper, so N1 is the at-scale re-gate — the Super→Ultra pattern). The `(1+w)` fold
+  lives in `runtime.py:_one_plus` (layer/q/k/final norms, NOT the gated-DeltaNet norm).
+- **N2 — bake + bits decision. int4 arm ✅ (int6 + ppl arbiter remaining).** RTN is data-free/cheap.
+  **int4-g64 baked** → `~/models/Nex-N2-Pro-quanta_int4g64` (`parity/run_bake_nex_n2_pro_int4g64.py`,
+  2.7 min, data-free RTN): **214.1 GiB / 25 shards**, 60 layers / 512 experts, counts {int8 465,
+  expert_int4 120, dense 453} (== N0 quant-policy projection exactly), MTP excluded (`include_mtp=
+  False`), **config declares the 1M window** (`max_position_embeddings 1,010,000` + standard HF YaRN +
+  synthesized `generation_config.json` eos `[248046, 248044]` + tokenizer copied — self-contained).
+  Family-consistent name `_int4g64` (the Qwen3.6-35B keeper convention; `rtn` was Nemotron-only, to
+  disambiguate from its AWQ artifact — qwen35 has no AWQ path). **Remaining:** bake int6-g64, then
+  teacher-force ppl on held-out prose, **pick by the quality-vs-VRAM rule** (int4-RTN was ~lossless
+  +0.3% on bf16-source Nemotron-Ultra → strong default; int6 ≈ 304 GiB is the safety net).
 - **N3 — serving + optimizations.** Resident e2e ppl gate (dequant-ref parity); the **`qwen3_coder`
   tool parser** (XML `<tool_call><function=…><parameter=…>` — NEW, the shim's JSON parser doesn't fit)
   + `qwen3` reasoning parser (account for the template's pre-opened `<think>`); the **1M long-doc /

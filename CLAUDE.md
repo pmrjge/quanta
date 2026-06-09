@@ -43,7 +43,27 @@ window declares 1M while the dynamic-YaRN baseline stays 262144 (`eff@8k=1.0`, `
 text tensors = 453 dense/465 int8/120 expert_int4**, +333 vision excluded). **FIT: int4-g64 ≈ 214.1 GiB /
 int6-g64 ≈ 304.1 GiB — both ≤ 490.4** (276/186 GiB headroom). Gates: `parity/nex_n2_pro_fit_test.py`
 (real-path SOLO, headers only) + `parity/qwen35_config_eos_yarn_test.py` (model-free, 21 checks).
-**N1 next** = layer parity @ 397B vs a transformers `Qwen3_5Moe` reference (SOLO, layer-streamed).
+**N1 ✅ (this commit)** — layer parity @ 397B vs an independent `transformers` `Qwen3_5Moe` reference
+(transformers 5.9.0 ships `qwen3_5_moe`), SOLO/layer-streamed (rule 8), `parity/nex_n2_pro_layer_parity.py`:
+**deltanet** our `GatedDeltaNet` vs `Qwen3_5MoeGatedDeltaNet` (pure-torch `torch_chunk_gated_delta_rule`
+fallback) **Δ 1.95e-6** + prefill==decode 1.4e-6; **attn** our `Qwen35Attention` vs `Qwen3_5MoeAttention`
+(eager + partial-mRoPE + doubled-`q_proj` sigmoid output gate + per-head `(1+w)` q/k norm) **Δ 2.10e-6** +
+fast==naive 7.5e-8 + prefill==decode 4.8e-7; **moe** router top-10 **set-exact** (softmax + `norm_topk_prob`
+renorm, confirmed vs the oracle — NOT DeepSeek sigmoid/noaux_tc) w Δ 4.9e-7 + experts/sigmoid-shared vs
+inline-dense 1.55e-3 + chunk **0.0**; **block** our full `Qwen35Block` vs `Qwen3_5MoeDecoderLayer` (the
+end-to-end gate exercising the `Qwen3_5MoeRMSNorm` **`(1+w)`** input/post norms + residual wiring + mixer
+dispatch) **linear L0 Δ 1.50e-6 / full L3 Δ 1.90e-6**. All fp32 cross-impl at machine precision — **no
+forward bug surfaced** (the qwen35 code was already correct from the 35B keeper; N1 is the at-scale re-gate,
+the Super→Ultra pattern; the `(1+w)` fold is `runtime.py:_one_plus`, layer/q/k/final norms NOT the gated-DeltaNet
+norm). **N2 int4 arm ✅ (this commit)** — **int4-g64 baked** (`parity/run_bake_nex_n2_pro_int4g64.py`, 2.7 min,
+data-free RTN) → `~/models/Nex-N2-Pro-quanta_int4g64`: **214.1 GiB / 25 shards**, 60 layers / 512 experts,
+counts {int8 465, expert_int4 120, dense 453} (== the N0 quant-policy projection exactly), MTP excluded, and
+the **config declares the 1M window** (`max_position_embeddings 1,010,000` + standard HF YaRN + synthesized
+`generation_config.json` eos `[248046, 248044]` + tokenizer copied — self-contained; family name `_int4g64`,
+the Qwen3.6-35B keeper convention). **Next** = bake int6-g64 + teacher-force ppl (the bits-decision arbiter,
+int4 vs int6 vs bf16; int4-RTN was ~lossless +0.3% on bf16-source Nemotron-Ultra → strong default), then
+**N3** = serving + all optimizations (qwen3_coder/qwen3 parsers, 1M needle gate, packed-int4 `gather_qmm`,
+paged-KV + prefix caching, MInference on the 15 full-attn layers, fused/batched GDN decode-step, multi-stream).
 
 **Prior (paused): Nemotron-3-Ultra-550B serving runtime.** (The second agentic-stack model is **deferred to
 MiniMax-M3 when it ships** — **Mellum2 was dropped, its context length is too short**; the `minimax`
