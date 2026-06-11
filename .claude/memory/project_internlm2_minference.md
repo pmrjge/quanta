@@ -1,11 +1,14 @@
 ---
 name: project-internlm2-minference
-description: InternLM2.5 sparse-prefill track (MInference family, lossy → ppl-gated). The 2nd InternLM2.5 speed lever after EAGLE spec-decode. KEY DECISION — do NOT build from scratch: the bounded-memory chunked block-gather *execution* substrate already exists, validated + ppl-gated, in quanta.modeling.xattention; reuse it and layer MInference's selectors on top. M0 871258f: wired the substrate into InternLM2Attention behind a self.sparse hook (default None = dense, byte-unchanged) + model-free integration parity gate. M1 next = real-model long-doc ppl sweep on the int8 bake (solo GPU). InternLM2 is the only keeper still paying full O(T²) dense prefill.
+description: "InternLM2.5 sparse-prefill track (MInference family, lossy → ppl-gated). 2nd InternLM2.5 speed lever after EAGLE. KEY DECISION — reuse the bounded-memory chunked block-gather *execution* substrate (quanta.modeling.xattention), layer MInference's selectors on top. COMPLETE M0–M10: per-head (kind+params) selectors (XAttention/A-shape/vertical-slash) + grouped-gather fold (default-on) → up to 4.3×@64K per attn layer; ppl +0.04% @ a 7-block doc but +31.8% @ 16K code corpus (steep speed/quality at long ctx). The substrate now also transfers to Nex-N2-Pro's 15 full-attn layers."
 metadata:
   node_type: memory
   type: project
   originSessionId: 78ef7db6-f4ec-4c53-857e-3bd77cc65962
 ---
+
+**STATUS: COMPLETE (M0–M10) — see the foot of this file. The roadmap below ("M1 next", "M2+") is the
+historical M0 plan, retained for the substrate-reuse decision; what actually shipped is at the bottom.**
 
 **Why:** InternLM2.5 is the only keeper still paying full **O(T²) dense prefill** (DSV4 native-sparse,
 Nemotron-Mamba/qwen35-GDN linear). The June-2026 prefill research ([[prefill-optimization-landscape]])
@@ -46,4 +49,12 @@ later milestone — smallest diff, parity-anchored, no rebuild.
   last-query-block index estimation) as an alternative *selector* feeding the SAME `gather_sparse_attention`
   execution, ppl-gated against dense + XAttn. This is where the genuine new work + the quality questions live.
 
-See also [[prefill-optimization-landscape]], [[project-internlm2-eagle]] (1st lever, DONE), [[project-model-targets]].
+---
+**COMPLETE (M0–M10) — what actually shipped (handover `PLAN_minference.md`):**
+- **M1** measured XAttention on the int8-g64 bake: prefill @ threshold 0.9 = **+0.31% ppl** ("free"); gather speed-path == mask quality-path.
+- **M2 A-shape** (sink + local window), **M3 vertical-slash** (online probe → top-vert/top-slash bands), both onto the SAME `gather_sparse_attention` execution via a `selector` discriminant (`"xattn"` default byte-unchanged).
+- **M4 per-head KIND**, **M5 per-head (kind, PARAMS)** via a frozen `HeadSpec` + offline FLOP-budgeted `assign_head_specs` — **+0.15% ppl** beats any uniform (75% heads on the cheap static kernel, each its most-accurate-affordable approx — the MInference thesis). **M6** per-head vslash params → **+0.04%**.
+- **M7** key-chunked the long-context vslash probe (online-softmax two-pass, O(one key chunk); short-doc path byte-unchanged). **M8** timed the gather speed path: **O(T²)→O(T) crossover 8–16K, up to 4.3×@64K** per attn layer (ashape/vslash sparsest; xattn nucleus least sparse → slowest, hence assigned per-head).
+- **M9 grouped-gather fold** (`grouped_gather`, since **default-on** for per-head configs, rule-4 bit-exact): partition heads by spec, gather each group at its OWN `max_kept` → **2.64× faster than naive** per-head gather (which paid the densest head's budget for all). **M10** long-context per-head ppl @ 16384 tok: keep-all==dense, M7 chunked==single-shot bit-identical, M9 fold==mask — and the real frontier: **+31.8% ppl** on a code-heavy corpus (94% ashape / 6% vslash) vs the adaptive xattn nucleus near-lossless **+2.8% but keeps ~65%** (priced out of the budget). A steep, real speed/quality tradeoff at long ctx (vs the 7-block doc's +0.04%).
+
+See also [[prefill-optimization-landscape]], [[project-internlm2-eagle]] (1st lever, DONE), [[project-model-targets]], [[project-nemotron-ultra]] (rode the same session), [[project-nex-n2-pro]] (the substrate's next consumer — its 15 full-attn layers).

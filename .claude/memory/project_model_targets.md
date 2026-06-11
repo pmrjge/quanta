@@ -1,12 +1,25 @@
 ---
 name: project-model-targets
-description: "AGENTIC KEEPER SET (2026-05-28) = Nemotron + DeepSeek-V4-Flash + InternLM2.5-7B-1M. Kimi/GLM/MiniMax/Qwen3.5/Qwen2.5 built but deprioritized for the serving loop."
+description: "SERVED FLEET (2026-06-11) = InternLM2.5-7B int8g64 (9 GiB) + Qwen3.6-35B int4g64 (19) + Nemotron-Super-120B int4g64 (68) + DSV4-Flash int4g64 (180) + Nemotron-Ultra-550B int4rtn (306) + Nex-N2-Pro/Qwen3.5-397B int4g64 (214, ACTIVE). Grew from the 2026-05-28 three-keeper set (Nemotron+DSV4+InternLM2.5). One model resident at a time."
 metadata:
   node_type: memory
   type: project
   originSessionId: e88fadb0-5f2c-48da-82a1-e14175af6551
 ---
 
+**CURRENT STATE (2026-06-11) — the served fleet is now FIVE+ models, all int4/int8 resident, ONE AT A
+TIME** (decode baseline table in CLAUDE.md): InternLM2.5-7B int8g64 **9 GiB**, Qwen3.6-35B-A3B int4g64
+**19**, Nemotron-Super-120B int4g64 **68**, DSV4-Flash int4g64 **180**, Nemotron-Ultra-550B int4rtn_g64
+**306**, **Nex-N2-Pro = Qwen3.5-397B-A17B int4g64 214 (SHIPPED, the ACTIVE task — N3 serving)**. NEW since
+the three-keeper decision below: **Nemotron-Ultra-550B** ([[project-nemotron-ultra]], SHIPPED int4-RTN —
+the group-wise-RMSNorm bug + AWQ→RTN e2e findings) and **Nex-N2-Pro** ([[project-nex-n2-pro]]). The
+2026-05-28 "Qwen3.5 deprioritized/DROPPED" framing is **superseded** — Nex-N2-Pro IS a Qwen3.5-397B and
+`quanta.qwen35` is its production runtime (the Qwen3.6-35B keeper proved the forward; Nex is
+validate-at-scale + bake). The three-keeper text below is the historical decision; the **per-model
+architecture + paging notes remain valid**. EAGLE (InternLM2.5) + MInference M0–M10 done; the whole
+#152/#153 paged + #158-160 tree-spec-over-paged tracks are CLOSED across keepers.
+
+---
 **FOCUS DECISION (2026-05-28): the agentic serving loop targets only THREE models** — to keep the
 loop simple/fast for agentic workflows:
 1. **Nemotron** — Mamba-2 + GQA hybrid (linear-attn scales for long agentic context), native MTP.
