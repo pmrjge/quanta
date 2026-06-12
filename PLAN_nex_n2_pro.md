@@ -174,6 +174,17 @@ conv kernel 4, fp32 SSM state; **MoE on all 60 layers**: 512 experts **top-10** 
        `nemotron_bake_test` reclassified real-weight via the explicit sentinel — it streams the
        bf16 SOURCE checkpoint through an import the static detector can't see, and the sources are
        now deleted from `~/models`, artifacts only).
+    5. **Serving graduation (follow-up commit).** `Qwen35BatchedResidentModel.prefill` (the oMLX
+       admit path — `_Qwen35BatchedSession` is unchanged, the routing is runtime-owned) now routes
+       prompts ≥ **`QWEN35_CHUNKED_PREFILL_FROM = 257`** tokens through `prefill_chunked`
+       (greedy-exact per the real gate, 8–10×); below the threshold the per-token seeding stays
+       **bit-identical** (the regime every existing bit-exact gate feeds — the real Design-A B=1
+       gates seed 32-token prompts). `None` restores per-token everywhere. Gated in
+       `qwen35_batched_test` check (f): routing OBSERVED via a spy on the late-imported
+       `chunked_prefill` (≥thr → chunked + bit-exact == direct; <thr → per-token bit-identical;
+       None → never; routed greedy == per-token) + a default-ON pin that also fails loud if the
+       threshold ever drops to ≤32 (which would silently flip the real gates' bit-exact
+       assertions into the chunked ULP class).
   - **Remaining N3.** **N3-4 = the 1M long-doc / needle gate** (the YaRN arbiter — needle past the
     262144 native window under the pinned dynamic-YaRN factor, `prefill_chunked` + `pin_yarn`;
     ~2 h at the measured 158 tok/s, attention-quadratic tail will slow late chunks — consider

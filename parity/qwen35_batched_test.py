@@ -26,6 +26,9 @@ Concretely:
       does NOT touch streams 1..3's caches (a per-stream cache-isolation gate).
 * (e) ``step_batch`` raises ``ValueError`` when ``cache.offset != declared offset`` (rule-6 fail-loud
       on an orchestrator desync — never silently advance a diverged stream).
+* (f) ``prefill`` routes prompts >= ``QWEN35_CHUNKED_PREFILL_FROM`` through the N3-3 chunked path
+      (observed via a spy, default-ON pinned, threshold > the real gates' 32-token seeds; ``None``
+      restores per-token everywhere; below-threshold stays bit-identical per-token seeding).
 
     uv run --with numpy python -m parity.qwen35_batched_test
 
@@ -171,6 +174,73 @@ def _test_b_eq_1_prefill_match(bm: Qwen35BatchedResidentModel) -> bool:
     ok = d < 1e-5 and cache_a.offset == len(prompt)
     print(f"  [{'OK' if ok else 'FAIL'}] B=1 prefill() == B=1 step_batch loop  |Δ|={d:.2e} "
           f"off={cache_a.offset}")
+    return ok
+
+
+def _test_chunked_prefill_routing(bm: Qwen35BatchedResidentModel) -> bool:
+    """``prefill`` routes long prompts through the N3-3 chunked path (graduated ON) and keeps the
+    bit-identical per-token seeding below the threshold. The routing is OBSERVED (a spy on the
+    late-imported :func:`quanta.qwen35.runtime.chunked_prefill`), not inferred from numerics; the
+    module constant + spy are restored on exit. Real-weight greedy-exactness of the chunked path
+    itself is the N3-3 SOLO gate (``nex_n2_pro_prefill_chunked_real``)."""
+    import quanta.qwen35.batched_runtime as qbr
+    import quanta.qwen35.runtime as qrt
+
+    thr = qbr.QWEN35_CHUNKED_PREFILL_FROM
+    # default-ON pin (fail loud on a silent revert) + the threshold must stay ABOVE every existing
+    # bit-exact gate's prompt length (the real Design-A B=1 gates seed 32-token prompts —
+    # ``nex_n2_pro_batched_real.SEED_LEN``; lowering the default past 32 silently flips those
+    # bit-exact assertions into the chunked ULP class).
+    ok_pin = thr is not None and thr > 32
+    print(f"  [{'OK' if ok_pin else 'FAIL'}] chunked-prefill routing default-ON pin "
+          f"(thr={thr}, must be int > 32)")
+    if not ok_pin:
+        return False
+
+    prompt = [3, 9, 15, 27, 42, 8, 33, 21]                 # 8 tokens
+    calls: list[int] = []
+    orig_cp = qrt.chunked_prefill
+
+    def spy(layers, embed_w, norm_w, lm_head_w, cfg, token_ids, caches, **kw):
+        calls.append(len(list(token_ids)))
+        return orig_cp(layers, embed_w, norm_w, lm_head_w, cfg, token_ids, caches, **kw)
+
+    try:
+        qrt.chunked_prefill = spy
+        # routed: threshold lowered to the prompt length -> prefill() delegates to the chunked path
+        qbr.QWEN35_CHUNKED_PREFILL_FROM = len(prompt)
+        c_r = bm.make_caches()
+        lg_r = bm.prefill(prompt, c_r)
+        routed = calls == [len(prompt)] and c_r.offset == len(prompt)
+        # same path direct == routed, bit-exact (identical computation on a fresh cache)
+        c_d = bm.make_caches()
+        lg_d = bm.prefill_chunked(prompt, c_d)
+        d_direct = _maxdiff(lg_r, lg_d)
+        # one token below the threshold: the per-token loop, chunked NOT called
+        calls.clear()
+        short = prompt[:-1]
+        c_s = bm.make_caches()
+        lg_s = bm.prefill(short, c_s)
+        pf, _ = _single_stream_decode(bm, short, n_decode=0)
+        below = calls == [] and _maxdiff(lg_s, pf[-1]) < 1e-5
+        # OFF (None): never routes, even for the at-threshold prompt
+        qbr.QWEN35_CHUNKED_PREFILL_FROM = None
+        calls.clear()
+        c_o = bm.make_caches()
+        lg_o = bm.prefill(prompt, c_o)
+        off_never = calls == []
+        # routed vs per-token: greedy-equal (the rule-4 arbiter for the chunked regime — the
+        # chunked WY arm reorders the fp32 recurrence vs the per-token scan, ~5e-3 abs on this
+        # tiny model; the bound is a sanity rail, greedy agreement is the gate)
+        agree = (int(mx.argmax(lg_r[0, -1]).item()) == int(mx.argmax(lg_o[0, -1]).item())
+                 and _maxdiff(lg_r, lg_o) < 2e-2)
+    finally:
+        qbr.QWEN35_CHUNKED_PREFILL_FROM = thr
+        qrt.chunked_prefill = orig_cp
+
+    ok = routed and d_direct == 0.0 and below and off_never and agree
+    print(f"  [{'OK' if ok else 'FAIL'}] prefill() routing: >=thr -> chunked (observed, "
+          f"|Δ|direct={d_direct:.1e}), <thr -> per-token, None -> never; routed greedy == per-token")
     return ok
 
 
@@ -429,6 +499,7 @@ def run() -> None:
     ok = True
     print("\n=== Qwen3.5 batched (B>1) decode parity (tiny, model-free) ===")
     ok &= _test_b_eq_1_prefill_match(bm)
+    ok &= _test_chunked_prefill_routing(bm)
     ok &= _test_identical_streams(bm, B=1)
     ok &= _test_identical_streams(bm, B=2)
     ok &= _test_identical_streams(bm, B=4)

@@ -130,6 +130,11 @@ verbatim**; throughput **193 tok/s @ 1K (9.5×) / 157.8 tok/s @ 32K** (peak 242 
 (was ~14 h). Manifest 100/52: new gate added; `nemotron_bake_test` reclassified real-weight via the
 explicit sentinel (it streams the bf16 SOURCE checkpoint via an import the static detector can't see —
 **the bf16 sources are now deleted from `~/models`**, baked artifacts only remain on this box).
+**N3-3b ✅ (this commit) — chunked prefill graduated into serving admit**: `Qwen35BatchedResidentModel.prefill`
+(the oMLX admit path) routes prompts ≥ **`QWEN35_CHUNKED_PREFILL_FROM = 257`** through `prefill_chunked`
+(greedy-exact per the real gate, 8–10×); <257 stays the **bit-identical** per-token seeding (every existing
+bit-exact gate's regime — the real Design-A B=1 gates seed 32 tok); `None` = never. Gated in
+`qwen35_batched_test` (f): routing observed via a spy + default-ON pin that fails loud at thr ≤ 32.
 **Next N3 = N3-4 1M needle gate (the YaRN arbiter — past-native needle under pinned dynamic YaRN via
 `prefill_chunked`; ~2 h at the measured rate, consider MInference on the 15 full-attn layers first),
 paged-KV + prefix caching, MInference sparse-prefill, fused/batched GDN decode-step, multi-stream

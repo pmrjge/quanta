@@ -935,7 +935,9 @@ class _InternLM2BatchedSession(_BaseBatchedSession):
 class _Qwen35BatchedSession(_BaseBatchedSession):
     """Qwen3.5 batched session — one :class:`quanta.qwen35.decode.Qwen35Cache` per slot (int8 KV on the
     15 full-attn layers, recurrent GatedDeltaNet state on the 45 linear-attn layers). Qwen3.5's
-    ``step_batch`` takes plain int token ids + per-stream offsets (``Qwen35Cache.offset``)."""
+    ``step_batch`` takes plain int token ids + per-stream offsets (``Qwen35Cache.offset``). Admit
+    prefill is runtime-owned: prompts >= ``QWEN35_CHUNKED_PREFILL_FROM`` route through the N3-3
+    chunked prefill (greedy-exact, 8-10x — see the flag block in ``quanta.qwen35.batched_runtime``)."""
 
     def _make_runtime(self, root: str | Path, capacity: int) -> Any:
         from quanta.qwen35 import batched_runtime as _qbr  # lazy

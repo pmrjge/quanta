@@ -82,6 +82,21 @@ QWEN35_BATCHED_LOOPKILL_DEFAULT = True
 # switch; if a future MLX drops the threshold below 8, §M0 fails loudly (the signal to lower this).
 QWEN35_LOOPKILL_CHUNK = 8
 
+# --- N3-3 chunked serving prefill (Qwen3.5-scoped admit-latency graduation) -------------------------
+# ``prefill`` seeds a new stream's cache one token at a time — BIT-identical to single-stream
+# ``generate`` seeding, but O(T) full forwards (~20 tok/s at 397B ⇒ a 32K admit would cost ~27 min).
+# The N3-3 chunked-prefill substrate (:meth:`Qwen35BatchedResidentModel.prefill_chunked`: WY/UT
+# chunk-parallel GDN + KV-extending bottom-right causal SDPA, one bounded forward per chunk) is
+# 8–10x faster and GREEDY-EXACT vs the per-token seeding on the real 397B artifact
+# (``parity/nex_n2_pro_prefill_chunked_real.py``) — but not bit-exact (the packed
+# ``mx.quantized_matmul`` runs at batch-M=chunk vs M=1, the documented greedy-token-stable ULP
+# class). So ``prefill`` routes prompts of >= this many tokens through ``prefill_chunked`` and
+# keeps the bit-identical per-token seeding below it — the regime every existing bit-exact gate
+# feeds (the real Design-A B=1 gates seed 32-token prompts, ``nex_n2_pro_batched_real.SEED_LEN``;
+# the model-free gates < 32). ``None`` = never route (the pre-N3-3 per-token path at every
+# length). Routing gated model-free in ``parity/qwen35_batched_test.py``.
+QWEN35_CHUNKED_PREFILL_FROM: int | None = 257
+
 
 def _gdn_step_through_cache(blk, lc: _GDNLayerState, x_t: mx.array) -> mx.array:
     """One linear-layer decode step for ONE stream through its recurrent layer-state.
@@ -428,12 +443,17 @@ class Qwen35BatchedResidentModel:
         Single-stream by design (Design A): full-attention prefill needs a common offset / mask
         across the consumed window, which cannot be shared with other streams' independent state.
         The orchestrator calls this once per new stream's prompt; decoding then proceeds via
-        :meth:`step_batch`. Seeds the cache the same way :func:`quanta.qwen35.generate.generate`
+        :meth:`step_batch`. Prompts of >= ``QWEN35_CHUNKED_PREFILL_FROM`` tokens route through
+        :meth:`prefill_chunked` (greedy-exact, the feasible long-admit path — see the flag block);
+        below the threshold the cache is seeded the same way :func:`quanta.qwen35.generate.generate`
         does — stepping one token at a time so the per-stream state is bit-identical to a fresh
         single-stream run."""
         ids = list(prompt_ids)
         if not ids:
             raise ValueError("prompt_ids is empty (prefill needs >= 1 token)")
+        thr = QWEN35_CHUNKED_PREFILL_FROM
+        if thr is not None and len(ids) >= thr:
+            return self.prefill_chunked(ids, state)
         logits = None
         # use the same one-token-at-a-time machinery batched_decode_step uses (so a B=1 prefill is
         # bit-identical to a step-by-step decode at offsets 0..len-1).
