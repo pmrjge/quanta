@@ -74,8 +74,18 @@ class _GDNLayerState:
         The decode stepper returns the new ``(recurrent_state, conv_state)``; the runtime calls this to
         store them as live and snapshot them so a later ``truncate`` can restore this exact point. The
         snapshot list is trimmed to the last ``snapshot_depth`` committed offsets (plus the empty base)."""
+        self.commit_block(conv_state, recurrent_state, 1)
+
+    def commit_block(self, conv_state: mx.array, recurrent_state: mx.array, n_tokens: int) -> None:
+        """Record the post-state after consuming a chunked-prefill block of ``n_tokens`` (advance
+        the offset by ``n_tokens``, snapshot only the block-final state). A later ``truncate`` can
+        restore any *committed* offset; rolling back INTO the block raises from :meth:`truncate`
+        (no intra-block snapshot exists) — fine for prefill, which is never speculatively rolled
+        back. ``n_tokens == 1`` is exactly :meth:`commit`."""
+        if n_tokens < 1:
+            raise ValueError(f"commit_block n_tokens must be >= 1 (got {n_tokens})")
         self.conv_state, self.recurrent_state = conv_state, recurrent_state
-        self._off += 1
+        self._off += int(n_tokens)
         self._snaps.append((self._off, conv_state, recurrent_state))
         # keep the empty base (offset 0) plus the last ``_depth`` committed snapshots
         if len(self._snaps) > self._depth + 1:

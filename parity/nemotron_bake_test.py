@@ -9,6 +9,13 @@
     ``awq_packed``, dense projections ``affine_packed``, SSM core ``dense``.
 
     uv run --with tokenizers python -m parity.nemotron_bake_test
+
+Needs the **bf16 SOURCE checkpoint** on disk (it streams real config/tokenizer/expert tensors —
+bounded, one expert resident — via ``parity.nemotron_ppl.MODEL``, an import the static real-weight
+detector cannot see). The sources were removed from ~/models after the bakes shipped (artifacts
+only), so this gate is pinned out of the model-free sweep by the explicit sentinel:
+
+# parity-gate: real-weight
 """
 
 from __future__ import annotations

@@ -87,14 +87,17 @@ class Qwen35Block(nn.Module):
         self.mlp = Qwen35MoEModule(cfg)
 
     def __call__(self, x, *, cache=None, state=None, conv_state=None, use_fast=True,
-                 seq_hint=None, sparse=True, topk_override: int | None = None):
+                 seq_hint=None, sparse=True, topk_override: int | None = None,
+                 gdn_wy: bool = False):
         """Forward one block. ``topk_override`` is forwarded to the MoE so the MTP draft head can
         run a lighter MoE (top-1 / top-2) without changing the main-model path (which always uses
         ``cfg.num_experts_per_tok``). Lossless: the main model verifies every drafted token, and
-        only the drafter's routing changes."""
+        only the drafter's routing changes. ``gdn_wy`` selects the chunk-parallel WY/UT
+        Gated-DeltaNet prefill (the long-context driver's fast path; default off = the sequential
+        within-chunk scan, byte-unchanged) — explicitly threaded, no leaked global state (rule 6)."""
         h = self.input_layernorm(x)
         if self.is_linear:
-            y, state, conv_state = self.mixer(h, state=state, conv_state=conv_state)
+            y, state, conv_state = self.mixer(h, state=state, conv_state=conv_state, wy=gdn_wy)
         else:
             y = self.mixer(h, cache=cache, use_fast=use_fast, seq_hint=seq_hint)
         x = x + y

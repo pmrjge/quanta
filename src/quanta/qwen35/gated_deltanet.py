@@ -27,12 +27,26 @@ linear layers. Pipeline (faithful to the HF ``Qwen3NextGatedDeltaNet`` reference
 Three numerically equivalent paths (gated in ``parity/qwen35_forward_test.py``):
 
 * :func:`gdn_recurrence` — the dead-simple O(L) sequential scan (python loop over time). Oracle.
-* :func:`gdn_chunked`    — the chunk-parallel prefill: a bounded loop over fixed-size chunks
+* :func:`gdn_chunked`    — the chunk-carrying prefill: a bounded loop over fixed-size chunks
   carrying the [k_dim, v_dim] state; **within** a chunk the delta rule is still sequential over
-  its ≤chunk tokens (the delta rule's ``Sᵀk`` data-dependence has no segment-sum dual like
-  Mamba-2's scalar-A SSD; chunking just bounds the prefill memory and lets the cross-chunk decay
+  its ≤chunk tokens (chunking just bounds the prefill memory and lets the cross-chunk decay
   fold into one matmul). Output-equivalent to the scan, with state carried for long context.
+* :func:`gdn_chunked_wy` — the chunk-PARALLEL prefill (WY/UT representation, the fla /
+  HF ``torch_chunk_gated_delta_rule`` algorithm): the within-chunk delta rule is folded into
+  batched matmuls over ALL chunks at once via the UT transform ``T = (I − tril(diag(β)KKᵀ⊙Γ))⁻¹``
+  (forward substitution — a bounded loop over the ≤chunk ROWS, run ONCE for the whole sequence,
+  not per chunk), then a bounded cross-chunk state-carry loop of ~6 matmuls per chunk. This is
+  what makes 100K–1M-token prefill feasible (the sequential within-chunk scan is O(L) tiny
+  kernel launches per layer; WY is O(L/C) matmuls). Output-equivalent to the scan (fp32
+  reassociation only — NOT bit-exact); takes the **log** decay (``dt·a``) so extreme decays
+  never round through ``exp`` → 0 → ``log`` (the cumulative-decay differences stay finite).
 * :func:`gdn_step`       — the O(1)-state decode step (one token, vectorized over heads).
+
+Chunked prefill **continuation** (long-context driver): :func:`causal_conv1d` takes an optional
+``state`` (the prior K-1 pre-activation rows) replacing the zero left-pad — bit-exact to the
+full-sequence conv split at any boundary — and :meth:`GatedDeltaNet.__call__` treats
+``conv_state`` given with ``T>1`` as a *prefill continuation* (previously an invalid input that
+silently took token 0 only). Both gated in ``parity/qwen35_prefill_chunked_test.py``.
 
 Assumption (to confirm at the torch-oracle stage, per project methodology): the exact gated-delta
 recurrence uses the **delta correction** ``u = v − Sᵀk`` (Yang et al. 2024 / fla
@@ -174,14 +188,101 @@ def _gdn_chunk(q, k, v, g, beta, s):
     return mx.stack(os, axis=1), s
 
 
-def causal_conv1d(u, weight, bias=None):
+def gdn_chunked_wy(q, k, v, log_g, beta, chunk_size=64, state_in=None):
+    """Chunk-PARALLEL gated-delta-rule prefill (WY/UT representation) — output-equivalent to
+    :func:`gdn_recurrence` / :func:`gdn_chunked` up to fp32 reassociation. Returns (o, state).
+
+    q,k: (B,L,Hk,Dk) — q already l2-normalized AND scaled by ``Dk^-0.5``, k l2-normalized (the
+    mixer's convention; the HF reference applies the scale internally, here the caller does).
+    v: (B,L,Hv,Dv).  log_g, beta: (B,L,Hv) — **log** decay ``dt·a`` (NOT the exponentiated ``g``;
+    log-space keeps the cumulative-decay differences finite under extreme decay) and write
+    strength.  state_in: (B,Hv,Dk,Dv)|None.
+
+    Port of the HF/fla ``torch_chunk_gated_delta_rule`` (the N1-gated reference): per chunk of
+    ``chunk_size`` tokens, the sequential delta rule is folded into matmuls via the UT transform
+    ``T = (I − strictly_lower(diag(β) K Kᵀ ⊙ Γ))⁻¹`` (forward substitution over the ≤chunk rows —
+    a bounded loop run ONCE over ALL chunks batched, the rules' permitted inner block scan), giving
+    the pre-state "new values" ``U = T (β⊙V)`` and decay-folded keys ``W = T (β⊙K⊙exp(Γ))``; then a
+    bounded cross-chunk loop carries the [Dk,Dv] state with ~6 matmuls per chunk. Ragged lengths
+    pad internally (log-decay 0 = identity, β 0 = no write — pad steps are provable no-ops on both
+    the outputs and the carried state). Memory is O(L/C·C²) per head for the decay/UT matrices —
+    the long-context driver bounds L per call (its ``chunk_tokens``), never the full sequence.
+    """
+    out_dtype = v.dtype
+    b, length, hk, dk = q.shape
+    hv, dv = v.shape[2], v.shape[3]
+    rep = hv // hk
+    c = int(chunk_size)
+    # fp32, k-heads repeated under v-heads, head-major [B,Hv,L,D] (the reference layout)
+    q = mx.transpose(_repeat_kheads(q.astype(mx.float32), rep, axis=2), (0, 2, 1, 3))
+    k = mx.transpose(_repeat_kheads(k.astype(mx.float32), rep, axis=2), (0, 2, 1, 3))
+    v = mx.transpose(v.astype(mx.float32), (0, 2, 1, 3))
+    lg = mx.transpose(log_g.astype(mx.float32), (0, 2, 1))                 # [B,Hv,L]
+    bt = mx.transpose(beta.astype(mx.float32), (0, 2, 1))
+    pad = (-length) % c
+    if pad:  # pad to a chunk multiple: log-decay 0 (identity) + beta 0 (no write) ⇒ no-op steps
+        q = mx.pad(q, [(0, 0), (0, 0), (0, pad), (0, 0)])
+        k = mx.pad(k, [(0, 0), (0, 0), (0, pad), (0, 0)])
+        v = mx.pad(v, [(0, 0), (0, 0), (0, pad), (0, 0)])
+        lg = mx.pad(lg, [(0, 0), (0, 0), (0, pad)])
+        bt = mx.pad(bt, [(0, 0), (0, 0), (0, pad)])
+    nc = (length + pad) // c
+    qc = q.reshape(b, hv, nc, c, dk)
+    kc = k.reshape(b, hv, nc, c, dk)
+    vc = v.reshape(b, hv, nc, c, dv)
+    lgc = mx.cumsum(lg.reshape(b, hv, nc, c), axis=-1)     # within-chunk cumulative log decay
+    btc = bt.reshape(b, hv, nc, c)
+    k_beta = kc * btc[..., None]
+    v_beta = vc * btc[..., None]
+    # within-chunk pairwise decay Γ[i,j] = exp(lg_i − lg_j), lower-triangular (diag = 1); the
+    # exp is taken on the tril'd difference (upper entries exp(0)=1) then tril'd again — the
+    # reference's exact two-tril construction.
+    diff = lgc[..., :, None] - lgc[..., None, :]
+    decay = mx.tril(mx.exp(mx.tril(diff)))                                 # [B,Hv,NC,C,C]
+    strict = mx.tril(mx.ones((c, c), dtype=mx.float32), k=-1)              # zero diag + upper
+    attn = -((k_beta @ mx.swapaxes(kc, -1, -2)) * decay) * strict
+    # UT transform: forward substitution inverting (I − strictly-lower) — sequential over the
+    # bounded ≤c rows, batched over ALL chunks at once (slice-assignment; MLX arrays are
+    # functionally updated so the RHS reads the pre-assignment rows).
+    for i in range(1, c):
+        row = attn[..., i, :i]
+        attn[..., i, :i] = row + mx.sum(row[..., None] * attn[..., :i, :i], axis=-2)
+    attn = attn + mx.eye(c, dtype=mx.float32)
+    u_all = attn @ v_beta                                  # T(β⊙V): pre-state "new values"
+    w_all = attn @ (k_beta * mx.exp(lgc)[..., None])       # T(β⊙K⊙exp(Γcum)): decay-folded keys
+    s = (mx.zeros((b, hv, dk, dv), dtype=mx.float32) if state_in is None
+         else state_in.astype(mx.float32))
+    outs = []
+    for ci in range(nc):  # bounded cross-chunk state carry (~6 matmuls per chunk)
+        q_i, k_i, lg_i = qc[:, :, ci], kc[:, :, ci], lgc[:, :, ci]
+        attn_i = (q_i @ mx.swapaxes(k_i, -1, -2)) * decay[:, :, ci]
+        v_new = u_all[:, :, ci] - w_all[:, :, ci] @ s                       # delta vs carried state
+        o_i = (q_i * mx.exp(lg_i)[..., None]) @ s + attn_i @ v_new
+        g_last = lg_i[..., -1]
+        s = (s * mx.exp(g_last)[..., None, None]
+             + mx.swapaxes(k_i * mx.exp(g_last[..., None] - lg_i)[..., None], -1, -2) @ v_new)
+        outs.append(o_i)
+    o = mx.concatenate(outs, axis=2)[:, :, :length]                         # [B,Hv,L,Dv]
+    return mx.transpose(o, (0, 2, 1, 3)).astype(out_dtype), s
+
+
+def causal_conv1d(u, weight, bias=None, state=None):
     """Causal depthwise conv (prefill). u: (B,L,C), weight: (C,K), bias: (C,)|None -> (B,L,C).
 
     Windowed sum over the bounded kernel (K=4); ``mx.conv1d(groups=C)`` is the production swap.
+    ``state`` (B,K-1,C) — the prior K-1 *pre-activation* rows — replaces the zero left-pad for
+    chunked-prefill continuation: bit-exact to the full-sequence conv split at that boundary
+    (identical terms, identical bounded-K summation order). ``None`` = the historical zero pad.
     """
     length = u.shape[1]
     k = weight.shape[-1]
-    up = mx.pad(u, [(0, 0), (k - 1, 0), (0, 0)])  # left-pad K-1 (causal)
+    if state is None:
+        up = mx.pad(u, [(0, 0), (k - 1, 0), (0, 0)])  # left-pad K-1 (causal)
+    else:
+        if state.ndim != 3 or state.shape[1] != k - 1 or state.shape[2] != u.shape[2]:
+            raise ValueError(f"causal_conv1d state must be [B,{k - 1},{u.shape[2]}] "
+                             f"(got {tuple(state.shape)}) — rule 6")
+        up = mx.concatenate([state.astype(u.dtype), u], axis=1)
     y = sum(up[:, i:i + length, :] * weight[:, i] for i in range(k))  # bounded K loop
     return y if bias is None else y + bias
 
@@ -242,21 +343,31 @@ class GatedDeltaNet(nn.Module):
         v = qkv[..., 2 * self.k_dim :].reshape(b, t, self.hv, self.dv)
         return q, k, v
 
-    def __call__(self, x, *, state=None, conv_state=None):
+    def __call__(self, x, *, state=None, conv_state=None, wy=False):
         b, t, _ = x.shape
         a = -mx.exp(self.A_log.astype(mx.float32))                  # (Hv,) < 0
         qkv = self.in_proj_qkv(x)
         dt = _softplus(self.in_proj_a(x).astype(mx.float32) + self.dt_bias.astype(mx.float32))  # (B,T,Hv)
-        g = mx.exp(dt * a[None, None, :])                          # (B,T,Hv) decay in (0,1]
+        log_g = dt * a[None, None, :]                              # (B,T,Hv) log decay (≤ 0)
+        g = mx.exp(log_g)                                          # (B,T,Hv) decay in (0,1]
         beta = mx.sigmoid(self.in_proj_b(x).astype(mx.float32))    # (B,T,Hv)
         z = self.in_proj_z(x).reshape(b, t, self.hv, self.dv)      # output gate (pre-sigmoid/silu)
-        if conv_state is None:  # prefill
+        if conv_state is None or t > 1:  # prefill — fresh, or chunked CONTINUATION (conv_state given)
             qkv_pre = qkv
-            qkv = silu(causal_conv1d(qkv, self.conv_weight, self.conv_bias))
+            qkv = silu(causal_conv1d(qkv, self.conv_weight, self.conv_bias, state=conv_state))
             q, k, v = self._split_qkv(qkv, b, t)
             q, k = _l2norm(q) * (self.dk ** -0.5), _l2norm(k)    # HF scales q by 1/√dk for the readout
-            o, state = self._prefill(q, k, v, g, beta, state)
-            conv_state = qkv_pre[:, -(self.k - 1):]               # for decode continuation
+            o, state = self._prefill(q, k, v, g, beta, state, log_g=log_g, wy=wy)
+            # next conv window: last K-1 PRE-conv rows, left-extended by the prior window (or
+            # zeros) when this block is shorter than K-1 (the t<K-1 edge previously produced a
+            # silently wrong-shaped window).
+            if t >= self.k - 1:
+                conv_state = qkv_pre[:, -(self.k - 1):]
+            else:
+                prev = (conv_state if conv_state is not None
+                        else mx.zeros((b, self.k - 1, self.conv_dim), dtype=qkv_pre.dtype))
+                conv_state = mx.concatenate([prev.astype(qkv_pre.dtype), qkv_pre],
+                                            axis=1)[:, -(self.k - 1):]
         else:  # decode step (t == 1)
             conv_out, conv_state = causal_conv1d_step(qkv[:, 0], self.conv_weight, conv_state,
                                                       self.conv_bias)
@@ -270,7 +381,11 @@ class GatedDeltaNet(nn.Module):
         o = o.reshape(b, t, self.v_dim).astype(x.dtype)
         return self.out_proj(o), state, conv_state
 
-    def _prefill(self, q, k, v, g, beta, state):
+    def _prefill(self, q, k, v, g, beta, state, *, log_g=None, wy=False):
+        if wy:  # chunk-parallel WY/UT path (long-context driver) — needs the LOG decay
+            if log_g is None:
+                raise ValueError("wy prefill needs log_g (the pre-exp decay) — rule 6")
+            return gdn_chunked_wy(q, k, v, log_g, beta, self.chunk, state_in=state)
         length, qc = q.shape[1], self.chunk
         pad = (-length) % qc
         if pad:  # pad to a chunk multiple; g=1,beta=0 -> padded steps are no-ops, sliced off after

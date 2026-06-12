@@ -107,8 +107,33 @@ markup (indistinguishable by text), so serving keeps delegating the shared XML f
 **dispatcher-exclusion that preserves the Nemotron delegation** + pre-opened/explicit/truncated/none
 reasoning + reasoning⊕tool compose) + a conformance/exclusion block in `qwen35_omlx_engine_test`; full
 model-free sweep **100/100** (manifest +1 → 100/51), `tool_parsers_test` Nemotron-delegation still green.
-**Next N3 = 1M needle gate, paged-KV + prefix caching, MInference on the 15 full-attn layers,
-fused/batched GDN decode-step, multi-stream >B=32** over the int4-g64 artifact.
+**N3-3 ✅ (this commit) — long-context chunked-prefill substrate** (the 1M feasibility lever; before it
+NO feasible long prefill existed — serving prefill is per-token O(T) forwards @ **20.4 tok/s** measured
+⇒ 1M ≈ 14 h, the GDN within-chunk scan is a sequential per-token loop, and the mixer couldn't continue
+a prefill across chunks). Additive, default paths byte-unchanged: **(1) `gdn_chunked_wy`** — chunk-
+parallel WY/UT delta-rule prefill, 1:1 MLX port of the HF/fla `torch_chunk_gated_delta_rule` (the N1
+reference; UT forward-substitution over the ≤64 chunk rows ONCE for all chunks batched + ~6 matmuls
+per chunk state carry; takes **log** decay `dt·a` so extreme decay never rounds `exp→0→log`; ==
+`gdn_recurrence` fp32 rel ~1e-6); **(2) prefill continuation** — `causal_conv1d(state=…)` (prior K-1
+pre-activation rows replace the zero pad, **bit-exact** split anywhere) + `GatedDeltaNet` treats
+`conv_state`+`T>1` as continuation (previously silently-wrong input; also fixes the latent `t<K-1`
+conv-window edge); `wy` threaded explicitly `Qwen35Block(gdn_wy=…)` (rule 6, no global state);
+**(3) `chunked_prefill` driver** (`runtime.py` + `prefill_chunked` on both resident models) — one
+bounded forward per chunk into `Qwen35Cache` (`_GDNLayerState.commit_block(n)` new; SDPA
+`mask="causal"` verified bottom-right-aligned Δ 0.0; int8 KV per-token codes chunking-invariant;
+dynamic YaRN resolved ONCE — past native **requires `pin_yarn`**, rule 6; ragged chunks = provable
+no-op pads; non-empty-cache continuation = prefix extension). **Gated**: model-free
+`parity/qwen35_prefill_chunked_test.py` (**28 checks**) + real `parity/nex_n2_pro_prefill_chunked_real.py`
+(SOLO 214.7 GiB): chunked **greedy-exact vs the per-token serving prefill** (WY AND sequential arms;
+|Δlogit| 1.6–2.0 = the batch-M `quantized_matmul` ULP class) + **needle at 50% depth of 32K retrieved
+verbatim**; throughput **193 tok/s @ 1K (9.5×) / 157.8 tok/s @ 32K** (peak 242 GiB) ⇒ 1M prefill ~2 h
+(was ~14 h). Manifest 100/52: new gate added; `nemotron_bake_test` reclassified real-weight via the
+explicit sentinel (it streams the bf16 SOURCE checkpoint via an import the static detector can't see —
+**the bf16 sources are now deleted from `~/models`**, baked artifacts only remain on this box).
+**Next N3 = N3-4 1M needle gate (the YaRN arbiter — past-native needle under pinned dynamic YaRN via
+`prefill_chunked`; ~2 h at the measured rate, consider MInference on the 15 full-attn layers first),
+paged-KV + prefix caching, MInference sparse-prefill, fused/batched GDN decode-step, multi-stream
+>B=32** over the int4-g64 artifact.
 
 **Prior (paused): Nemotron-3-Ultra-550B serving runtime.** (The second agentic-stack model is **deferred to
 MiniMax-M3 when it ships** — **Mellum2 was dropped, its context length is too short**; the `minimax`

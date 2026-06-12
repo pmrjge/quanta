@@ -443,6 +443,17 @@ class Qwen35BatchedResidentModel:
             mx.eval(logits)
         return logits  # [1,1,vocab] at the last consumed position
 
+    def prefill_chunked(self, prompt_ids, state: Qwen35Cache, *, chunk_tokens: int = 4096,
+                        wy: bool = True) -> mx.array:
+        """Long-context single-stream prefill into ``state`` in ``chunk_tokens`` blocks — the
+        feasible path past chat lengths (the per-token :meth:`prefill` is O(T) full forwards).
+        Same contract (returns the last position's logits ``[1,1,vocab]``); decoding then proceeds
+        via :meth:`step_batch`. See :func:`quanta.qwen35.runtime.chunked_prefill` (the shared
+        driver; gated in ``parity/qwen35_prefill_chunked_test.py``)."""
+        from quanta.qwen35.runtime import chunked_prefill   # late: keep from_inner paths light
+        return chunked_prefill(self.layers, self.embed_w, self.norm_w, self.lm_head_w, self.cfg,
+                               prompt_ids, state, chunk_tokens=chunk_tokens, wy=wy)
+
     # --- single-stream callable contract (drop-in for Qwen35ResidentModel.__call__) ----------
     def __call__(self, token_ids, *, caches: Qwen35Cache, offset: int = 0,
                  capture_layers=None) -> mx.array:

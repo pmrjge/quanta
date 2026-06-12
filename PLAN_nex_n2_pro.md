@@ -126,13 +126,65 @@ conv kernel 4, fp32 SSM state; **MoE on all 60 layers**: 512 experts **top-10** 
     `parity/qwen35_omlx_engine_test.py`. Additive only (no existing parser or the dispatcher touched);
     full model-free sweep **100/100**, `tool_parsers_test` (Nemotron delegation) still green. Manifest
     +1 model_free (100/51).
-  - **Remaining N3.** The **1M long-doc / needle gate** (the YaRN arbiter); **paged-KV + prefix
-    caching** (only the 15 full-attn layers hold a KV cache — the 45 linear layers are O(1) recurrent
-    state, so 1M KV is ~4× cheaper than a dense model); **MInference sparse-prefill** on the full-attn
-    layers (InternLM2.5 M0–M10 substrate transfers); **fused/batched Gated-DeltaNet decode step** (the
-    Nemotron `BATCHED_FUSED_SSD_STEP` win, +36% @ B=32, applied to `gdn_step`); push multi-stream
-    batched decode past B=32. **Native-MTP spec-decode is N/A for Nex** (no MTP weights) — an
-    EAGLE-style external drafter is the only B=1 latency path if wanted later.
+  - **N3-3 ✅ — long-context chunked-prefill substrate** (the 1M-window feasibility lever; before
+    this, NO feasible long prefill existed: the serving `prefill` is one-token-at-a-time (O(T) full
+    forwards, measured **20.4 tok/s** ⇒ 32K ≈ 27 min, 1M ≈ 14 h) and the single-shot prefill path
+    holds the whole `[1,T,hidden]` window with no decode cache; the Gated-DeltaNet within-chunk scan
+    is a sequential per-token loop (O(T) tiny kernel launches per layer), and the mixer could not
+    continue a prefill across chunks (the conv window restarted from zero-padding). Four pieces, all
+    additive (default paths byte-unchanged):
+    1. **`gdn_chunked_wy`** (`gated_deltanet.py`) — chunk-parallel WY/UT gated-delta-rule prefill,
+       a 1:1 MLX port of the HF/fla `torch_chunk_gated_delta_rule` (the N1-gated reference): the
+       within-chunk delta rule folds into batched matmuls over ALL chunks at once via the UT
+       transform `T=(I−strictly_lower(diag(β)KKᵀ⊙Γ))⁻¹` (forward substitution over the ≤64 chunk
+       rows, run ONCE for the whole call), then a bounded cross-chunk state-carry loop (~6 matmuls
+       per 64-token chunk). Takes the **log** decay `dt·a` (never rounds through `exp→0→log`;
+       extreme-decay stress gated, g underflowing to exactly 0). == `gdn_recurrence` at fp32 rel
+       ~1e-6–1e-5.
+    2. **Prefill continuation** — `causal_conv1d(state=...)` (the prior K-1 pre-activation rows
+       replace the zero left-pad; **bit-exact** to the full-sequence conv split anywhere) +
+       `GatedDeltaNet.__call__` now treats `conv_state` given with `T>1` as a *prefill
+       continuation* (previously an invalid input that silently took token 0 only); also fixes the
+       latent `t<K-1` fresh-prefill conv-window shape edge. `wy` threaded explicitly
+       `Qwen35Block(gdn_wy=...)` → mixer (no leaked global state, rule 6; default False ⇒ every
+       existing call byte-identical).
+    3. **`chunked_prefill` driver** (`runtime.py`, + `Qwen35ResidentModel.prefill_chunked` /
+       `Qwen35BatchedResidentModel.prefill_chunked`) — consumes a prompt into a `Qwen35Cache` one
+       bounded chunk at a time (default 4096): GDN layers carry `(conv, recurrent)` via
+       `_GDNLayerState.commit_block(n)` (new — offset advances by the block), full-attn layers
+       extend their int8 KV (`mx.fast.scaled_dot_product_attention` `mask="causal"` verified
+       bottom-right-aligned, Δ 0.0). Dynamic YaRN resolved ONCE per request via
+       `caches.yarn_seq(start+T)` — past native it **requires `pin_yarn`** (rule 6). Ragged chunks
+       pad internally with provable no-op steps; continuation onto a non-empty cache = multi-turn
+       prefix extension.
+    4. **Gates.** Model-free `parity/qwen35_prefill_chunked_test.py` (**28 checks**: WY==recurrence
+       ==sequential-chunked incl. ragged/state-carry/extreme-decay; conv continuation BIT-exact;
+       mixer two-chunk == single prefill (seq bit-exact at aligned cuts, ULP at a 1-token tail);
+       driver chunked == single-shot == per-token (`chunk_tokens=1` IS the per-token serving
+       semantics) for seq+WY × aligned+ragged, greedy continuation token-exact; two-call
+       continuation; int8-KV chunked == per-token; YaRN unpinned-past-native raises + pinned ==
+       single-shot; validation fail-loud). Real `parity/nex_n2_pro_prefill_chunked_real.py` (SOLO,
+       214.7 GiB): chunked **greedy-exact vs the per-token serving prefill** (WY arm AND sequential
+       arm, 24-tok traces; |Δlogit| 1.6–2.0 = the documented batch-M `quantized_matmul` ULP class,
+       greedy-stable) and a **needle at 50% depth of a 32K haystack retrieved verbatim** (`739214`
+       + clean `<|endoftext|>` stop). Throughput: **WY chunked prefill 193 tok/s @ 1K / 157.8 tok/s
+       @ 32K** (peak 242.4 GiB) vs per-token 20.4 tok/s — **9.5× @ 1K**, and the WY arm is ~2× the
+       sequential chunked arm (104 tok/s). 1M prefill extrapolates to **~2 h** (was ~14 h) —
+       N3-4 is now feasible. Sweep manifest 100/52 (the new model-free gate added;
+       `nemotron_bake_test` reclassified real-weight via the explicit sentinel — it streams the
+       bf16 SOURCE checkpoint through an import the static detector can't see, and the sources are
+       now deleted from `~/models`, artifacts only).
+  - **Remaining N3.** **N3-4 = the 1M long-doc / needle gate** (the YaRN arbiter — needle past the
+    262144 native window under the pinned dynamic-YaRN factor, `prefill_chunked` + `pin_yarn`;
+    ~2 h at the measured 158 tok/s, attention-quadratic tail will slow late chunks — consider
+    landing MInference sparse-prefill on the 15 full-attn layers first or measuring at 300–400K);
+    **paged-KV + prefix caching** (only the 15 full-attn layers hold KV — the 45 linear layers are
+    O(1) recurrent state, so 1M KV is ~4× cheaper than a dense model; int8 KV @ 1M ≈ 16 GiB);
+    **MInference sparse-prefill** on the full-attn layers (InternLM2.5 M0–M10 substrate transfers);
+    **fused/batched Gated-DeltaNet decode step** (the Nemotron `BATCHED_FUSED_SSD_STEP` win, +36% @
+    B=32, applied to `gdn_step`); push multi-stream batched decode past B=32. **Native-MTP
+    spec-decode is N/A for Nex** (no MTP weights) — an EAGLE-style external drafter is the only B=1
+    latency path if wanted later.
 
 ## N0 — what landed (this commit)
 

@@ -42,7 +42,7 @@ import mlx.nn as nn
 from mlx.utils import tree_flatten
 
 from quanta.qwen35.artifact import Qwen35Artifact
-from quanta.qwen35.attention import Qwen35Attention
+from quanta.qwen35.attention import KVCache, Qwen35Attention
 from quanta.qwen35.config import Qwen35Config
 from quanta.qwen35.decode import Qwen35Cache
 from quanta.qwen35.gated_deltanet import GatedDeltaNet
@@ -202,6 +202,80 @@ def _block_arrays(blk: Qwen35Block) -> list[mx.array]:
     return arrs
 
 
+def _live_state_arrays(caches: Qwen35Cache) -> list[mx.array]:
+    """Every live per-layer state array of a decode cache (KV tensors / GDN conv+recurrent) — the
+    chunked-prefill driver evals these per chunk so the lazy graph stays bounded (the GDN states
+    are NOT ancestors of the residual stream's output and would otherwise accumulate)."""
+    arrs: list[mx.array] = []
+    for lc in caches.layers:
+        if isinstance(lc, KVCache):
+            arrs += [a for a in (lc.k, lc.v, lc.k_q, lc.k_s, lc.k_b,
+                                 lc.v_q, lc.v_s, lc.v_b) if a is not None]
+        else:
+            arrs += [a for a in (lc.conv_state, lc.recurrent_state) if a is not None]
+    return arrs
+
+
+def chunked_prefill(layers, embed_w: mx.array, norm_w: mx.array, lm_head_w: mx.array,
+                    cfg: Qwen35Config, token_ids, caches: Qwen35Cache, *,
+                    chunk_tokens: int = 4096, wy: bool = True,
+                    use_fast: bool = True) -> mx.array:
+    """Long-context prefill: consume ``token_ids`` into ``caches`` in blocks of ``chunk_tokens``;
+    return the LAST position's logits ``[1,1,vocab]`` (the next-token distribution, same contract
+    as :meth:`Qwen35BatchedResidentModel.prefill`).
+
+    The feasibility substrate for the 1M window: the per-token serving prefill is O(T) full
+    forwards (infeasible past chat lengths) and the single-shot prefill path holds the whole
+    ``[1,T,hidden]`` window with no cache to decode from. This driver runs each ``Qwen35Block``
+    over one bounded chunk at a time — full-attention layers extend their (int8) KV cache
+    (``mx.fast.scaled_dot_product_attention`` ``mask="causal"`` is bottom-right aligned, verified),
+    linear-attention layers carry the O(1) ``(conv, recurrent)`` state via the prefill-continuation
+    path — so peak transient memory is O(chunk), the KV grows only on the 15 full layers, and the
+    whole prompt costs ONE forward per chunk.
+
+    ``wy=True`` (default) runs the Gated-DeltaNet chunks through the chunk-parallel WY/UT kernel
+    (:func:`quanta.qwen35.gated_deltanet.gdn_chunked_wy` — O(chunk/64) matmuls instead of O(chunk)
+    sequential tiny-kernel steps per layer; THE long-context lever). ``wy=False`` is the sequential
+    within-chunk scan — bit-exact to the single-shot prefill (chunk boundaries only re-cut the
+    same per-64-token scan; the conv continuation is bit-exact by construction). Both gated in
+    ``parity/qwen35_prefill_chunked_test.py``.
+
+    Dynamic YaRN: the factor is resolved ONCE for the request via ``caches.yarn_seq(start+T)`` —
+    below the native window that is factor 1.0 (same as every per-token path); past it the caller
+    must have pinned ``caches.pin_yarn(prompt+max_new)`` or this raises (rule 6: a drifting factor
+    silently corrupts the rotate-then-cache roped K). A non-empty cache continues from its offset
+    (multi-turn prefix extension). ``chunk_tokens`` need not divide the prompt — ragged chunks pad
+    internally with provable no-op steps (use multiples of 64 to avoid pad waste).
+    """
+    ids = token_ids if isinstance(token_ids, mx.array) else mx.array(token_ids)
+    ids = ids.reshape(-1)
+    total = int(ids.shape[0])
+    if total < 1:
+        raise ValueError("chunked_prefill needs >= 1 token")
+    if chunk_tokens < 1:
+        raise ValueError(f"chunk_tokens must be >= 1 (got {chunk_tokens})")
+    start = caches.offset
+    hint = caches.yarn_seq(start + total, cfg)   # pinned/derived ONCE (raises past native w/o pin)
+    h_last = None
+    for lo in range(0, total, chunk_tokens):
+        chunk = ids[lo:lo + chunk_tokens]
+        tlen = int(chunk.shape[0])
+        h = embed_w[chunk][None]                                   # [1,tlen,hidden] (embed dtype)
+        for i, blk in enumerate(layers):
+            lc = caches[i]
+            if blk.is_linear:
+                h, rec, conv = blk(h, state=lc.recurrent_state, conv_state=lc.conv_state,
+                                   gdn_wy=wy)
+                lc.commit_block(conv, rec, tlen)
+            else:
+                h, _, _ = blk(h, cache=lc, use_fast=use_fast, seq_hint=hint)
+        h_last = h[:, -1:]
+        mx.eval([h_last] + _live_state_arrays(caches))   # bound the lazy graph at one chunk
+        mx.clear_cache()                                 # rule 8: chunk transients do not pool up
+    hh = mx.fast.rms_norm(h_last, norm_w.astype(h_last.dtype), cfg.norm_eps)
+    return hh @ lm_head_w.T.astype(hh.dtype)             # [1,1,vocab]
+
+
 class Qwen35ResidentModel:
     """RAM-resident Qwen3.5 hybrid decoder — prefill via the reference block, decode via cached state.
 
@@ -252,6 +326,14 @@ class Qwen35ResidentModel:
         full-attn layers by default — Kimi pattern (#47); linear-attn layers stay recurrent
         (O(1) state, no benefit from int8)."""
         return Qwen35Cache(self.num_layers, self.cfg, quantized=True)
+
+    def prefill_chunked(self, token_ids, caches: Qwen35Cache, *, chunk_tokens: int = 4096,
+                        wy: bool = True, use_fast: bool = True) -> mx.array:
+        """Long-context chunked prefill into ``caches`` (see :func:`chunked_prefill`); returns the
+        last position's logits ``[1,1,vocab]``. Decode then proceeds via ``__call__(caches=...)``."""
+        return chunked_prefill(self.layers, self.embed_w, self.norm_w, self.lm_head_w, self.cfg,
+                               token_ids, caches, chunk_tokens=chunk_tokens, wy=wy,
+                               use_fast=use_fast)
 
     def embed(self) -> mx.array:
         return self.embed_w
