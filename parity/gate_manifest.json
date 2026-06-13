@@ -55,6 +55,7 @@
     "minimax_decode_attn_test",
     "minimax_kvcache_int8_test",
     "minimax_m3_config_test",
+    "minimax_m3_layer_test",
     "mla_absorbed_sdpa_test",
     "mla_int8_test",
     "moe_chunk_test",

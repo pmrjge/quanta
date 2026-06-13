@@ -1,0 +1,388 @@
+"""MiniMax-M3-VL text decoder block — MLX-native ``mlx.nn`` modules (M1 layer parity).
+
+The runnable reference forward for the M3 text backbone (``MiniMaxM3SparseForCausalLM``): one
+decoder layer built as composed ``mlx.nn`` modules (rule 1) over ``mx.fast`` primitives (rule 2),
+**dense full attention** (the trained block-sparse indexer is inert at ``T <= sparse_topk_blocks *
+sparse_block_size`` ⇒ sparse == dense at short context, so parity is established dense-first; the
+indexer is the long-context serving lever — M3). It is **additive**: the sibling M2.7
+``quanta.minimax.model`` / ``moe`` / ``attention`` modules (a DIFFERENT architecture) are untouched.
+
+Architecture (empirically grounded — ``config_m3`` + the real checkpoint headers/values, see the M0
+fit-test and the M1 layer gate). M3 = the MiniMax-M2 backbone (transformers ``minimax_m2``:
+sigmoid-noaux MoE, per-(q/k) RMSNorm, partial rotate-half RoPE) **plus** five deltas, each pinned
+against an authoritative sibling:
+
+* **Per-head QK-norm** (``qk_norm_type="per_head"``): RMSNorm of width ``head_dim`` applied to q,k
+  AFTER the reshape to ``[B,T,H,head_dim]`` and BEFORE RoPE (≈ ``quanta.qwen35``), NOT M2's
+  full-width pre-reshape norm.
+* **Gemma ``(1 + weight)`` RMSNorm** (``use_gemma_norm``) on EVERY norm — input/post-attention/
+  final layer norms AND the per-head q/k norms AND the indexer norms. The fold is applied at LOAD
+  time (:func:`one_plus`); the forward runs plain ``weight * normed`` (the ``quanta.qwen35``
+  convention). [PINNED: a single ``use_gemma_norm`` flag ⇒ uniform ``(1+w)``; the decisive check is
+  the M2 teacher-forced ppl arbiter — a wrong fold degrades ppl uniformly.]
+* **Clamped SwiGLU-OpenAI** activation (``hidden_act="swigluoai"``, ``swiglu_alpha=1.702``,
+  ``swiglu_limit=7.0``) for the dense FFN AND the experts AND the shared expert — :func:`swigluoai`,
+  byte-pinned to ``transformers`` ``GptOssExperts._apply_gate`` (w1=gate→swish branch, w3=up→
+  ``(up+1)`` branch, w2=down).
+* **Router ``* routed_scaling_factor`` (2.0) + a shared expert** on top of the M2 sigmoid-noaux
+  router — :func:`route_noaux`, identical math to the parity-gated ``quanta.nemotron`` / ``dsv4``
+  router (sigmoid; bias added for SELECTION only; weights gathered from the pure sigmoid; renorm;
+  scale). No DeepSeek group machinery (M3 has no ``n_group``/``topk_group``).
+* The shared expert has **no scalar gate** (the checkpoint ships no ``shared_expert_gate`` — rule-6
+  coverage is exact without one), unlike Qwen2-MoE / qwen35.
+
+Two output-equivalent routed paths are gated (rule 4): the dense oracle (run every expert, mask) and
+the sparse ``mx.gather_mm`` dispatch; the packed-int6 ``mx.gather_qmm`` resident sibling is added at
+the bake/serving milestones (M2/M3) on the SAME codes.
+"""
+
+from __future__ import annotations
+
+import mlx.core as mx
+import mlx.nn as nn
+
+from quanta.minimax.config_m3 import MiniMaxM3Config
+
+# ----------------------------------------------------------------------------- #
+# Norms / RoPE helpers (self-contained; mirror the parity-gated quanta.qwen35).
+# ----------------------------------------------------------------------------- #
+
+
+def one_plus(w: mx.array) -> mx.array:
+    """Gemma ``(1 + weight)`` RMSNorm fold (``use_gemma_norm``). The loader applies this so the
+    forward can run plain ``weight * normed`` (``mx.fast.rms_norm`` / :func:`rms_norm`). Applies to
+    every M3 RMSNorm — input/post-attention/final + per-head q/k + indexer norms. Kept in the source
+    dtype (bf16)."""
+    return w + 1.0
+
+
+def rms_norm(x: mx.array, w: mx.array, eps: float) -> mx.array:
+    """Weighted RMSNorm over the last axis, computed in fp32 (per-head q/k norm path). ``w`` is the
+    already-``(1+w)``-folded weight."""
+    xf = x.astype(mx.float32)
+    xf = xf * mx.rsqrt(mx.mean(xf * xf, axis=-1, keepdims=True) + eps)
+    return (w.astype(mx.float32) * xf).astype(x.dtype)
+
+
+def inv_freq(rotary_dim: int, theta: float) -> mx.array:
+    """Plain (no-YaRN) partial-RoPE inverse frequencies for the rotated dims, ``[rotary_dim//2]``.
+    M3 declares no rope-scaling, so this is the textbook ``1/theta**(2i/rotary_dim)``."""
+    idx = mx.arange(0, rotary_dim, 2, dtype=mx.float32)
+    return 1.0 / (theta ** (idx / rotary_dim))
+
+
+def rope_fast(x: mx.array, inv: mx.array, rd: int, offset: int) -> mx.array:
+    """``mx.fast.rope`` rotate-half over the first ``rd`` dims (the rest pass through). mlx ``freqs``
+    is the *period* (angle = pos/freqs) ⇒ pass ``1/inv``; ``traditional=False`` is the rotate-half
+    (split-half: dim ``i`` pairs with ``i+rd/2``) variant MiniMax/Qwen use (HF ``rotate_half``)."""
+    return mx.fast.rope(x, dims=rd, traditional=False, base=None, scale=1.0, offset=offset,
+                        freqs=1.0 / inv)
+
+
+def rope_explicit(x: mx.array, inv: mx.array, rd: int, offset: int) -> mx.array:
+    """Explicit rotate-half RoPE on the first ``rd`` dims — the short-sequence reference for
+    :func:`rope_fast`. ``x`` ``[B,H,T,D]``."""
+    b, h, t, d = x.shape
+    pos = (mx.arange(t, dtype=mx.float32) + offset)[:, None]
+    ang = pos * inv[None, :]
+    cos = mx.cos(ang)[None, None]
+    sin = mx.sin(ang)[None, None]
+    xr = x[..., :rd]
+    x1, x2 = xr[..., : rd // 2], xr[..., rd // 2:]
+    o1 = x1 * cos - x2 * sin
+    o2 = x2 * cos + x1 * sin
+    rot = mx.concatenate([o1, o2], axis=-1)
+    return mx.concatenate([rot, x[..., rd:]], axis=-1)
+
+
+def causal_mask(q_len: int, kv_len: int, dtype: mx.Dtype) -> mx.array:
+    """Lower-right causal additive mask (query j at abs pos ``kv_len-q_len+j``)."""
+    off = kv_len - q_len
+    j = mx.arange(q_len)[:, None]
+    i = mx.arange(kv_len)[None, :]
+    return mx.where(i <= j + off, mx.array(0.0, dtype), mx.array(float("-inf"), dtype))
+
+
+# ----------------------------------------------------------------------------- #
+# Clamped SwiGLU-OpenAI activation (gpt-oss).
+# ----------------------------------------------------------------------------- #
+
+
+def swigluoai(gate: mx.array, up: mx.array, alpha: float, limit: float) -> mx.array:
+    """Clamped SwiGLU-OAI, byte-pinned to ``transformers`` ``GptOssExperts._apply_gate``:
+
+        gate = clamp(gate, max=limit)        # upper-clamped only (min=None)
+        up   = clamp(up, -limit, +limit)
+        glu  = gate * sigmoid(alpha * gate)  # swish with learnable-style alpha
+        out  = (up + 1) * glu
+
+    ``gate`` = the w1 (swish) branch, ``up`` = the w3 (linear ``(up+1)`` multiplier) branch — both
+    ``[..., inter]`` post-projection. Computed in fp32 for numerical stability across the clamp
+    (the activation is precision-sensitive; the reference oracle matches in fp32)."""
+    g = gate.astype(mx.float32)
+    u = up.astype(mx.float32)
+    g = mx.minimum(g, limit)                 # clamp(max=limit), no lower bound
+    u = mx.clip(u, -limit, limit)
+    glu = g * mx.sigmoid(alpha * g)
+    return (u + 1.0) * glu
+
+
+# ----------------------------------------------------------------------------- #
+# Routing (sigmoid noaux_tc + bias; == quanta.nemotron / dsv4).
+# ----------------------------------------------------------------------------- #
+
+
+def route_noaux(xf: mx.array, gate_w: mx.array, bias: mx.array, cfg: MiniMaxM3Config,
+                ) -> tuple[mx.array, mx.array]:
+    """Top-k sigmoid-noaux routing. ``xf`` ``[N,hidden]`` → ``(idx [N,topk] int32, w [N,topk] f32)``.
+
+    The MiniMax-M2 / DeepSeek-noaux scheme (no group machinery): score by ``sigmoid(logits)``, add
+    the correction ``bias`` for SELECTION only, gather the top-k weights from the PURE sigmoid
+    (without bias), renormalize (``norm_topk_prob``), then scale by ``routed_scaling_factor``. ``gate_w``
+    ``[E,hidden]`` and ``bias`` ``[E]`` are fp32 in the checkpoint; the matmul runs fp32."""
+    topk = cfg.num_experts_per_tok
+    logits = xf.astype(mx.float32) @ gate_w.astype(mx.float32).T          # [N, E]
+    scores = mx.sigmoid(logits)
+    choice = scores + bias.astype(mx.float32)[None]                       # bias: selection only
+    idx = mx.argpartition(-choice, kth=topk - 1, axis=-1)[:, :topk].astype(mx.int32)
+    w = mx.take_along_axis(scores, idx, axis=-1)                          # weights: pure sigmoid
+    if cfg.norm_topk_prob:
+        w = w / (mx.sum(w, axis=-1, keepdims=True) + 1e-20)
+    return idx, w * cfg.routed_scaling_factor
+
+
+# ----------------------------------------------------------------------------- #
+# Attention — GQA + per-head QK-norm + partial RoPE (dense full attention).
+# ----------------------------------------------------------------------------- #
+
+
+class KVCache:
+    """Plain GQA KV cache: ``[B, n_kv, S, head_dim]`` k/v, grown along the seq axis. bf16 (the M1
+    parity path); int8 KV is the M3 serving lever."""
+
+    def __init__(self) -> None:
+        self.k: mx.array | None = None
+        self.v: mx.array | None = None
+
+    @property
+    def offset(self) -> int:
+        return 0 if self.k is None else self.k.shape[2]
+
+    def update(self, k: mx.array, v: mx.array) -> tuple[mx.array, mx.array]:
+        if self.k is None:
+            self.k, self.v = k, v
+        else:
+            self.k = mx.concatenate([self.k, k], axis=2)
+            self.v = mx.concatenate([self.v, v], axis=2)
+        return self.k, self.v
+
+
+class MiniMaxM3Attention(nn.Module):
+    """GQA full attention: per-head QK-norm (before RoPE) + partial rotate-half RoPE, no output gate.
+
+    Dense at short context (the trained sparse indexer ``index_{q,k}_*`` is loaded by policy but
+    consumed only by the M3 long-context sparse path — inert here because top-k blocks == all blocks
+    at ``T <= sparse_topk_blocks*sparse_block_size``)."""
+
+    def __init__(self, cfg: MiniMaxM3Config) -> None:
+        super().__init__()
+        self.cfg = cfg
+        self.nh = cfg.num_attention_heads          # 64
+        self.nkv = cfg.num_key_value_heads         # 4
+        self.hd = cfg.head_dim                     # 128
+        self.rep = cfg.n_rep                       # 16
+        self.rd = cfg.rotary_dim                   # 64
+        self.scale = cfg.attn_scale                # head_dim**-0.5
+        self.eps = cfg.norm_eps
+        self.q_proj = nn.Linear(cfg.hidden_size, cfg.q_dim, bias=False)
+        self.k_proj = nn.Linear(cfg.hidden_size, cfg.kv_dim, bias=False)
+        self.v_proj = nn.Linear(cfg.hidden_size, cfg.kv_dim, bias=False)
+        self.o_proj = nn.Linear(cfg.q_dim, cfg.hidden_size, bias=False)
+        self.q_norm = mx.ones((self.hd,))          # (1+w)-folded by the loader
+        self.k_norm = mx.ones((self.hd,))
+        self._inv = inv_freq(self.rd, cfg.rope_theta)
+
+    def _project(self, x):
+        b, t, _ = x.shape
+        q = self.q_proj(x).reshape(b, t, self.nh, self.hd)
+        k = self.k_proj(x).reshape(b, t, self.nkv, self.hd)
+        v = self.v_proj(x).reshape(b, t, self.nkv, self.hd)
+        q = rms_norm(q, self.q_norm, self.eps)                 # per-head QK-norm BEFORE RoPE
+        k = rms_norm(k, self.k_norm, self.eps)
+        q = mx.transpose(q, (0, 2, 1, 3))                      # [B,H,T,D]
+        k = mx.transpose(k, (0, 2, 1, 3))
+        v = mx.transpose(v, (0, 2, 1, 3))
+        return q, k, v
+
+    def __call__(self, x, *, cache=None, use_fast=True):
+        b, t, _ = x.shape
+        offset = cache.offset if cache is not None else 0
+        q, k, v = self._project(x)
+        rope = rope_fast if use_fast else rope_explicit
+        q = rope(q, self._inv, self.rd, offset)
+        k = rope(k, self._inv, self.rd, offset)
+        if cache is not None:
+            k, v = cache.update(k, v)
+        kv_len = k.shape[2]
+        kr = mx.repeat(k, self.rep, axis=1)                    # GQA: kv head -> its query group
+        vr = mx.repeat(v, self.rep, axis=1)
+        if use_fast:
+            mask = "causal" if t > 1 else None
+            out = mx.fast.scaled_dot_product_attention(q, kr, vr, scale=self.scale, mask=mask)
+        else:
+            scores = (q @ mx.swapaxes(kr, -1, -2)) * self.scale + causal_mask(t, kv_len, q.dtype)
+            wts = mx.softmax(scores.astype(mx.float32), axis=-1).astype(q.dtype)
+            out = wts @ vr
+        out = mx.transpose(out, (0, 2, 1, 3)).reshape(b, t, self.nh * self.hd)
+        return self.o_proj(out)
+
+
+# ----------------------------------------------------------------------------- #
+# Dense FFN (layers 0-2) — clamped SwiGLU.
+# ----------------------------------------------------------------------------- #
+
+
+class MiniMaxM3DenseMLP(nn.Module):
+    """Dense feed-forward (layers 0-2): clamped-SwiGLU ``down( swigluoai(gate(x), up(x)) )``, width
+    ``dense_intermediate_size``."""
+
+    def __init__(self, cfg: MiniMaxM3Config) -> None:
+        super().__init__()
+        self.cfg = cfg
+        di = cfg.dense_intermediate_size
+        self.gate_proj = nn.Linear(cfg.hidden_size, di, bias=False)
+        self.up_proj = nn.Linear(cfg.hidden_size, di, bias=False)
+        self.down_proj = nn.Linear(di, cfg.hidden_size, bias=False)
+
+    def __call__(self, x):
+        h = swigluoai(self.gate_proj(x), self.up_proj(x), self.cfg.swiglu_alpha, self.cfg.swiglu_limit)
+        return self.down_proj(h.astype(x.dtype))
+
+
+# ----------------------------------------------------------------------------- #
+# MoE (layers 3-59) — noaux router + clamped-SwiGLU experts + shared expert.
+# ----------------------------------------------------------------------------- #
+
+
+def _routed_sparse(xf: mx.array, idx: mx.array, gate_up: mx.array, down: mx.array,
+                   inter: int, alpha: float, limit: float) -> mx.array:
+    """Sparse routed clamped-SwiGLU via ``mx.gather_mm`` over pre-stacked experts (rule 7).
+
+    ``xf`` ``[N,hidden]``; ``idx`` ``[N,topk]``; ``gate_up`` ``[E,2*inter,hidden]`` (w1 stacked over
+    w3); ``down`` ``[E,hidden,inter]`` (w2). Returns per-(token,slot) outputs ``[N,topk,hidden]``."""
+    n, hidden = xf.shape
+    topk = idx.shape[1]
+    mc = n * topk
+    exp = idx.reshape(-1)
+    tok = mx.repeat(mx.arange(n, dtype=mx.int32), topk)
+    col = xf[:, :, None].astype(gate_up.dtype)                            # [N, hidden, 1]
+    gu = mx.gather_mm(gate_up, col, lhs_indices=exp, rhs_indices=tok)[:, :, 0]   # [mc, 2*inter]
+    h = swigluoai(gu[:, :inter], gu[:, inter:], alpha, limit)             # [mc, inter] (fp32)
+    h = h[:, :, None].astype(down.dtype)
+    d = mx.gather_mm(down, h, lhs_indices=exp, rhs_indices=mx.arange(mc, dtype=mx.int32))[:, :, 0]
+    return d.reshape(n, topk, hidden)
+
+
+def _routed_dense(xf: mx.array, idx: mx.array, w: mx.array, gate_up: mx.array, down: mx.array,
+                  inter: int, alpha: float, limit: float) -> mx.array:
+    """Dense oracle: run EVERY expert on every token, combine only the top-k. Parity reference for
+    :func:`_routed_sparse` (small E only)."""
+    n, hidden = xf.shape
+    e = gate_up.shape[0]
+    xd = xf.astype(gate_up.dtype)
+    gu = mx.einsum("nh,eoh->neo", xd, gate_up)                            # [N, E, 2*inter]
+    h = swigluoai(gu[..., :inter], gu[..., inter:], alpha, limit)         # [N, E, inter]
+    d = mx.einsum("nei,ehi->neh", h.astype(down.dtype), down)            # [N, E, hidden]
+    gates = mx.zeros((n, e), dtype=mx.float32)
+    rows = mx.repeat(mx.arange(n, dtype=mx.int32), idx.shape[1])
+    gates[rows, idx.reshape(-1)] = w.reshape(-1).astype(mx.float32)
+    return mx.sum(d.astype(mx.float32) * gates[:, :, None], axis=1)       # [N, hidden]
+
+
+class MiniMaxM3MoE(nn.Module):
+    """Sparse MoE: 128 routed experts top-4 (noaux sigmoid) + 1 shared expert, clamped-SwiGLU.
+
+    Routed experts are held pre-stacked ``[E, 2*inter, hidden]`` (gate_up = w1 over w3) and
+    ``[E, hidden, inter]`` (down = w2), ``gather_mm``-ready. The shared expert is a plain
+    clamped-SwiGLU MLP (NO scalar gate), added to the routed sum. Router ``gate``/``bias`` are
+    fp32."""
+
+    def __init__(self, cfg: MiniMaxM3Config) -> None:
+        super().__init__()
+        self.cfg = cfg
+        h, e = cfg.hidden_size, cfg.num_local_experts
+        inter, si = cfg.moe_intermediate_size, cfg.shared_intermediate_size
+        self.gate = mx.zeros((e, h), dtype=mx.float32)
+        self.e_score_correction_bias = mx.zeros((e,), dtype=mx.float32)
+        self.experts_gate_up = mx.zeros((e, 2 * inter, h))   # [E, 2*inter, h] (w1 over w3)
+        self.experts_down = mx.zeros((e, h, inter))          # [E, h, inter]   (w2)
+        self.shared_gate_proj = mx.zeros((si, h))
+        self.shared_up_proj = mx.zeros((si, h))
+        self.shared_down_proj = mx.zeros((h, si))
+        self.token_chunk = 8192
+
+    def set_experts(self, gate_up: mx.array, down: mx.array) -> None:
+        self.experts_gate_up, self.experts_down = gate_up, down
+
+    def _shared(self, xf: mx.array) -> mx.array:
+        """Shared clamped-SwiGLU expert (no scalar gate). ``xf`` ``[N,hidden]`` -> ``[N,hidden]`` fp32."""
+        xd = xf.astype(self.shared_gate_proj.dtype)
+        h = swigluoai(xd @ self.shared_gate_proj.T, xd @ self.shared_up_proj.T,
+                      self.cfg.swiglu_alpha, self.cfg.swiglu_limit)        # [N, si] fp32
+        return h.astype(self.shared_down_proj.dtype) @ self.shared_down_proj.T
+
+    def __call__(self, x, *, sparse: bool = True):
+        b, s, hidden = x.shape
+        n = b * s
+        inter = self.cfg.moe_intermediate_size
+        alpha, limit = self.cfg.swiglu_alpha, self.cfg.swiglu_limit
+        xf = x.reshape(n, hidden)
+        idx, w = route_noaux(xf, self.gate, self.e_score_correction_bias, self.cfg)
+        if sparse:
+            chunk = self.token_chunk if self.token_chunk and self.token_chunk > 0 else n
+            multi = n > chunk
+            parts = []
+            for c0 in range(0, n, chunk):  # bounded chunked-prefill loop; experts stay vectorized
+                c1 = min(c0 + chunk, n)
+                slots = _routed_sparse(xf[c0:c1], idx[c0:c1], self.experts_gate_up,
+                                       self.experts_down, inter, alpha, limit)  # [nc, topk, hidden]
+                rc = mx.sum(slots.astype(mx.float32) * w[c0:c1][:, :, None], axis=1)
+                parts.append(rc)
+                if multi:
+                    mx.eval(rc)
+            routed = parts[0] if not multi else mx.concatenate(parts, axis=0)
+        else:
+            routed = _routed_dense(xf, idx, w, self.experts_gate_up, self.experts_down,
+                                   inter, alpha, limit)
+        y = routed.astype(mx.float32) + self._shared(xf).astype(mx.float32)
+        return y.astype(x.dtype).reshape(b, s, hidden)
+
+
+# ----------------------------------------------------------------------------- #
+# Decoder block.
+# ----------------------------------------------------------------------------- #
+
+
+class MiniMaxM3Block(nn.Module):
+    """One decoder layer: ``x + attn(in_norm(x))`` then ``x + ffn(post_norm(x))``.
+
+    ``ffn`` is :class:`MiniMaxM3DenseMLP` on layers 0-2 (``cfg.is_dense_layer``) and
+    :class:`MiniMaxM3MoE` on layers 3-59 (``cfg.is_moe_layer``). Norms are Gemma ``(1+w)`` RMSNorm
+    (the loader folds ``+1`` into ``.weight``)."""
+
+    def __init__(self, cfg: MiniMaxM3Config, layer_id: int) -> None:
+        super().__init__()
+        self.cfg = cfg
+        self.layer_id = layer_id
+        self.is_moe = cfg.is_moe_layer(layer_id)
+        self.input_layernorm = nn.RMSNorm(cfg.hidden_size, eps=cfg.norm_eps)
+        self.post_attention_layernorm = nn.RMSNorm(cfg.hidden_size, eps=cfg.norm_eps)
+        self.self_attn = MiniMaxM3Attention(cfg)
+        self.mlp = MiniMaxM3MoE(cfg) if self.is_moe else MiniMaxM3DenseMLP(cfg)
+
+    def __call__(self, x, *, cache=None, use_fast=True, sparse=True):
+        y = self.self_attn(self.input_layernorm(x), cache=cache, use_fast=use_fast)
+        x = x + y
+        h = self.post_attention_layernorm(x)
+        y = self.mlp(h, sparse=sparse) if self.is_moe else self.mlp(h)
+        return x + y

@@ -33,12 +33,20 @@ model-free / header-only (no 809 GB load): `config_m3.MiniMaxM3Config` (nested t
 `(200020,)`, MTP refine 7→0, per-layer dense/MoE + sparse-attn typing) + `quant_policy_m3` (key→scheme
 + resident projection). Coverage proven exact vs the real index (rule 6): **23,416 tensors = 1108
 dense / 420 int8 / 21,888 expert_int**; **int6-g64 = 329.6 GiB resident** (160.8 GiB headroom under
-490.4; int4 ref 233.4). Gates: `parity/minimax_m3_fit_test.py` (real-path SOLO, headers only, 13
-checks) + `parity/minimax_m3_config_test.py` (model-free, 24 checks). Manifest 101 model_free / 53
-real_weight. **Next = M1 layer parity** vs an independent reference (GQA/clamped-SwiGLU dense FFN/
-sigmoid-MoE+shared/block), then M2 int6 bake + ppl arbiter, then M3 serving (resident batched re-gate,
-oMLX shim incl. multimodal image input + `<mm:think>` reasoning + MiniMax nested-XML tool parser,
-paged-KV + prefix caching, trained block-sparse long-context lever, chunked prefill, multi-stream).
+490.4; int4 ref 233.4). **M1a ✅ (this commit)** — module + model-free layer parity
+(`model_m3.py` + `parity/minimax_m3_layer_test.py`, 12 checks). No HF/sglang M3 forward exists
+(checkpoint ships only `configuration_*.py`), so risky formulas are pinned to transformers SIBLINGS,
+isolated: **clamped SwiGLU-OAI == `GptOssExperts._apply_gate`** (w1=gate/swish, w3=up, w2=down;
+α=1.702/limit=7.0), **sigmoid-noaux router == `MiniMaxM2TopKRouter` + `routed_scaling_factor` 2.0**
+(no DeepSeek groups), **partial RoPE == `minimax_m2.apply_rotary_pos_emb`** (no YaRN); **Gemma `(1+w)`
+applies to ALL non-gated norms** (empirically: q/k/index norms 0-centered) and the **shared expert has
+NO scalar gate** (no `shared_expert_gate` key). Full block + MoE-sparse==dense + fast==naive vs a
+numpy-fp64 ref. Gates: `minimax_m3_fit_test` (SOLO, 13) + `minimax_m3_config_test` (24) +
+`minimax_m3_layer_test` (model-free, 12). Manifest 102 model_free / 53 real_weight. **Next = M1b
+real-weight at-scale layer parity** (load real L0+L3, fp32 mx vs numpy-fp64, rule 8), then M2 int6
+bake + ppl arbiter, then M3 serving (resident batched re-gate, oMLX shim incl. multimodal image input
++ `<mm:think>` reasoning + MiniMax nested-XML tool parser, paged-KV + prefix caching, trained
+block-sparse long-context lever, chunked prefill, multi-stream).
 
 The rest of the served fleet is **complete, shipped, and parity-gated**. Per-model resident sizes are
 in the Serving throughput table below; the detailed milestone handovers live in the `PLAN_*.md` files

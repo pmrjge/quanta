@@ -71,14 +71,34 @@ source is gone from disk). So M3 is a **real build**, not validate-at-scale. The
   headers only, **13 checks** — int6 329.6 GiB fits, coverage exact, header acct <1%) +
   `parity/minimax_m3_config_test.py` (model-free, **24 checks** — synthetic checkpoints). Manifest
   101 model_free / 53 real_weight.
-- **M1 — layer parity @ scale vs an independent reference**, SOLO / layer-streamed (rule 8). Build:
-  GQA attention (partial RoPE + per-head QK-norm + Gemma `(1+w)`; dense full-attn — indexer inert at
-  short ctx), dense FFN (clamped SwiGLU-OAI), MoE (sigmoid noaux_tc + bias + routed_scaling 2.0 +
-  top-4 + shared expert, clamped-SwiGLU experts), block (1+w norms + residual wiring). Reference:
-  `transformers` if it ships `minimax_m3_vl` (`trust_remote_code` from the bundled modeling file),
-  else an independent inline `mx` reference from the modeling source. RISK: confirm the clamped-
-  SwiGLU formula and the sigmoid-router renorm (`norm_topk_prob`) against the reference (settled-
-  findings: assuming DeepSeek parity once cost the int4 offset-binary bug).
+- **M1a ✅ — module + model-free layer parity** (`src/quanta/minimax/model_m3.py` +
+  `parity/minimax_m3_layer_test.py`, **12 checks**). The checkpoint ships **no modeling file** (only
+  `configuration_minimax_m3_vl.py`; `auto_map` has `AutoConfig` only) and the comment says it mirrors
+  **sglang** (not installed) — so there is NO `transformers`/`trust_remote_code` M3 forward. Instead
+  the risky formulas are pinned to AUTHORITATIVE transformers SIBLINGS in isolated single-call checks,
+  and the full block is cross-checked against a pure-numpy-fp64 reference:
+  - **clamped SwiGLU-OAI** == `transformers` `GptOssExperts._apply_gate` (`gate=clamp(g,max=limit);
+    up=clamp(u,±limit); (up+1)·(g·σ(α·g))`; w1=gate/swish, w3=up, w2=down; M3's α=1.702/limit=7.0
+    ARE gpt-oss's). **NOT** a registered `swigluoai` HF activation — gpt-oss is the formula.
+  - **sigmoid-noaux router** == `transformers` `MiniMaxM2TopKRouter` (sigmoid; bias for SELECTION
+    only; weights gathered from the PURE sigmoid; renorm) **+ the M3 `routed_scaling_factor` 2.0**
+    (M2 has none). **No DeepSeek group machinery** (M3 config has no `n_group`/`topk_group`) ⇒ the
+    nemotron/dsv4 in-tree router path, not deepseek_v3's.
+  - **partial rotate-half RoPE** == `minimax_m2.apply_rotary_pos_emb` (rotary_dim 64, θ=5e6, NO YaRN).
+  - **Gemma `(1+w)`** confirmed empirically: ALL non-gated RMSNorms apply `(1+w)` (one `use_gemma_norm`
+    flag) — the per-head q/k + index norms are tightly 0-centered (~+0.15 ⇒ eff ~1.15), the
+    input/post/final norms are varied learned scales; the `(1+w)` fold is at LOAD time. [PINNED; the
+    decisive arbiter is M2 ppl — a wrong fold degrades it uniformly.]
+  - **Shared expert has NO scalar gate** (the checkpoint ships no `shared_expert_gate`; rule-6
+    coverage is exact without one) — unlike Qwen2-MoE / qwen35.
+  Also gated (rule 4): MoE dense oracle == sparse `gather_mm`; `use_fast` (mx.fast rope+SDPA) ==
+  naive attention. Model-free (synthetic dims), runs in the sweep under the `reference` extra
+  (peak RSS 0.32 GiB). Manifest 102 model_free / 53 real_weight.
+- **M1b — layer parity @ scale (real weights), SOLO / layer-streamed (rule 8).** Load real layer-0
+  (dense) + layer-3 (first MoE, carries the indexer) from the 796 GB checkpoint, run the
+  `model_m3` block in fp32, diff vs a pure-numpy-fp64 reference on the SAME dequantized weights +
+  input — validates loading + real-shape/dtype wiring at scale (64q/4kv, 128 experts, dense_inter
+  12288). Reference is numpy (the formulas are already pinned to transformers in M1a).
 - **M2 — bake int6-g64** (self-contained artifact: relative refs only, declares the 1M window,
   synthesizes `generation_config.json` eos [200020], copies tokenizer; data-free RTN; one layer
   resident at a time, rule 8). Teacher-forced **ppl arbiter** (the e2e arbiter, methodology #4) on
