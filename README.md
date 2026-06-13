@@ -17,13 +17,15 @@ Read in this order:
 
 1. **[CLAUDE.md](CLAUDE.md)** — master context: permanent engineering rules (1–8), settled
    findings, model facts, parity-first methodology, verification commands, the measured serving
-   fleet baseline, and the **Active task** paragraph (current = Nex-N2-Pro / Qwen3.5-397B N3).
-2. **[PLAN_nex_n2_pro.md](PLAN_nex_n2_pro.md)** — the **active task's** full handover.
-3. The other `PLAN_*.md` — durable handovers for completed / paused tracks
-   ([PLAN_nemotron_ultra.md](PLAN_nemotron_ultra.md), [PLAN_minference.md](PLAN_minference.md),
-   [PLAN.md](PLAN.md) (#18), [PLAN_153.md](PLAN_153.md), [PLAN_qwen35_experts.md](PLAN_qwen35_experts.md)).
-4. **[INITIAL_PROMPT.md](INITIAL_PROMPT.md)** — the original project brief.
-5. **`.claude/memory/`** — the agent "brain" snapshot (settled findings, user profile, per-task
+   fleet baseline, and the **Current state** section (fleet complete; next model = MiniMax-M3 when
+   it ships; Kimi/GLM/DSV4-Pro and the Nex N3 tail are dropped).
+2. The `PLAN_*.md` files — durable handovers for the completed serving tracks
+   ([PLAN_nex_n2_pro.md](PLAN_nex_n2_pro.md), [PLAN_nemotron_ultra.md](PLAN_nemotron_ultra.md),
+   [PLAN_minference.md](PLAN_minference.md), [PLAN.md](PLAN.md) (#18), [PLAN_153.md](PLAN_153.md),
+   [PLAN_qwen35_experts.md](PLAN_qwen35_experts.md)). No plan exists yet for MiniMax-M3 — open
+   `PLAN_minimax_m3.md` when its weights land.
+3. **[INITIAL_PROMPT.md](INITIAL_PROMPT.md)** — the original project brief.
+4. **`.claude/memory/`** — the agent "brain" snapshot (settled findings, user profile, per-task
    records). Restore it on a fresh machine (below); index is `.claude/memory/MEMORY.md`.
 
 ---
@@ -90,8 +92,7 @@ fleet (resident sizes from CLAUDE.md's baseline table):
 | **InternLM2.5-7B** (dense GQA, 1M ctx) | `internlm2_5-7b-chat-1m` | int8-g64 bake | `…-quanta_int8g64` — 9 GiB |
 
 Exact source HF ids and the per-model bake recipes are encoded in the `parity/run_bake_*.py`
-scripts and `src/quanta/bake/`. **Keep `~/models/Kimi-K2.6`** — the int4 reference teacher; never
-delete (CLAUDE.md). Baked artifacts are immutable, self-contained bundles (relative in-artifact
+scripts and `src/quanta/bake/`. Baked artifacts are immutable, self-contained bundles (relative in-artifact
 refs only); runtime offload state lives in the sibling `<artifact>_offload`, never inside.
 
 ---
