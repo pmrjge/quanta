@@ -1,4 +1,4 @@
-# PLAN — MiniMax-M3-VL serving runtime + int6 bake (full VL)
+# PLAN — MiniMax-M3-VL serving runtime + int4-g64 bake + vision track (full VL)
 
 Handover for the **MiniMax-M3-VL** build. Single-thread cadence (NO subagents, commit each
 milestone, STOP for the user to compact). This is the project's only forward model
@@ -272,16 +272,38 @@ source is gone from disk). So M3 is a **real build**, not validate-at-scale. The
     Serving re-gate: **paged ✅ + chunked ✅** unchanged; **runtime/batched** `DPPL_CEILING` 1.0→4.0 (int4
     `gather_qmm` vs dequant gap +2.1%/+1.7% — intrinsic, not a regression); **loop-kill AUTO-OFF at int4**
     (`_resolve_loopkill_default`: ON int6+/bf16, OFF int4 — 0.875 token-agree, rule 4) ⇒ paged-batched
-    cascades off ⇒ **int4 serves per-stream attention + batched MoE + paged KV + chunked prefill**. int6
-    artifact kept on disk.
-  - **M3-6+ (next).** The **trained block-sparse attention** long-context lever (the COMPUTE lever on top
-    of chunked prefill — dense chunked prefill is correct but O(T²) in compute; parity: sparse==dense at
-    short ctx; xattention substrate); the **oMLX shim** (the `_MiniMaxM3BatchedSession` engine route +
-    chat template + `<mm:think>` reasoning parser + MiniMax nested-XML tool parser + a **multimodal image
-    input path**); multi-stream.
-- **Vision track** (folded into M1/M3 since full-VL): CLIP ViT forward + 3D-RoPE + patch-merge
-  compression + projector parity; image processor (dynamic-res tiling); multimodal prefill (splice
-  image embeddings at `image_token_index` 200025).
+    cascades off ⇒ **int4 serves per-stream attention + batched MoE + paged KV + chunked prefill**.
+    **int6 artifact freed 2026-06-14** (user; 330 GiB reclaimed; `--bits 6` reproduces it).
+  - **M3-6a / vision V1 ✅ (this milestone).** The CLIP-ViT **vision tower forward** — the user picked
+    the vision track first (full-VL requirement; lowest reference-risk; cleanly parity-gateable). New
+    additive `src/quanta/minimax/model_vision_m3.py`: **Conv3d-as-linear patch embed** (on-disk
+    `[1280,3,2,14,14]` conv → `[1280,1176]`, `1176=3·2·14·14` in the shipped `image_processor.py`'s
+    `[channel,temporal,h,w]` patch-flatten order ⇒ a `[1176→1280]` linear; Qwen2-VL style), `pre_layrnorm`,
+    32 **pre-norm CLIP encoder layers** (biased q/k/v/out, full bidirectional, exact-erf GELU, LayerNorm;
+    no learned pos-embed / CLS / post-norm — none ship), **3-D vision RoPE**, then the **project→merge**
+    head whose ORDER is forced by the on-disk input dims (`multi_modal_projector.linear_1` input 1280 ⇒
+    per-patch `1280→6144→6144` FIRST; `patch_merge_mlp.linear_1` input `24576=4·6144` ⇒ consecutive-4 = one
+    2×2 spatial block `24576→6144→6144` SECOND). One image `grid=(t,h,w)` → `t·h·w` ViT tokens →
+    `(t·h·w)/4` LLM tokens (== the processor's `num_tokens = grid.prod()//merge²` at `image_token_index`
+    200025). The **3-D RoPE** is the one piece with **no shipped reference** (transformers CLIP = learned
+    pos-embeds; even Qwen3-VL *vision* is 2-D h/w) — built on the **Qwen2.5-VL M-RoPE convention** (one
+    shared `inv_freq` ladder, freq pairs *sectioned* across t/h/w), which **degenerates exactly to the 2-D
+    (h,w) rope for an image** (`grid_t=1` ⇒ t-pos 0 ⇒ identity on the t-section). [PINNED-pending-e2e: the
+    exact `rope_section` split (default `(8,16,16)`, h==w) is the lone knob no artifact fixes; vision V2
+    settles it.] Gate: model-free `parity/minimax_m3_vision_test.py` (20 checks, in the sweep — CLIP
+    encoder layer (RoPE off) == REAL `transformers.CLIPEncoderLayer`; patch-embed / 3-D rope / projector /
+    merge / (t,h,w) position-ids == a numpy-fp64 oracle; rule-4 fast==naive; rule-6 section-sum +
+    indivisible-merge refusals; the 2-D-degenerate property; per-image attention isolation). Manifest
+    **109 model_free / 53 real_weight**.
+  - **vision V2 (next).** Real-weight vision e2e (load the 1.6 GiB ViT from the int4 artifact, run a real
+    image, **settle `rope_section`**) + the image processor pinned to the shipped `image_processor.py`
+    (smart-resize → CLIP-normalize → patchify → `grid_thw`) + the **multimodal prefill splice** (replace
+    the `image_token_index` 200025 placeholders with the merged vision embeddings).
+  - **M3-6+ (after vision).** The **oMLX shim** (the `_MiniMaxM3BatchedSession` engine route + chat
+    template + `<mm:think>` reasoning parser + MiniMax nested-XML tool parser + the multimodal image input
+    path) + multi-stream; the **trained block-sparse attention** long-context compute lever (deferred — no
+    M3 forward exists; only sparse==dense-at-short-ctx is bit-gateable; it is a speed optimization on the
+    already-correct dense path).
 
 ## Reusable quanta assets
 

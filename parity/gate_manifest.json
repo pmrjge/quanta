@@ -62,6 +62,7 @@
     "minimax_m3_paged_test",
     "minimax_m3_prefill_chunked_test",
     "minimax_m3_runtime_test",
+    "minimax_m3_vision_test",
     "mla_absorbed_sdpa_test",
     "mla_int8_test",
     "moe_chunk_test",

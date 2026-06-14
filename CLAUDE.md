@@ -223,12 +223,40 @@ SAME batched-cross-stream-SDPA mechanism, it cascades off too ⇒ **int4 serves 
 the path is the bounded-reorder regime (loosened int4 ceilings 0.30/0.80) **and assert the int4 auto-default
 is OFF**; `minimax_m3_loopkill_test` gains check (6) — the per-width resolver (int4→OFF, int6+/bf16→ON) +
 the auto-wired default (27 checks). Manifest unchanged 108 / 53 (no gate added/removed — the bake runner
-rename is a non-`_test.py` real-weight gate, untracked). int6 artifact kept on disk (offer to free).
-**Next = M3-6** — the trained block-sparse attention long-context lever (the COMPUTE lever on top of
-chunked prefill: dense chunked prefill is correct but O(T²) in compute; sparse==dense at short ctx;
-xattention substrate), the oMLX shim (the `_MiniMaxM3BatchedSession` engine route + chat template +
-`<mm:think>` reasoning + MiniMax nested-XML tool parser + multimodal image input), and the vision track
-(CLIP-ViT forward + projector + image processor; the vision *weights* are already baked dense bf16).
+rename is a non-`_test.py` real-weight gate, untracked). **int6 artifact freed 2026-06-14** (user:
+"delete int6 artifact and keep going with int4"; 330 GiB reclaimed, disk → 24%; `--bits 6` still
+reproduces the retired arm). **M3-6 is decomposed into sub-milestones (Nex/M3-style); the user picked
+the vision track first (full-VL requirement, lowest reference-risk, parity-gateable).**
+**M3-6a / vision V1 ✅ (this commit)** — the CLIP-ViT vision tower forward. NEW additive
+`model_vision_m3.py` (text/M2.7 untouched): the **Conv3d-as-linear patch embed** (the on-disk
+`[1280,3,2,14,14]` conv reshaped `[1280,1176]`, `1176=3·2·14·14` in the processor's `[channel,temporal,h,w]`
+flatten order ⇒ a plain `[1176→1280]` linear — Qwen2-VL style, NOT CLIP Conv2d), `pre_layrnorm`, 32
+**pre-norm CLIP encoder layers** (biased q/k/v/out, full bidirectional attention, exact-erf GELU MLP,
+LayerNorm; no learned pos-embed / CLS / post-norm — none ship), **3-D vision RoPE**, then the head whose
+order is **forced by the on-disk input dims**: `multi_modal_projector` (`linear_1` input 1280 ⇒ runs
+FIRST, per patch `1280→6144→6144`) then `patch_merge_mlp` (`linear_1` input `24576=4·6144` ⇒ groups each
+consecutive-4 = one 2×2 spatial block, `24576→6144→6144`), so one image of `grid=(t,h,w)` patches →
+`t·h·w` ViT tokens → `(t·h·w)/4` LLM tokens (== the processor's `num_tokens = grid.prod()//merge²`
+placeholder count at `image_token_index` 200025). The **3-D RoPE** (`rope_mode="3d"`, θ=1e4) is the one
+piece with **NO shipped reference** (transformers CLIP uses learned pos-embeds; even Qwen3-VL's *vision*
+tower is 2-D h/w) — built on the **Qwen2.5-VL M-RoPE convention** (one shared `inv_freq` ladder over the
+head_dim, freq pairs *sectioned* across t/h/w by `rope_section`), which **degenerates exactly to the 2-D
+(h,w) vision rope for an image** (`grid_t=1` ⇒ t-position 0 ⇒ identity on the t-section). [PINNED-pending-
+e2e: the exact `rope_section` split of the 40 freq pairs (default `(8,16,16)`, h==w symmetric) is the lone
+knob no artifact fixes; **vision V2** settles it cheaply against a real image — the ViT is 1.6 GiB,
+loadable standalone.] Gate: model-free `parity/minimax_m3_vision_test.py` (20 checks, in the sweep —
+**CLIP encoder layer (RoPE off) == the REAL `transformers` `CLIPEncoderLayer`** on identical weights;
+patch-embed / 3-D rope / projector / patch-merge / (t,h,w) position-ids (merge-block order) == a
+**numpy-fp64 oracle**; rule-4 fast==naive attention; rule-6 `rope_section`-sum + indivisible-merge
+refusals; the 2-D-degenerate property; per-image attention isolation). Manifest **109 model_free / 53
+real_weight**. **Next = vision V2** — the real-weight vision e2e (load the 1.6 GiB ViT from the int4
+artifact, run a real image, settle `rope_section`) + the image processor pinned to the shipped
+`image_processor.py` (smart-resize / CLIP-normalize / patchify / `grid_thw`) + the multimodal prefill
+splice; **then** the oMLX shim (the `_MiniMaxM3BatchedSession` engine route + chat template + `<mm:think>`
+reasoning + MiniMax nested-XML tool parser + the multimodal image input path) and the **trained
+block-sparse attention** long-context compute lever (deferred — no M3 forward exists; only
+sparse==dense-at-short-ctx is bit-gateable, the exact selection formula leans on a heavy 397B
+long-context ppl arbiter; it is a speed optimization on an already-correct dense path).
 
 The rest of the served fleet is **complete, shipped, and parity-gated**. Per-model resident sizes are
 in the Serving throughput table below; the detailed milestone handovers live in the `PLAN_*.md` files
