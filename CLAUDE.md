@@ -42,11 +42,21 @@ isolated: **clamped SwiGLU-OAI == `GptOssExperts._apply_gate`** (w1=gate/swish, 
 applies to ALL non-gated norms** (empirically: q/k/index norms 0-centered) and the **shared expert has
 NO scalar gate** (no `shared_expert_gate` key). Full block + MoE-sparse==dense + fast==naive vs a
 numpy-fp64 ref. Gates: `minimax_m3_fit_test` (SOLO, 13) + `minimax_m3_config_test` (24) +
-`minimax_m3_layer_test` (model-free, 12). Manifest 102 model_free / 53 real_weight. **Next = M1b
-real-weight at-scale layer parity** (load real L0+L3, fp32 mx vs numpy-fp64, rule 8), then M2 int6
-bake + ppl arbiter, then M3 serving (resident batched re-gate, oMLX shim incl. multimodal image input
-+ `<mm:think>` reasoning + MiniMax nested-XML tool parser, paged-KV + prefix caching, trained
-block-sparse long-context lever, chunked prefill, multi-stream).
+`minimax_m3_layer_test` (model-free, 12). Manifest 102 model_free / 53 real_weight. **M1b ✅ (this
+commit)** — real-weight at-scale layer parity: new `loader_m3.MiniMaxM3SourceCheckpoint` (lazy
+single-shard reader, text decoder; `moe()` pre-stacks the **per-expert** `experts.{e}.{w1,w2,w3}`
+into `[E,2*inter,h]`/`[E,h,inter]` at load time; text-only — refuses vision keys, the ViT is a
+separate VL track) + SOLO gate `parity/minimax_m3_layer_parity.py` (non-`_test.py`, excluded from the
+sweep; loads only L0+L3, streamed+released, rule 8) diffing the `model_m3` block in fp32 vs a
+self-contained **numpy-fp64** oracle on identical real dequantized weights. Machine-precision:
+dense-L0 Δ 7.8e-7, MoE-L3 Δ 8.6e-7, fast==naive ~1e-7, sparse `gather_mm`==dense 4e-7, router
+(real F32 gate/bias) set-match + wΔ 6e-8, indexer shapes ✓ (8 checks). Validates loading +
+real-shape/dtype wiring (hidden 6144, GQA 64q/4kv, 128 experts top-4 + shared) + the
+per-expert→stacked pack at 397B-class scale. **Next = M2 int6-g64 bake + teacher-forced ppl
+arbiter** (the decisive arbiter for the pinned `(1+w)` fold), then M3 serving (resident batched
+re-gate, oMLX shim incl. multimodal image input + `<mm:think>` reasoning + MiniMax nested-XML tool
+parser, paged-KV + prefix caching, trained block-sparse long-context lever, chunked prefill,
+multi-stream) + the vision track.
 
 The rest of the served fleet is **complete, shipped, and parity-gated**. Per-model resident sizes are
 in the Serving throughput table below; the detailed milestone handovers live in the `PLAN_*.md` files

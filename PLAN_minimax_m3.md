@@ -94,11 +94,23 @@ source is gone from disk). So M3 is a **real build**, not validate-at-scale. The
   Also gated (rule 4): MoE dense oracle == sparse `gather_mm`; `use_fast` (mx.fast rope+SDPA) ==
   naive attention. Model-free (synthetic dims), runs in the sweep under the `reference` extra
   (peak RSS 0.32 GiB). Manifest 102 model_free / 53 real_weight.
-- **M1b — layer parity @ scale (real weights), SOLO / layer-streamed (rule 8).** Load real layer-0
-  (dense) + layer-3 (first MoE, carries the indexer) from the 796 GB checkpoint, run the
-  `model_m3` block in fp32, diff vs a pure-numpy-fp64 reference on the SAME dequantized weights +
-  input — validates loading + real-shape/dtype wiring at scale (64q/4kv, 128 experts, dense_inter
-  12288). Reference is numpy (the formulas are already pinned to transformers in M1a).
+- **M1b ✅ — layer parity @ scale (real weights), SOLO / layer-streamed (rule 8).** New
+  `src/quanta/minimax/loader_m3.py` (`MiniMaxM3SourceCheckpoint`): a lazy single-shard-mmap reader
+  for the TEXT decoder — `embed`/`final_norm`/`lm_head` + per-layer `block_norms`/`attention`/
+  `sparse_index`/`dense_mlp`/`moe`. Routed experts ship **per-expert**
+  (`block_sparse_moe.experts.{e}.{w1,w2,w3}`), so `moe()` **pre-stacks** them at load time (bounded
+  loop) into `experts_gate_up` `[E,2*inter,h]` (w1 over w3) + `experts_down` `[E,h,inter]` (w2) — the
+  `gather_mm`-ready layout `MiniMaxM3MoE.set_experts` wants. Text-only (refuses a `vision_tower.*`
+  key — the ViT is a separate VL track, not dropped). Gate `parity/minimax_m3_layer_parity.py`
+  (real-weight SOLO, non-`_test.py` ⇒ excluded from the sweep; loads only L0+L3, streamed+released):
+  the `model_m3` block in fp32 vs a self-contained **numpy-fp64** oracle (same formulas M1a pinned to
+  transformers, now on real weights — torch-free, runs on base deps) on IDENTICAL dequantized weights
+  + input. **Measured (machine-precision):** dense L0 block Δ **7.8e-7**, MoE L3 block Δ **8.6e-7**,
+  fast==naive 5e-8/1.6e-7, sparse `gather_mm`==dense oracle 4e-7, router (real F32 gate/bias)
+  set-match + weights Δ 6e-8, trained-indexer tensors stream with the expected shapes (rule-6
+  coverage). 8 checks. Confirms the loader + real-shape/dtype wiring (hidden 6144, GQA 64q/4kv hd128,
+  128 experts top-4 + shared, dense_inter 12288) + the per-expert→stacked pack. Peak ~29 GiB
+  (one MoE block's fp32 expert stacks) « 490.
 - **M2 — bake int6-g64** (self-contained artifact: relative refs only, declares the 1M window,
   synthesizes `generation_config.json` eos [200020], copies tokenizer; data-free RTN; one layer
   resident at a time, rule 8). Teacher-forced **ppl arbiter** (the e2e arbiter, methodology #4) on
