@@ -134,12 +134,22 @@ source is gone from disk). So M3 is a **real build**, not validate-at-scale. The
   (SOLO; `--smoke` slice ran on real weights in 2.7s → a 6.1 GiB self-contained artifact, readback of
   L0 int8 / L3 int6 stacks [128,6144,6144]·[…,3072] / F32 gate / bf16 indexer / packed-int6 triplet
   all correct). Manifest 103 model_free / 53 real_weight.
-- **M2b — full int6 bake + teacher-forced ppl arbiter (next).** Run the real
-  `run_bake_minimax_m3_int6g64` SOLO (multi-hour, ~329.6 GiB out), then a new `parity/minimax_m3_ppl.py`
-  (the e2e arbiter, methodology #4): bf16 source vs int6 artifact, teacher-forced ppl + top-1 on
-  held-out prose via a streamed `MiniMaxM3Block` forward (one layer resident). **The decisive check
-  for the pinned Gemma `(1+w)` fold** — a wrong fold makes the absolute ppl garbage on both arms; a
-  coherent low ppl validates the whole forward. int6 vs bf16 Δppl → ship.
+- **M2b ✅ — full int6 bake + teacher-forced ppl arbiter (this milestone).** The real
+  `run_bake_minimax_m3_int6g64` ran SOLO and produced `~/models/MiniMax-M3-quanta_int6g64` in **3.9 min**
+  (RTN is data-free / fast — no GPTQ): **329.6 GiB** on disk (exactly the M0 projection, < the 490.4
+  ceiling), self-contained (0 symlinks, sidecars present, no leaks, 30 shards / 2710 weight-map
+  entries), **full VL** (523 vision tensors dense bf16), native 1M; counts `int8 420 / expert_int 114
+  (57 MoE × 2 ✓) / dense 1108`. New SOLO arbiter `parity/minimax_m3_ppl.py` (non-`_test.py` ⇒ excluded
+  from the sweep; `# parity-gate: real-weight`): two streamed `MiniMaxM3Block` forwards (one layer
+  resident, rule 8) — bf16 source vs int6 artifact — over held-out prose, teacher-forced ppl + top-1
+  agreement. The tokenizer is built directly from `MiniMaxM3Config` (it duck-types bos/eos/eos_token_ids;
+  the BPE reads only `tokenizer.json`), `add_bos_token` absent ⇒ raw encode (the Nex precedent).
+  **Verdict (637 tok, all 60 layers):** **bf16 ppl 4.96 / acc 0.591** ⇒ the pinned Gemma `(1+w)` fold
+  is **CONFIRMED e2e** (the decisive check — there is no HF/sglang M3 forward to diff against; a wrong
+  fold degrades ppl uniformly into the hundreds, 4.96 is exactly a healthy 397B value); **int6-g64 ppl
+  5.00 / Δppl +0.82% / acc 0.591 (identical) / top-1 agree 0.943** ⇒ ~lossless, the user's int6
+  margin choice (over int4) is validated e2e. **SHIP int6-g64.** PARITY-CHECKS: 4 (bf16+int6 finite,
+  bf16 ppl < 30 ceiling, int6 Δppl < 5% & agree > 0.90). Smoke (`8 160`) validated the code path first.
 - **M3 — serving.** Resident + batched re-gate (packed-int6 `gather_qmm` experts + int8 mixer);
   **oMLX shim** (`QuantaOmlxEngine` route + chat template + the `<mm:think>` reasoning parser + the
   MiniMax nested-XML tool parser + a **multimodal image input path** — the VL-specific work);

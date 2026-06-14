@@ -66,12 +66,23 @@ top-k ties; only gate+bias are F32, rest bf16, confirmed on disk). Gates: model-
 then back through both readers: every dequant == source-RTN bit-exact, F32 router preserved, manifest
 schemes, raw/refusals, native-1M, self-contained) + `parity/run_bake_minimax_m3_int6g64.py` (SOLO;
 `--smoke` ran on real weights in 2.7s → 6.1 GiB artifact, readback of int8/int6 stacks/F32 gate/bf16
-indexer/packed-int6 triplet all correct). Manifest 103 model_free / 53 real_weight. **Next = M2b** —
-run the full bake SOLO (multi-hour, ~329.6 GiB), then `parity/minimax_m3_ppl.py` teacher-forced ppl
-arbiter (bf16 vs int6; the decisive check for the pinned `(1+w)` fold), then M3 serving (resident
-batched re-gate, oMLX shim incl. multimodal image input + `<mm:think>` reasoning + MiniMax nested-XML
-tool parser, paged-KV + prefix caching, trained block-sparse long-context lever, chunked prefill,
-multi-stream) + the vision track.
+indexer/packed-int6 triplet all correct). Manifest 103 model_free / 53 real_weight. **M2b ✅ (this
+commit)** — full bake + teacher-forced ppl arbiter. `run_bake_minimax_m3_int6g64` ran SOLO →
+`~/models/MiniMax-M3-quanta_int6g64` in **3.9 min** (RTN, no GPTQ): **329.6 GiB** on disk (== the M0
+projection, < 490.4 ceiling), self-contained (0 symlinks / sidecars present / no leaks / 30 shards),
+**full VL** (523 vision tensors dense bf16), native 1M; counts int8 420 / expert_int 114 (57 MoE × 2) /
+dense 1108. New SOLO arbiter `parity/minimax_m3_ppl.py` (non-`_test.py` ⇒ excluded from the sweep; two
+streamed `MiniMaxM3Block` forwards one-layer-resident, rule 8; tokenizer built directly from
+`MiniMaxM3Config` which duck-types bos/eos, BPE reads only `tokenizer.json`, `add_bos_token` absent ⇒
+raw): **637 tok, all 60 layers — bf16 ppl 4.96 / acc 0.591** ⇒ the pinned Gemma `(1+w)` fold is
+**CONFIRMED e2e** (the decisive check: no HF/sglang M3 forward exists to diff against; a wrong fold
+degrades ppl uniformly to the hundreds — 4.96 is a healthy 397B value), **int6-g64 ppl 5.00 / Δppl
++0.82% / acc 0.591 / top-1 agree 0.943** ⇒ ~lossless, **SHIP int6-g64** (the user's int6-margin choice
+over int4 validated e2e). **Next = M3 serving** — resident batched re-gate (packed-int6 `gather_qmm`
+experts via `artifact_m3.moe_packed` + int8 mixer), oMLX shim incl. multimodal image input +
+`<mm:think>` reasoning + MiniMax nested-XML tool parser, paged-KV + prefix caching, trained
+block-sparse long-context lever, chunked prefill, multi-stream — plus the vision track (CLIP-ViT
+forward + projector + image processor; the vision *weights* are already baked dense bf16).
 
 The rest of the served fleet is **complete, shipped, and parity-gated**. Per-model resident sizes are
 in the Serving throughput table below; the detailed milestone handovers live in the `PLAN_*.md` files
