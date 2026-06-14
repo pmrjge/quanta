@@ -22,7 +22,8 @@ Target operating point: B≈32 (the fleet cohort point), ~order-of-magnitude agg
          cache exactly as the single-stream runtime does. Bounded IO loop over the small batch (rule
          3); each call is M=1 so the packed q/k/v/o ``mx.quantized_matmul`` is bit-exact vs the
          single-stream decode.
-       * *GQA loop-kill* (``loopkill=True`` — M3-3, the graduated serving default): ONE batched
+       * *GQA loop-kill* (``loopkill=True`` — M3-3, graduated ON per-width — int6+/bf16 only; AUTO-OFF
+         at int4 where its parity is not bit-exact, see :func:`_resolve_loopkill_default`): ONE batched
          attention across all ``B`` streams via
          :meth:`quanta.minimax.model_m3.MiniMaxM3Attention.decode_step_batched` — batched q/k/v/o
          projections (each weight read ``⌈B/chunk⌉×`` instead of ``B×``: the mixer-read bandwidth win,
@@ -91,12 +92,18 @@ from quanta.paged import MINIMAX_M3_PAGED_KV_BATCHED_DEFAULT, PagedKVCacheView
 # with ONE batched attention across all B streams (M3 is all-GQA, so the whole mixer): batched q/k/v/o
 # projections (each mixer weight read ONCE for all B — the bandwidth win, mirroring the MoE expert-read
 # amortization) + per-stream RoPE kernel loop + the shared fused padded SDPA. **GRADUATED ON (M3-3)**
-# after the real-model B=8 re-gate (``parity/minimax_m3_loopkill_real.py`` on the 397B int6-g64 bake):
+# after the real-model B=8 re-gate (``parity/minimax_m3_loopkill_real.py`` on the 397B int4-g64 bake):
 # with the option-B packed+chunked projections it is greedy-token-equivalent to the per-stream loop at
 # every B AND a decode win on top of M3-2's batched MoE. The loop-kill REQUIRES packed (a dense-bf16
 # projection reorders across batch-M), enforced by ``_check_loopkill_requires_packed``. Gated vs the
 # per-stream loop in ``parity/minimax_m3_loopkill_test.py``.
-MINIMAX_M3_BATCHED_LOOPKILL_DEFAULT = True
+MINIMAX_M3_BATCHED_LOOPKILL_DEFAULT = True   # master gate; the EFFECTIVE default is per-expert-width
+# (see _resolve_loopkill_default): loop-kill is graduated ON only where its parity to the per-stream
+# loop is PROVEN. At int6+ it is BIT-EXACT (real-gated); at **int4** the coarse MoE amplifies the
+# batched-SDPA reorder to 0.875 token-agree @ B=8 (real-gated) — NOT output-equivalent, so per rule 4
+# it AUTO-DEFAULTS OFF for int4 (fall back to the proven per-stream loop). The user's int4 build thus
+# serves the per-stream attention by default; explicit ``loopkill=True`` still forces it (gated, packed).
+MINIMAX_M3_LOOPKILL_MIN_EXPERT_BITS = 6
 
 # --- M3-3 option-B loop-kill chunk size (the batch-M bit-exact regime) -----------------------------
 # The loop-kill batches the mixer projections across all B streams. Under the packed runtime those are
@@ -126,6 +133,29 @@ MINIMAX_M3_LOOPKILL_CHUNK = 8
 # ``parity/minimax_m3_prefill_chunked_real.py``.
 MINIMAX_M3_PREFILL_CHUNK_TOKENS = 4096
 MINIMAX_M3_CHUNKED_PREFILL_FROM: int | None = MINIMAX_M3_PREFILL_CHUNK_TOKENS + 1
+
+
+def _served_expert_bits(layers: Sequence[MiniMaxM3Block]) -> int | None:
+    """The routed-expert quant width of the loaded layers, read from the packed triplet (rule 6 —
+    never assumed), or ``None`` if the experts are a bf16 stack (no quant width). Drives the per-width
+    loop-kill default."""
+    for blk in layers:
+        if not getattr(blk, "is_moe", False):
+            continue
+        gu = blk.mlp.experts_gate_up
+        return int(gu["bits"]) if isinstance(gu, dict) else None
+    return None
+
+
+def _resolve_loopkill_default(expert_bits: int | None) -> bool:
+    """Graduate the GQA loop-kill ON only where its parity to the per-stream loop is PROVEN: int6+
+    (BIT-EXACT, real-gated) and bf16 experts (``None`` ⇒ the bit-exact reference). At **int4** the
+    coarse MoE amplifies the batched-SDPA reorder (0.875 token-agree @ B=8 — NOT output-equivalent,
+    rule 4), so it AUTO-DEFAULTS OFF (fall back to the proven per-stream loop). The global
+    :data:`MINIMAX_M3_BATCHED_LOOPKILL_DEFAULT` master-gates it off entirely when False."""
+    if not MINIMAX_M3_BATCHED_LOOPKILL_DEFAULT:
+        return False
+    return expert_bits is None or expert_bits >= MINIMAX_M3_LOOPKILL_MIN_EXPERT_BITS
 
 
 def _attn_step(blk: MiniMaxM3Block, kv: KVCache, x_t: mx.array, *, use_fast: bool = True) -> mx.array:
@@ -294,8 +324,10 @@ class MiniMaxM3BatchedResidentModel:
         self._kv_quantized = bool(kv_quantized)
         self._kv_group_size = int(kv_group_size)
         self._kv_bits = int(kv_bits)
-        self._loopkill = (bool(MINIMAX_M3_BATCHED_LOOPKILL_DEFAULT) if loopkill is None
-                          else bool(loopkill))           # M3-3 GQA loop-kill (graduated ON; rule-4 flag)
+        # M3-3 GQA loop-kill — per-width default (rule-4 flag): ON where parity is proven (int6+/bf16),
+        # AUTO-OFF at int4 (the user's served width — falls back to the proven per-stream loop).
+        self._loopkill = (_resolve_loopkill_default(_served_expert_bits(self.layers))
+                          if loopkill is None else bool(loopkill))
         self._paged_kv_batched = bool(MINIMAX_M3_PAGED_KV_BATCHED_DEFAULT)  # M3-4 paged KV loop-kill
         self._check_loopkill_requires_packed()
 
@@ -310,10 +342,10 @@ class MiniMaxM3BatchedResidentModel:
         without a checkpoint — same step machinery, model-free. ``norm_w`` is the already-``(1+w)``-
         folded final norm. ``packed`` / ``packed_experts`` are detected from the passed layers.
 
-        ``loopkill`` overrides the per-instance loop-kill flag: ``None`` (default) inherits the
-        graduated :data:`MINIMAX_M3_BATCHED_LOOPKILL_DEFAULT` (so the serving ``from_inner`` gets the
-        loop-kill, paired with the layers' ``packed`` state); the M3-2 Design-A gate passes
-        ``loopkill=False`` to pin the bit-exact per-stream path it gates.
+        ``loopkill`` overrides the per-instance loop-kill flag: ``None`` (default) resolves it
+        per-expert-width via :func:`_resolve_loopkill_default` (ON at int6+/bf16 where parity is proven,
+        AUTO-OFF at int4 — paired with the layers' ``packed`` state); the M3-2/M3-3 gates pass an
+        explicit ``loopkill=`` to pin the path they gate.
 
         KV flags default **bf16** (unlike ``__init__``'s int8 serving default) so a tiny synthetic
         config (``head_dim < 32`` cannot meet ``mx.quantize``'s min group_size) stays on the bf16 path;
@@ -334,8 +366,8 @@ class MiniMaxM3BatchedResidentModel:
         self.packed_experts = bool(moe) and isinstance(moe[0].mlp.experts_gate_up, dict)
         import mlx.nn as nn
         self.packed = bool(layers) and isinstance(layers[0].self_attn.q_proj, nn.QuantizedLinear)
-        self._loopkill = (bool(MINIMAX_M3_BATCHED_LOOPKILL_DEFAULT) if loopkill is None
-                          else bool(loopkill))
+        self._loopkill = (_resolve_loopkill_default(_served_expert_bits(self.layers))
+                          if loopkill is None else bool(loopkill))   # per-width default (AUTO-OFF @ int4)
         self._paged_kv_batched = bool(MINIMAX_M3_PAGED_KV_BATCHED_DEFAULT)  # M3-4 paged KV loop-kill
         self._check_loopkill_requires_packed()
         return self

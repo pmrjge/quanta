@@ -9,8 +9,8 @@ dynamic-YaRN policy to bake). Per-tensor scheme follows :mod:`quanta.minimax.qua
 
 * **routed experts** — the **pre-stacked** ``block_sparse_moe.experts.gate_up_proj``
   ``[E, 2*moe_inter, hidden]`` (fused w1=gate over w3=up) and ``experts.down_proj``
-  ``[E, hidden, moe_inter]`` (w2) → **int6 affine g64** (``expert_bits=6`` for margin; the user's
-  decision — skip int4). Quantized **as 3-D stacks in one shot** (``mx.quantize`` groups over the
+  ``[E, hidden, moe_inter]`` (w2) → **int4 affine g64** (``expert_bits=4``; the user's decision — the
+  only width going forward, int6 retired). Quantized **as 3-D stacks in one shot** (``mx.quantize`` groups over the
   trailing ``in`` dim), keeping the exact ``[E, out, in]`` layout ``mx.gather_qmm`` decodes — no
   per-expert python loop (rule 3). The per-expert→stacked pack is :meth:`loader_m3.moe`'s job.
 * **non-experts** → **int8 affine**: GQA ``q/k/v/o_proj`` (every layer), the dense-FFN
@@ -37,7 +37,7 @@ full call is the real bake. **Data-free** (plain affine RTN over the stacks — 
 sub-int6-grid headroom; settled finding). **Run SOLO** (one model resident; OOM/reboot hazard).
 
     # the real full bake is GPU+memory-heavy (~809.5 GiB bf16 source, ~330 GiB int6 out, multi-hour);
-    # run it SOLO via parity/run_bake_minimax_m3_int6g64, then the M2b teacher-forced ppl arbiter.
+    # run it SOLO via parity/run_bake_minimax_m3_int4g64, then the teacher-forced ppl arbiter.
 """
 
 from __future__ import annotations
@@ -68,7 +68,7 @@ from quanta.minimax.quant_policy_m3 import (
     VISION_PREFIXES,
 )
 
-_EXPERT_BITS = 6   # the user's decision: routed experts int6 g64 for margin (skip int4)
+_EXPERT_BITS = 4   # the user's decision: routed experts int4 g64 — the only width going forward (int6 retired)
 _INT8_BITS = 8
 
 # Attention suffix partition (mirror loader_m3.ATTN_SUFFIXES; classify each, fail loud on a miss):
@@ -112,7 +112,7 @@ def _write_expert_stack(writer: ArtifactWriter, key: str, w: mx.array, gs: int,
     ``mx.quantize`` groups over the trailing ``in`` dim, so the stack stays in the ``[E, out, in]``
     layout the runtime's ``mx.gather_qmm`` consumes — packed codes ``[E, out, in*bits/32]`` + scales /
     biases ``[E, out, in/gs]``. The manifest records ``bits`` so the resident loader decodes at the
-    baked width — never a hardcoded default (rule 6). MLX affine supports {2,3,4,6,8}; M3 ships int6.
+    baked width — never a hardcoded default (rule 6). MLX affine supports {2,3,4,6,8}; M3 ships int4.
     """
     writer.add_quantized(key, *quantize_affine(w, bits, gs, scale_dtype=scale_dtype), bits, gs)
 
@@ -279,8 +279,8 @@ def bake_minimax_m3(
     Returns a summary ``dict`` (per-kind counts, layers, vision tensors, bytes, self-containment
     audit). ``n_layers`` / ``expert_subset`` slice the bake for bounded validation; ``include_head``
     toggles embed/norm/head; ``include_vision`` toggles the vision-tower passthrough (the full bake
-    keeps it — the user's full-VL decision). ``expert_bits`` is the routed-expert width (6 — the user's
-    int6 margin decision). Data-free RTN. Streamed one text layer resident at a time (rule 8); the
+    keeps it — the user's full-VL decision). ``expert_bits`` is the routed-expert width (4 — the user's
+    decision, the only width going forward). Data-free RTN. Streamed one text layer resident at a time (rule 8); the
     artifact is asserted to declare the native 1M window and :func:`_audit_self_contained` then fails
     loud unless the folder is fully standalone (rule 6)."""
     cfg = MiniMaxM3Config.from_pretrained(source)

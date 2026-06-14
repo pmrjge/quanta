@@ -48,9 +48,14 @@ source is gone from disk). So M3 is a **real build**, not validate-at-scale. The
 
 - **Build full VL now** (vision tower + projector + image processor + a multimodal input path in the
   oMLX shim — the shim has no image pathway today).
-- **Quant at int6-g64 for margin** (skip int4). Fit (M0): **int6-g64 = 329.6 GiB resident** (experts
-  312.6 int6 + int8 10.2 + dense/bf16 6.8 incl. the bf16 vision tower + the bf16 trained indexer),
-  **160.8 GiB headroom** under 490.4. (int4 reference projection 233.4 GiB.)
+- **Quant at int4-g64 — the only width going forward** (2026-06-14; "only 4bit from now on";
+  supersedes the original int6-margin pick — int6 retired). Fit: **int4-g64 = 233.4 GiB resident**
+  (96 GiB under int6's 329.6, **257 GiB headroom** under 490.4). Measured e2e: int4 WEIGHTS lossless
+  (arbiter Δppl −0.24% vs bf16); served via packed `gather_qmm` +2.86% vs bf16 (the fused low-bit kernel
+  gap, healthy). **Consequence:** loop-kill (M3-3) + paged-batched (M3-4) AUTO-OFF at int4 (rule 4 — the
+  batched-cross-stream SDPA reorder is amplified by the coarse MoE to 0.875 token-agree, not bit-exact),
+  so int4 serves per-stream attention + batched MoE + paged KV + chunked prefill. (`--bits 6` still bakes
+  the retired int6 arm; 329.6 GiB.)
 
 ## Quant policy (`quanta.minimax.quant_policy_m3`)
 
@@ -259,6 +264,16 @@ source is gone from disk). So M3 is a **real build**, not validate-at-scale. The
     paged == discrete-chunked **BIT-EXACT** [|Δ| 0 — the M3-4 orthogonal-axes foundation holds under
     chunked writes], chunked-seeded 6-step decode == single-shot-seeded **1.000**). Manifest 108
     model_free / 53 real_weight.
+  - **int4-g64 switch ✅ (this milestone).** Served width → int4-g64 (int6 retired; "only 4bit from now
+    on"). Re-baked via `run_bake_minimax_m3_int4g64` (233.4 GiB, full VL, native 1M, 3.3 min); arbiter +
+    5 serving `_real` gates + the model-free bake gate (sweeps int4+int6) + the M0 fit gate all repointed.
+    **int4 weights lossless** (arbiter Δppl −0.24% vs bf16); **served `gather_qmm` +2.86% vs bf16** (the
+    fused low-bit kernel gap — healthy, the intrinsic int4 serving cost, anchored by the lossless arbiter).
+    Serving re-gate: **paged ✅ + chunked ✅** unchanged; **runtime/batched** `DPPL_CEILING` 1.0→4.0 (int4
+    `gather_qmm` vs dequant gap +2.1%/+1.7% — intrinsic, not a regression); **loop-kill AUTO-OFF at int4**
+    (`_resolve_loopkill_default`: ON int6+/bf16, OFF int4 — 0.875 token-agree, rule 4) ⇒ paged-batched
+    cascades off ⇒ **int4 serves per-stream attention + batched MoE + paged KV + chunked prefill**. int6
+    artifact kept on disk.
   - **M3-6+ (next).** The **trained block-sparse attention** long-context lever (the COMPUTE lever on top
     of chunked prefill — dense chunked prefill is correct but O(T²) in compute; parity: sparse==dense at
     short ctx; xattention substrate); the **oMLX shim** (the `_MiniMaxM3BatchedSession` engine route +

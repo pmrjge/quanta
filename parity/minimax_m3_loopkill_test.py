@@ -233,6 +233,20 @@ def run() -> None:
     _ck(_raises(lambda: lk_bad.step_batch([nxt[0]], cbad, [len(prompts[0])])),
         "step_batch ran the loop-kill after .packed was cleared (rule 6)")
 
+    # (6) per-width loop-kill default (rule 4): the resolver + the auto-wired default ------------------
+    # graduate ON only where parity is PROVEN — int6+/bf16 — and AUTO-OFF at int4 (the served width,
+    # where the real gate measures 0.875 token-agree ⇒ not output-equivalent). The pure resolver, then
+    # the actual __init__/from_inner wiring on the gate's packed synthetic.
+    _ck(BR._resolve_loopkill_default(4) is False, "loop-kill must AUTO-OFF at int4 (parity unproven)")
+    _ck(BR._resolve_loopkill_default(6) is True and BR._resolve_loopkill_default(8) is True
+        and BR._resolve_loopkill_default(None) is True,
+        "loop-kill must default ON at int6+/bf16 (the bit-exact reference)")
+    auto = BR.MiniMaxM3BatchedResidentModel.from_inner(
+        blk_serve, w["embed"], M.one_plus(w["final_norm"]), w["lm_head"], cfg, max_batch=8)  # loopkill=None
+    eb = BR._served_expert_bits(blk_serve)
+    _ck(auto._loopkill == BR._resolve_loopkill_default(eb),
+        f"auto loop-kill default ({auto._loopkill}) != resolver for served expert bits {eb}")
+
     print("\n=== MiniMax-M3-VL M3-3 GQA loop-kill gate (model-free) ===")
     print(f"(2) loop-kill == per-stream loop (B={B}, ragged): worst agree {w2_agree:.4f}, "
           f"worst rel {w2_rel:.2e}")
@@ -240,6 +254,8 @@ def run() -> None:
           f"worst rel {w3_rel:.2e}")
     print("(4) B=1 loop-kill == single-stream (top-1 exact)")
     print("(5) rule 4/6: loop-kill ⇒ packed (refused at construction AND at step on a bf16 mixer)")
+    print(f"(6) per-width default: int4 AUTO-OFF / int6+/bf16 ON; auto-wired _loopkill={auto._loopkill} "
+          f"for served bits {eb}")
     print(f"PARITY-CHECKS: {_N}")
     print("PASS — M3-3 GQA loop-kill: ONE batched attention across streams is greedy-token-equivalent "
           "to the per-stream loop; chunked projections bit-exact (§M0); loop-kill ⇒ packed enforced.")

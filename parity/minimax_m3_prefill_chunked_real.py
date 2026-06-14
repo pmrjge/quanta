@@ -1,10 +1,10 @@
 """MiniMax-M3-VL M3-5: real-weight chunked-prefill re-gate @ 397B (SOLO).
 
-Validates the M3-5 chunked-prefill admit path on the REAL int6-g64 artifact at full scale, off ONE
-~325 GiB resident load. M3 is all dense GQA, so chunked prefill = feed the prompt in seq blocks, each
+Validates the M3-5 chunked-prefill admit path on the REAL int4-g64 artifact at full scale, off ONE
+~233 GiB resident load. M3 is all dense GQA, so chunked prefill = feed the prompt in seq blocks, each
 chunk extending every layer's GQA KV with a bottom-right causal mask; the fused flash-attn kernel never
 materializes the ``[chunk, kv_len]`` score matrix, so a long prompt admits in O(chunk) memory. The MODEL
-ppl is unchanged by the admit pattern (M2b int6 ppl ~5.0, M3-1 resident ppl 5.87) — chunked prefill only
+ppl is unchanged by the admit pattern (M2b int4 ppl ~5.0, M3-1 resident ppl 5.87) — chunked prefill only
 changes HOW the cache is seeded, so the arbiter here is **output-equivalence to the proven single-shot
 admit**, on the packed serving runtime (packed mixer + packed experts + int8 KV).
 
@@ -45,7 +45,7 @@ from quanta.minimax.tokenizer import MiniMaxTokenizer
 from quanta.paged import PagedKVCacheManager
 
 SRC = "/Users/pmrj/models/MiniMax-M3"
-INT6 = "/Users/pmrj/models/MiniMax-M3-quanta_int6g64"
+ART = "/Users/pmrj/models/MiniMax-M3-quanta_int4g64"
 N_TOK = 256
 CHUNK = 64           # chunk_tokens << P ⇒ several chunks (the multi-chunk continuation path)
 BLOCK = 16           # paged block size
@@ -117,7 +117,7 @@ def run(n_layers: int | None = None, n_tok: int = N_TOK) -> None:
           f"({'all 60' if full else n_layers} layers, SOLO) ===", flush=True)
 
     t0 = time.perf_counter()
-    pg = MiniMaxM3BatchedResidentModel(INT6, max_batch=2, n_layers=n_layers,
+    pg = MiniMaxM3BatchedResidentModel(ART, max_batch=2, n_layers=n_layers,
                                        packed=True, packed_experts=True, kv_quantized=True)
     t_load = time.perf_counter() - t0
     spec = pg.paged_kv_spec

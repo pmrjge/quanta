@@ -1,6 +1,6 @@
 """MiniMax-M3-VL M3-4: real-weight paged-KV + prefix caching re-gate @ 397B (SOLO).
 
-Validates the M3-4 paged-KV path on the REAL int6-g64 artifact at full scale, off ONE ~325 GiB resident
+Validates the M3-4 paged-KV path on the REAL int4-g64 artifact at full scale, off ONE ~233 GiB resident
 load. M3 is the clean dense-GQA paged case (all 60 layers attention, NO recurrent state), so paging is
 the textbook k/v scenario: prefix blocks dedup across requests, int8-g64 KV (GQA 4 kv heads ⇒ cheap KV;
 int8 halves it), nothing to content-address at a block boundary.
@@ -50,6 +50,7 @@ import time
 import mlx.core as mx
 
 from parity.minimax_m3_ppl import PROSE, teacher_forced
+import quanta.minimax.batched_runtime_m3 as BR
 from quanta.minimax.batched_runtime_m3 import MiniMaxM3BatchedResidentModel
 from quanta.minimax.config_m3 import MiniMaxM3Config
 from quanta.minimax.runtime_m3 import MiniMaxM3ResidentModel
@@ -57,9 +58,9 @@ from quanta.minimax.tokenizer import MiniMaxTokenizer
 from quanta.paged import PagedKVCacheManager
 
 SRC = "/Users/pmrj/models/MiniMax-M3"
-INT6 = "/Users/pmrj/models/MiniMax-M3-quanta_int6g64"
+ART = "/Users/pmrj/models/MiniMax-M3-quanta_int4g64"
 N_TOK = 256          # a parity re-gate, not a ppl measurement
-PPL_CEILING = 30.0   # the served runtime must ship a healthy 397B ppl (the M2b int6 value ~5.0)
+PPL_CEILING = 30.0   # the served runtime must ship a healthy 397B ppl (the M2b int4 value ~5.0)
 INT8_KV_DPPL_CEIL = 5.0   # int8 KV is near-lossless (the fleet's proven cache_quant scheme)
 B = 8                # batched streams for the paged loop-kill equivalence
 BLOCK = 16           # paged block size (prefix-match granularity)
@@ -139,10 +140,13 @@ def run(n_layers: int | None = None, n_tok: int = N_TOK) -> None:
     print(f"=== MiniMax-M3-VL M3-4 paged-KV + prefix caching re-gate — {len(ids_list)} tok, "
           f"{'all 60' if full else n_layers} layers (SOLO) ===", flush=True)
 
-    # ---- ONE resident load: paged serving config (packed mixer + experts, int8 KV, paged loop-kill ON)
+    # ---- ONE resident load: paged config, packed mixer + experts, int8 KV. The paged-batched attention
+    # is gated behind loop-kill (paged = _paged_kv_batched AND _loopkill), and at int4 loop-kill AUTO-OFF
+    # (rule 4 — same batched-SDPA reorder), so FORCE loopkill=True here to gate the paged-loop-kill PATH;
+    # the int4 serving default is per-stream-paged (asserted below).
     t0 = time.perf_counter()
-    pg = MiniMaxM3BatchedResidentModel(INT6, max_batch=max(B, 2), n_layers=n_layers,
-                                       packed=True, packed_experts=True, kv_quantized=True)
+    pg = MiniMaxM3BatchedResidentModel(ART, max_batch=max(B, 2), n_layers=n_layers,
+                                       packed=True, packed_experts=True, kv_quantized=True, loopkill=True)
     t_load = time.perf_counter() - t0
     # per-stream-paged-loop sibling (paged loop-kill OFF) + discrete int8 ref + bf16-KV ref — SAME layers
     pg_loop = MiniMaxM3BatchedResidentModel.from_inner(pg.layers, pg.embed_w, pg.norm_w, pg.lm_head_w,
@@ -155,6 +159,11 @@ def run(n_layers: int | None = None, n_tok: int = N_TOK) -> None:
                                                      pg.cfg, kv_quantized=False)
     _ck(pg._paged_kv_batched and pg._loopkill and pg.packed, "paged model not loopkill+packed+pagedKV")
     _ck(not pg_loop._paged_kv_batched, "per-stream-paged-loop sibling did not pin paged_batched=False")
+    # the int4 SERVING default auto-disables loop-kill (⇒ paged-batched off, per-stream-paged serves) —
+    # assert the resolver the constructor uses returns OFF for this width (no second 233 GiB load).
+    _eb = BR._served_expert_bits(pg.layers)
+    _ck(BR._resolve_loopkill_default(_eb) is False,
+        f"int4 loop-kill default must be OFF (served expert bits {_eb}); int4 paged serving is per-stream")
     _ck(pg.paged_kv_spec["quantized"] and pg.paged_kv_spec["n_layers"] == pg.num_layers
         and not pg.has_recurrent_state, f"paged_kv_spec wrong: {pg.paged_kv_spec}")
     n_built = pg.num_layers

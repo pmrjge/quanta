@@ -1,19 +1,19 @@
-"""MiniMax-M3-VL M2b — teacher-forced ppl + top-1: the bf16-vs-int6 arbiter (+ the (1+w)-fold check).
+"""MiniMax-M3-VL — teacher-forced ppl + top-1: the bf16-vs-int4 arbiter (+ the (1+w)-fold check).
 
 Two **sequential** streamed forwards (rule 8: one decoder layer resident at a time; the MoE
-128-expert bf16 stack ~14.5 GiB is the peak, NEVER the 809.5 GiB / 329.6 GiB whole model) over the
+128-expert bf16 stack ~14.5 GiB is the peak, NEVER the 809.5 GiB / 233.4 GiB whole model) over the
 *same* held-out prose, the first freed before the second so only one model is ever resident:
 
   1. **bf16 M3 source**    (:class:`~quanta.minimax.loader_m3.MiniMaxM3SourceCheckpoint`)
      -> reference ppl + reference per-position argmax
-  2. **int6-g64 artifact** (:class:`~quanta.minimax.artifact_m3.MiniMaxM3Artifact`, dequant-on-read)
-     -> the served arm
+  2. **int4-g64 artifact** (:class:`~quanta.minimax.artifact_m3.MiniMaxM3Artifact`, dequant-on-read)
+     -> the served arm (the only shipped width; ``--artifact`` measures any other)
 
 Both share :func:`streamed_logits` verbatim — the SAME forward (the proven
 :class:`quanta.minimax.model_m3.MiniMaxM3Block` prefill path, built dense-bf16 and streamed one block
 at a time; M1a/M1b already proved this block matches a numpy-fp64 reference to ~8e-7) — so the ppl Δ
-isolates pure expert-coding (int6 RTN) error. Because the readers duck-type the same surface, this one
-forward serves both arms. The quant mix measured here is the **SERVED mix**: int6 routed experts +
+isolates pure expert-coding (int4 RTN) error. Because the readers duck-type the same surface, this one
+forward serves both arms. The quant mix measured here is the **SERVED mix**: int4 routed experts +
 int8 dense/shared + bf16 control (so the Δ is the real deployment loss, not an expert-only proxy).
 
 This is ALSO the **decisive end-to-end check for the pinned Gemma ``(1+w)`` fold** (CLAUDE.md: there is
@@ -29,6 +29,7 @@ identical RoPE — the only difference is the dequantized weights.
 
     uv run python -m parity.minimax_m3_ppl              # the real 2-arm arbiter (SOLO)
     uv run python -m parity.minimax_m3_ppl 8 160        # n_layers, n_tok (bounded code-path smoke)
+    uv run python -m parity.minimax_m3_ppl --artifact /path/to/MiniMax-M3-quanta_int6g64  # any width
 
 # parity-gate: real-weight
 """
@@ -49,14 +50,22 @@ from quanta.minimax.loader_m3 import MiniMaxM3SourceCheckpoint
 from quanta.minimax.tokenizer import MiniMaxTokenizer
 
 SRC = "/Users/pmrj/models/MiniMax-M3"
-INT6 = "/Users/pmrj/models/MiniMax-M3-quanta_int6g64"
+ART = "/Users/pmrj/models/MiniMax-M3-quanta_int4g64"   # int4-g64 — the shipped width (override --artifact)
 N_TOK = 1024  # ~10x a 100-tok pilot → a de-noised, trustworthy ppl verdict
 
 # the (1+w)-fold / forward e2e sanity ceiling: a healthy 397B model on clean prose lands well under
 # this (~single digits); a broken (1+w) fold or forward bug degrades ppl to the hundreds/thousands
 PPL_CEILING = 30.0
-DPPL_CEILING = 5.0   # int6 RTN on a bf16 source is ~lossless; >5% would mean a real coding regression
+DPPL_CEILING = 5.0   # int4 RTN on a bf16 source is ~lossless; >5% would mean a real coding regression
 AGREE_FLOOR = 0.90   # top-1 agreement floor (loose — bf16-ULP near-ties flip; the Nemotron-Ultra rule)
+
+
+def _expert_bits(art) -> int:
+    """The routed-expert width baked into ``art`` (read from the manifest, rule 6 — never assumed)."""
+    for k, m in art.manifest.items():
+        if k.endswith("experts.gate_up_proj") and m.get("format") == "affine_packed":
+            return int(m["bits"])
+    raise ValueError("artifact has no routed-expert stack (cannot determine the served width)")
 
 # Original expository prose, held out from any calibration corpus (RTN is data-free regardless).
 PROSE = """The history of mapmaking is in large part the history of how people have tried to compress \
@@ -215,7 +224,7 @@ def _streamed_arm(label: str, weights, cfg: MiniMaxM3Config, ids: mx.array, n_la
     return out
 
 
-def run(n_layers: int | None = None, n_tok: int = N_TOK) -> None:
+def run(n_layers: int | None = None, n_tok: int = N_TOK, artifact: str = ART) -> None:
     full = n_layers is None
     mx.set_cache_limit(8 * 1024**3)
     cfg_src = MiniMaxM3Config.from_pretrained(SRC)
@@ -225,53 +234,62 @@ def run(n_layers: int | None = None, n_tok: int = N_TOK) -> None:
     tok = MiniMaxTokenizer(os.path.join(SRC, "tokenizer.json"), cfg_src)
     ids_list = tok.encode(PROSE)[:n_tok]
     ids = mx.array(ids_list, dtype=mx.uint32)
-    print(f"=== MiniMax-M3-VL M2b ppl arbiter — {len(ids_list)} tok, "
+    print(f"=== MiniMax-M3-VL ppl arbiter — {len(ids_list)} tok, "
           f"{'all' if full else n_layers} layers (streamed, SOLO) ===", flush=True)
 
-    # 1) bf16 reference — its argmax + ppl anchor the int6 Δ and confirm the (1+w) fold
+    # 1) bf16 reference — its argmax + ppl anchor the quant Δ and confirm the (1+w) fold
     src = MiniMaxM3SourceCheckpoint(SRC, cfg_src)
     ref = _streamed_arm("bf16-src", src, cfg_src, ids, n_layers, None, None)
     del src
     mx.clear_cache()
 
-    # 2) int6-g64 — streamed (dequant-on-read) vs the bf16 reference
-    art = MiniMaxM3Artifact(INT6)
-    i6 = _streamed_arm("int6-g64", art, art.cfg, ids, n_layers, ref["argmax"], ref["ppl"])
+    # 2) the quantized arm (default int4-g64) — streamed (dequant-on-read) vs the bf16 reference
+    art = MiniMaxM3Artifact(artifact)
+    bits = _expert_bits(art)
+    label = f"int{bits}-g64"
+    size = {4: "~233.4 GiB", 6: "~329.6 GiB"}.get(bits, "resident")
+    qa = _streamed_arm(label, art, art.cfg, ids, n_layers, ref["argmax"], ref["ppl"])
     del art
     mx.clear_cache()
 
-    # --- verdict: teacher-forced ppl is THE arbiter (CLAUDE.md methodology #4). int6-g64 (the user's
-    # margin choice, skip int4) ships unless it regresses materially; top-1 agreement is a SECONDARY,
+    # --- verdict: teacher-forced ppl is THE arbiter (CLAUDE.md methodology #4). The served width
+    # (int4-g64 going forward) ships unless it regresses materially; top-1 agreement is a SECONDARY,
     # noisy signal (bf16-ULP near-ties flip at low-confidence positions — a settled finding) used as a
     # loose floor, not a tight gate. ---
     fold = ("CONFIRMED" if ref["ppl"] < PPL_CEILING else "SUSPECT") if full else "n/a (smoke)"
     print(f"\n(1+w) fold (bf16 ppl {ref['ppl']:.3f} vs {PPL_CEILING} ceiling): {fold}", flush=True)
-    if full and ref["ppl"] < PPL_CEILING and i6["dppl"] < DPPL_CEILING and i6["agree"] > AGREE_FLOOR:
-        verdict = (f"SHIP int6-g64 (~329.6 GiB) — Δppl {i6['dppl']:+.2f}% / acc {i6['acc']:.4f} vs "
-                   f"bf16 {ref['acc']:.4f} / agree {i6['agree']:.4f} (~lossless; the user's margin "
-                   f"choice over int4 is validated e2e).")
+    if full and ref["ppl"] < PPL_CEILING and qa["dppl"] < DPPL_CEILING and qa["agree"] > AGREE_FLOOR:
+        verdict = (f"SHIP {label} ({size}) — Δppl {qa['dppl']:+.2f}% / acc {qa['acc']:.4f} vs "
+                   f"bf16 {ref['acc']:.4f} / agree {qa['agree']:.4f} (~lossless; the served width is "
+                   f"validated e2e).")
     elif full:
-        verdict = (f"int6-g64 Δppl {i6['dppl']:+.2f}% / acc {i6['acc']:.4f} / agree {i6['agree']:.4f} "
+        verdict = (f"{label} Δppl {qa['dppl']:+.2f}% / acc {qa['acc']:.4f} / agree {qa['agree']:.4f} "
                    f"vs bf16 ppl {ref['ppl']:.3f} — INSPECT (regression or (1+w)-fold suspect).")
     else:
-        verdict = (f"SMOKE ok — both arms ran ({n_layers} layers); bf16 ppl {ref['ppl']:.3f}, int6 "
-                   f"Δppl {i6['dppl']:+.2f}% / agree {i6['agree']:.4f} (numbers not meaningful — "
+        verdict = (f"SMOKE ok — both arms ran ({n_layers} layers); bf16 ppl {ref['ppl']:.3f}, {label} "
+                   f"Δppl {qa['dppl']:+.2f}% / agree {qa['agree']:.4f} (numbers not meaningful — "
                    f"partial model; run with no args for the real verdict).")
     print(f"VERDICT: {verdict}", flush=True)
 
     _ck(math.isfinite(ref["ppl"]), "bf16 arm produced a non-finite ppl")
-    _ck(math.isfinite(i6["ppl"]), "int6 arm produced a non-finite ppl")
+    _ck(math.isfinite(qa["ppl"]), f"{label} arm produced a non-finite ppl")
     if full:
         _ck(ref["ppl"] < PPL_CEILING,
             f"bf16 ppl {ref['ppl']:.3f} >= {PPL_CEILING}: the (1+w) fold or forward is broken "
             f"(it degrades ppl uniformly — CLAUDE.md methodology #4)")
-        _ck(i6["dppl"] < DPPL_CEILING and i6["agree"] > AGREE_FLOOR,
-            f"int6-g64 regresses materially: Δppl {i6['dppl']:+.2f}% (ceiling {DPPL_CEILING}%), "
-            f"agree {i6['agree']:.4f} (floor {AGREE_FLOOR})")
+        _ck(qa["dppl"] < DPPL_CEILING and qa["agree"] > AGREE_FLOOR,
+            f"{label} regresses materially: Δppl {qa['dppl']:+.2f}% (ceiling {DPPL_CEILING}%), "
+            f"agree {qa['agree']:.4f} (floor {AGREE_FLOOR})")
     print(f"PARITY-CHECKS: {_N}", flush=True)
 
 
 if __name__ == "__main__":
-    nl = int(sys.argv[1]) if len(sys.argv) > 1 else None
-    nt = int(sys.argv[2]) if len(sys.argv) > 2 else N_TOK
-    run(nl, nt)
+    argv = sys.argv[1:]
+    art_path = ART
+    if "--artifact" in argv:
+        i = argv.index("--artifact")
+        art_path = argv[i + 1]
+        argv = argv[:i] + argv[i + 2:]
+    nl = int(argv[0]) if len(argv) > 0 else None
+    nt = int(argv[1]) if len(argv) > 1 else N_TOK
+    run(nl, nt, art_path)

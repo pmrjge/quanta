@@ -13,8 +13,8 @@ per-shard safetensors HEADERS only — **no tensor is materialized**, sub-second
   exactly the Nex case ⇒ native-MTP spec-decode is N/A);
 * the quant policy classifies EVERY source tensor — text keys EXACTLY match the on-disk index
   (rule 6, the loader key contract at 397B scale) and the whole vision tower is covered (dense);
-* the milestone: the **int6-g64** expert mix (int8 dense/attn/shared + bf16 control/indexer/vision)
-  is resident under 490.4 GiB (int4 projected too, for reference); a header-vs-file cross-check
+* the milestone: the **int4-g64** expert mix (int8 dense/attn/shared + bf16 control/indexer/vision)
+  is resident under 490.4 GiB (int6 projected too, the retired arm); a header-vs-file cross-check
   validates the byte accounting.
 
 Real-weight-PATH gate (reads ``~/models/MiniMax-M3``) ⇒ EXCLUDED from the model-free sweep, run
@@ -99,7 +99,7 @@ def run() -> None:
         f"keymap {len(cov['keymap'])} != index {len(wm)} (every tensor must be classified)"
     by_scheme = Counter(cov["keymap"].values())
 
-    # 3. resident projection from REAL header shapes: int6 (ship) AND int4 (reference) under ceiling
+    # 3. resident projection from REAL header shapes: int4 (ship) AND int6 (retired) under ceiling
     sizes = _tensor_sizes(d, wm)
     p6 = project_resident(sizes, cov["keymap"], expert_bits=6)
     p4 = project_resident(sizes, cov["keymap"], expert_bits=4)
@@ -129,12 +129,12 @@ def run() -> None:
           f"(incl. {len(cov['vision'])} vision dense)")
     print(f"source (mapped bf16)          : {p6['bf16_gib']:.1f} GiB  | on-disk {on_disk:.1f} GiB "
           f"over 59 shards")
-    print(f"resident int6-g64 mix (SHIP)  : {p6['mix_gib']:.1f} GiB  (experts "
-          f"{p6['gib']['expert_int']:.1f} + int8 {p6['gib']['int8']:.1f} + dense "
-          f"{p6['gib']['dense']:.1f})  headroom {CEILING_GIB - p6['mix_gib']:.1f}")
-    print(f"resident int4-g64 mix (ref)   : {p4['mix_gib']:.1f} GiB  (experts "
-          f"{p4['gib']['expert_int']:.1f})  headroom {CEILING_GIB - p4['mix_gib']:.1f}")
-    print(f"fits <= {CEILING_GIB} GiB          : int6 {fits6} / int4 {fits4}")
+    print(f"resident int4-g64 mix (SHIP)  : {p4['mix_gib']:.1f} GiB  (experts "
+          f"{p4['gib']['expert_int']:.1f} + int8 {p4['gib']['int8']:.1f} + dense "
+          f"{p4['gib']['dense']:.1f})  headroom {CEILING_GIB - p4['mix_gib']:.1f}")
+    print(f"resident int6-g64 mix (retired): {p6['mix_gib']:.1f} GiB  (experts "
+          f"{p6['gib']['expert_int']:.1f})  headroom {CEILING_GIB - p6['mix_gib']:.1f}")
+    print(f"fits <= {CEILING_GIB} GiB          : int4 {fits4} / int6 {fits6}")
 
     assert acct_ok, f"header bytes {hdr_total:.1f} GiB drifted from on-disk {on_disk:.1f} GiB (>1%)"
     assert fits6, f"int6 mix {p6['mix_gib']:.1f} GiB exceeds {CEILING_GIB} GiB"
@@ -143,7 +143,7 @@ def run() -> None:
 
     print("PARITY-CHECKS: 13")
     print(f"PASS — M3-VL parses, eos {cfg.eos_token_ids}, MTP {cfg.num_mtp_modules}, policy covers "
-          f"all {len(cov['keymap'])} tensors, resident int6 {p6['mix_gib']:.0f} GiB < {CEILING_GIB}.")
+          f"all {len(cov['keymap'])} tensors, resident int4 {p4['mix_gib']:.0f} GiB < {CEILING_GIB}.")
 
 
 if __name__ == "__main__":

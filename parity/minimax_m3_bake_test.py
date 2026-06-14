@@ -1,4 +1,4 @@
-"""Model-free gate for the MiniMax-M3-VL int6 bake — a tiny synthetic checkpoint, no real weights.
+"""Model-free gate for the MiniMax-M3-VL bake (int4 + int6) — a tiny synthetic checkpoint, no real weights.
 
 Builds a few-KB synthetic M3-VL checkpoint on disk (nested config + one safetensors shard + index +
 tokenizer/generation stubs), runs the REAL :func:`quanta.minimax.bake_m3.bake_minimax_m3` entry point
@@ -11,13 +11,13 @@ stub-vs-real interface rot in the bake + artifact surface without touching the r
 Checks (rel = ‖Δ‖ / ‖ref‖):
 
   (a) the artifact dequant of every quantized tensor is **bit-identical** to the RTN round-trip of the
-      source tensor (int8 attention/dense-FFN/shared, int6 routed-expert stacks) — proves the bake
+      source tensor (int8 attention/dense-FFN/shared, int4/int6 routed-expert stacks) — proves the bake
       quantizes exactly what the reader dequantizes, at the manifest-recorded width;
   (b) the **F32 router gate + e_score_correction_bias survive as F32** (read via ``get`` not ``read``)
       — bit-identical to the source, NOT bf16-downcast (a downcast could flip a top-k tie ⇒ a
       different expert; this is the M3-specific precision invariant);
   (c) dense norms / embed / head round-trip bf16-exact; the manifest schemes are right (experts
-      affine_packed bits=6, non-experts bits=8, norms/router/indexer/vision dense); ``raw`` returns
+      affine_packed bits=4/6, non-experts bits=8, norms/router/indexer/vision dense); ``raw`` returns
       3-D expert codes and refuses a dense key; the text reader refuses a vision key (the ViT weights
       ARE baked, reached via the vision track);
   (d) the artifact is self-contained (the bake's own audit ran) and its config declares the native 1M
@@ -45,7 +45,7 @@ from quanta.minimax.config_m3 import MiniMaxM3Config
 from quanta.minimax.loader_m3 import MiniMaxM3SourceCheckpoint
 
 GS = 32  # MLX affine group size (32/64/128 supported); divides every synthetic in-dim. real bake = 64
-BITS_EXPERT, BITS_INT8 = 6, 8
+BITS_INT8 = 8  # non-expert width (fixed); the routed-expert width is swept: int4 (shipped) + int6 (retired)
 
 # tiny dims — every QUANTIZED in-dim (hidden, q_dim, dense/shared/moe inter) is a multiple of GS=32
 VOCAB, H, HD = 48, 64, 16
@@ -169,14 +169,13 @@ def _rtn(w: mx.array, bits: int) -> mx.array:
     return mx.dequantize(pq, sc, b, group_size=GS, bits=bits).astype(mx.bfloat16)
 
 
-def run() -> None:
-    mx.random.seed(0)
-    src = _build_checkpoint()
-    out = src + "_int6g64"
+def _check_bake(src: str, cfg: MiniMaxM3Config, bits: int) -> None:
+    """Bake the synthetic checkpoint at routed-expert width ``bits`` and round-trip it through BOTH
+    readers (the same checks for any width — the bake/artifact path is bits-agnostic, the manifest
+    carries the width). Cleans up its own ``out`` dir."""
+    out = f"{src}_int{bits}g64"
     try:
-        cfg = MiniMaxM3Config.from_pretrained(src)
-        stats = bake_minimax_m3(src, out, group_size=GS, expert_bits=BITS_EXPERT,
-                                scale_dtype=mx.bfloat16)
+        stats = bake_minimax_m3(src, out, group_size=GS, expert_bits=bits, scale_dtype=mx.bfloat16)
         ck = MiniMaxM3SourceCheckpoint(src, cfg)          # bf16 source reader
         art = MiniMaxM3Artifact(out)                       # dequant-on-read baked reader
         man = json.loads((Path(out) / "manifest.json").read_text())["tensors"]
@@ -190,13 +189,13 @@ def run() -> None:
         dm_src, dm_art = ck.dense_mlp(L_DENSE), art.dense_mlp(L_DENSE)
         dense_err = max(_rel(dm_art[pj], _rtn(dm_src[pj], BITS_INT8)) for pj in dm_src)
         m_src, m_art = ck.moe(L_MOE), art.moe(L_MOE)
-        eg_err = _rel(m_art["experts_gate_up"], _rtn(m_src["experts_gate_up"], BITS_EXPERT))
-        ed_err = _rel(m_art["experts_down"], _rtn(m_src["experts_down"], BITS_EXPERT))
+        eg_err = _rel(m_art["experts_gate_up"], _rtn(m_src["experts_gate_up"], bits))
+        ed_err = _rel(m_art["experts_down"], _rtn(m_src["experts_down"], bits))
         shared_err = max(_rel(m_art[f"shared_{pj}"], _rtn(m_src[f"shared_{pj}"], BITS_INT8))
                          for pj in ("gate_proj", "up_proj", "down_proj"))
         _ck(attn_err < 1e-6, f"int8 attn dequant != source RTN: {attn_err:.2e}")
         _ck(dense_err < 1e-6, f"int8 dense-FFN dequant != source RTN: {dense_err:.2e}")
-        _ck(eg_err < 1e-6 and ed_err < 1e-6, f"int6 expert dequant != source RTN: {eg_err:.2e}/{ed_err:.2e}")
+        _ck(eg_err < 1e-6 and ed_err < 1e-6, f"int{bits} expert dequant != source RTN: {eg_err:.2e}/{ed_err:.2e}")
         _ck(shared_err < 1e-6, f"int8 shared dequant != source RTN: {shared_err:.2e}")
 
         # (b) F32 router gate + bias survive as F32, bit-identical (NOT bf16-downcast) -------------
@@ -219,8 +218,8 @@ def run() -> None:
         sp = "language_model.model.layers.3.self_attn."
         schemes_ok = (
             man[mp + "experts.gate_up_proj"]["format"] == "affine_packed"
-            and man[mp + "experts.gate_up_proj"]["bits"] == BITS_EXPERT
-            and man[mp + "experts.down_proj"]["bits"] == BITS_EXPERT
+            and man[mp + "experts.gate_up_proj"]["bits"] == bits
+            and man[mp + "experts.down_proj"]["bits"] == bits
             and man[sp + "q_proj"]["format"] == "affine_packed" and man[sp + "q_proj"]["bits"] == BITS_INT8
             and man[mp + "gate.weight"]["format"] == "dense"
             and man[mp + "gate.weight"]["dtype"] == "float32"
@@ -256,23 +255,33 @@ def run() -> None:
         audit_ok = stats["self_contained"]["leaks"] == "none" and stats["self_contained"]["symlinks"] == 0
         counts_ok = (stats["counts"]["expert_int"] == 2          # 1 MoE layer × {gate_up, down}
                      and stats["vision_tensors"] == 5
-                     and stats["expert_bits"] == BITS_EXPERT)
+                     and stats["expert_bits"] == bits)
         _ck(audit_ok, f"self-contained audit not clean: {stats['self_contained']}")
         _ck(counts_ok, f"scheme/vision counts wrong: {stats['counts']} vis={stats['vision_tensors']}")
 
-        print("\n=== MiniMax-M3-VL bake gate (model-free, tiny synthetic) ===")
+        print(f"\n=== MiniMax-M3-VL bake gate (model-free, tiny synthetic) — int{bits} experts ===")
         print(f"(a) int8 attn {attn_err:.1e} / dense {dense_err:.1e} / shared {shared_err:.1e}; "
-              f"int6 experts {eg_err:.1e}/{ed_err:.1e}  (all == source RTN)")
+              f"int{bits} experts {eg_err:.1e}/{ed_err:.1e}  (all == source RTN)")
         print(f"(b) router gate+bias F32-preserved bit-exact: {gate_exact and bias_exact}")
         print("(c) dense round-trip exact; manifest schemes ok; raw 3-D + dense/vision refusals ok")
         print(f"(d) self-contained {audit_ok}; native 1M + marker {ctx_ok}; counts {stats['counts']} "
               f"vision {stats['vision_tensors']}")
-        print(f"PARITY-CHECKS: {_N}")
-        print("PASS — M3 bake: int6 experts + int8 non-experts dequant == source RTN; F32 router "
+    finally:
+        shutil.rmtree(out, ignore_errors=True)
+
+
+def run() -> None:
+    mx.random.seed(0)
+    src = _build_checkpoint()
+    try:
+        cfg = MiniMaxM3Config.from_pretrained(src)
+        for bits in (4, 6):  # int4 = the shipped width going forward; int6 = the retired arm, still gated
+            _check_bake(src, cfg, bits)
+        print(f"\nPARITY-CHECKS: {_N}")
+        print("PASS — M3 bake: int4/int6 experts + int8 non-experts dequant == source RTN; F32 router "
               "preserved; dense/vision verbatim; native-1M self-contained VL artifact round-trips.")
     finally:
         shutil.rmtree(src, ignore_errors=True)
-        shutil.rmtree(out, ignore_errors=True)
 
 
 if __name__ == "__main__":

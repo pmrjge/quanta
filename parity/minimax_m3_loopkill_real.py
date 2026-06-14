@@ -1,13 +1,19 @@
 """MiniMax-M3-VL M3-3: real-weight GQA loop-kill re-gate @ 397B (SOLO).
 
-Validates the M3-3 GQA loop-kill on the REAL int6-g64 artifact at full scale, off ONE ~325 GiB
+Validates the M3-3 GQA loop-kill on the REAL int4-g64 artifact at full scale, off ONE ~233 GiB
 resident load. The loop-kill replaces M3-2's per-stream decode-attention loop with ONE batched
 attention across all ``B`` streams (batched chunked q/k/v/o projections + per-stream RoPE + the shared
-fused padded SDPA); it is the decode path the serving runtime ships
-(:data:`quanta.minimax.batched_runtime_m3.MINIMAX_M3_BATCHED_LOOPKILL_DEFAULT` is ON).
+fused padded SDPA).
+
+**At int4 the loop-kill is NOT the serving default** — :func:`_resolve_loopkill_default` auto-disables
+it for int4 because the coarse int4 MoE amplifies the fused padded-SDPA reduction-order ULP past
+bit-exactness (~0.875 token-agree @ B=8 vs int6's BIT-EXACT — the user's rule-4 call: fall back to the
+proven per-stream loop). So this gate **force-enables** loop-kill (``loopkill=True``) to validate the
+PATH is still the bounded SDPA-reorder regime (not a systematic bug), and separately asserts the int4
+auto-default is OFF. The per-stream loop is the int4 serving attention.
 
 One :class:`~quanta.minimax.batched_runtime_m3.MiniMaxM3BatchedResidentModel` load (``packed=True`` +
-``packed_experts=True`` ⇒ loop-kill ON by default) provides the loop-kill path; a per-stream-loop
+``packed_experts=True`` + explicit ``loopkill=True``) provides the loop-kill path; a per-stream-loop
 sibling and a single-stream reference are built over the SAME resident layers (zero extra memory) via
 ``from_inner(..., loopkill=False)`` and :meth:`MiniMaxM3ResidentModel.from_blocks`, so all checks share
 the one load.
@@ -23,7 +29,7 @@ the one load.
   2. **loop-kill == single-stream decode, ragged @ B (end-to-end anchor).** One batched loop-kill step
      vs each stream's single-stream decode at the same offset — the same greedy-token-equivalent claim
      the M3-2 re-gate makes for the per-stream path, now for the loop-kill.
-  3. **ppl sanity.** The resident prefill ships a healthy 397B teacher-forced ppl (~5.0, the M2b int6
+  3. **ppl sanity.** The resident prefill ships a healthy 397B teacher-forced ppl (~5.0, the M2b int4
      value) — the loop-kill is decode-only (prefill is unchanged), so this just confirms the load.
   4. **decode throughput lever (informational).** Aggregate decode tok/s of the loop-kill vs the
      per-stream loop at B=1 and B=``B`` — the loop-kill reads each mixer weight ⌈B/chunk⌉× instead of
@@ -46,23 +52,26 @@ import mlx.core as mx
 
 from parity.minimax_m3_ppl import PROSE, streamed_logits, teacher_forced
 from quanta.minimax.artifact_m3 import MiniMaxM3Artifact
+import quanta.minimax.batched_runtime_m3 as BR
 from quanta.minimax.batched_runtime_m3 import MiniMaxM3BatchedResidentModel
 from quanta.minimax.config_m3 import MiniMaxM3Config
 from quanta.minimax.runtime_m3 import MiniMaxM3ResidentModel
 from quanta.minimax.tokenizer import MiniMaxTokenizer
 
 SRC = "/Users/pmrj/models/MiniMax-M3"
-INT6 = "/Users/pmrj/models/MiniMax-M3-quanta_int6g64"
+ART = "/Users/pmrj/models/MiniMax-M3-quanta_int4g64"
 N_TOK = 256          # a parity re-gate, not a ppl measurement
-PPL_CEILING = 30.0   # the served runtime must ship a healthy 397B ppl (the M2b int6 value ~5.0)
+PPL_CEILING = 30.0   # the served runtime must ship a healthy 397B ppl (the M2b int4 value ~5.0)
 B = 8                # batched streams for the loop-kill equivalence + throughput probe
 N_DECODE = 8         # teacher-forced decode steps for the multi-step equivalence
 # loop-kill vs per-stream loop differ ONLY by the fused padded-SDPA reorder (projections bit-exact
-# chunked, RoPE bit-identical, the batched MoE shared) — tighter than M3-2's batched-vs-single (which
-# also reorders the router GEMM). A near-tie SDPA flip on one (stream,step) is ~0.08 rel on that row; a
-# SYSTEMATIC bug (wrong offset / mis-threaded cache) blows up ALL rows to O(1).
-LK_REL_CEIL = 0.15
-LK_AGREE_FLOOR = 0.90  # fraction of (stream,step) comparisons whose loop-kill top-1 matches the loop
+# chunked, RoPE bit-identical, the batched MoE shared). At int6 this was BIT-EXACT; at int4 the coarse
+# MoE amplifies the reorder to a worst row of ~0.19 rel / 0.875 token-agree @ B=8 (scattered near-tie
+# flips, NOT the O(1)-all-rows signature of a systematic bug). These int4-loosened bounds confirm the
+# force-enabled path is that benign reorder regime — it is NOT graduated as the int4 serving default
+# (auto-OFF), so this is a "not broken", not an equivalence, gate. (int6 used 0.15 / 0.90.)
+LK_REL_CEIL = 0.30
+LK_AGREE_FLOOR = 0.80  # fraction of (stream,step) comparisons whose loop-kill top-1 matches the loop
 
 _N = 0
 
@@ -104,16 +113,21 @@ def run(n_layers: int | None = None, n_tok: int = N_TOK) -> None:
     print(f"=== MiniMax-M3-VL M3-3 GQA loop-kill re-gate — {len(ids_list)} tok, "
           f"{'all 60' if full else n_layers} layers (SOLO) ===", flush=True)
 
-    # ---- ONE resident load: loop-kill ON (the serving default), packed mixer + packed experts ------
+    # ---- ONE resident load: FORCE loop-kill ON (int4 default is OFF), packed mixer + packed experts --
     t0 = time.perf_counter()
-    lk = MiniMaxM3BatchedResidentModel(INT6, max_batch=max(B, 2), n_layers=n_layers,
-                                       packed=True, packed_experts=True)            # loopkill defaults ON
+    lk = MiniMaxM3BatchedResidentModel(ART, max_batch=max(B, 2), n_layers=n_layers,
+                                       packed=True, packed_experts=True, loopkill=True)  # forced ON to gate
     t_load = time.perf_counter() - t0
+    # the int4 SERVING default auto-disables loop-kill (rule 4 — parity not bit-exact at int4): assert the
+    # resolver the constructor uses returns OFF for this artifact's width (no second 233 GiB load needed).
+    eb = BR._served_expert_bits(lk.layers)
+    _ck(BR._resolve_loopkill_default(eb) is False,
+        f"int4 loop-kill default must be OFF (served expert bits {eb}); the serving attention is per-stream")
     # per-stream-loop sibling + single-stream ref over the SAME resident layers (no copy)
     loop = MiniMaxM3BatchedResidentModel.from_inner(lk.layers, lk.embed_w, lk.norm_w, lk.lm_head_w,
                                                     lk.cfg, max_batch=max(B, 2), loopkill=False)
     single = MiniMaxM3ResidentModel.from_blocks(lk.layers, lk.embed_w, lk.norm_w, lk.lm_head_w, lk.cfg)
-    _ck(lk._loopkill and lk.packed, "loop-kill model is not loopkill+packed")
+    _ck(lk._loopkill and lk.packed, "loop-kill model is not loopkill+packed (forced)")
     _ck(not loop._loopkill, "per-stream-loop sibling did not pin loopkill=False")
     n_built = lk.num_layers
     print(f"  loaded {n_built}L resident in {t_load:.0f}s (loopkill={lk._loopkill}, "
@@ -182,7 +196,7 @@ def run(n_layers: int | None = None, n_tok: int = N_TOK) -> None:
     _ck(math.isfinite(ppl_res), "non-finite resident ppl")
     if full:
         # cross-check against the streamed bf16 reference (same codes) — confirms the load is the M2b model
-        art = MiniMaxM3Artifact(INT6)
+        art = MiniMaxM3Artifact(ART)
         logits_ref = streamed_logits(art, art.cfg, ids, n_layers=n_layers)
         ppl_ref, _, argmax_ref = teacher_forced(logits_ref, ids)
         del art
@@ -219,9 +233,11 @@ def run(n_layers: int | None = None, n_tok: int = N_TOK) -> None:
     mx.clear_cache()
 
     if full:
-        print(f"\nVERDICT: M3-3 GQA loop-kill VALIDATED @ 397B — ONE batched attention across streams "
-              f"== the per-stream loop (top-1 {agree:.4f}, rel {worst_rel:.1e}) and the single-stream "
-              f"decode (top-1 {top1_2:.3f}); ships the M2b int6 quality (ppl {ppl_res:.3f}).", flush=True)
+        print(f"\nVERDICT: M3-3 GQA loop-kill @ 397B int4 — force-enabled path is the bounded SDPA-reorder "
+              f"regime vs the per-stream loop (top-1 {agree:.4f}, worst rel {worst_rel:.1e} — not a "
+              f"systematic bug) but NOT bit-exact at int4, so it is AUTO-OFF as the int4 serving default "
+              f"(rule 4 — the per-stream loop serves); resident ppl {ppl_res:.3f} (healthy int4).",
+              flush=True)
     else:
         print(f"\nSMOKE ok — loop-kill ran ({nb} streams, {n_built} layers); top-1 {agree:.4f}, "
               f"rel {worst_rel:.1e} (numbers not meaningful on a partial model).", flush=True)

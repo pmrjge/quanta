@@ -13,7 +13,7 @@ against the REAL index, which is the equivalent guarantee.
 Schemes:
 
 * ``expert_int``  — the routed-expert FFN weights (``block_sparse_moe.experts.<e>.{w1,w2,w3}``)
-  → affine ``expert_bits`` g64 (the dominant footprint; the user ships **int6**, ``expert_bits=6``).
+  → affine ``expert_bits`` g64 (the dominant footprint; the user ships **int4**, ``expert_bits=4``).
 * ``int8``        — matmul projections (GQA q/k/v/o), the dense-FFN ``mlp.{gate,up,down}_proj``
   (layers 0–2), and the shared expert (``block_sparse_moe.shared_experts.*``) → int8 affine.
 * ``dense``       — kept verbatim (bf16/f32): every RMSNorm (incl. per-head q/k norm + the
