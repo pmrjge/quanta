@@ -349,14 +349,45 @@ re-implements the jinja `to_xml`/invoke/section macros and the parser is asserte
 flat/typed/nested-mapping/list-of-scalars/list-of-dicts[the template's own example]/None-skip/multi-section
 args [documenting the empty-container→`""` collapse, intrinsic to the markup], + `<mm:think>` reasoning
 shapes, `<response>` formatting, Protocol conformance, markup disjointness vs all four siblings + the
-dispatcher routing). Manifest **114 model_free / 53 real_weight** (+1). **Next (M3-7b) =** the
-`_MiniMaxM3BatchedSession` engine route (load-runtime + decode-stepper + batched-session dispatch on
-`model_type` `minimax_m3*` — currently swallowed by the M2.7 `mt.startswith("minimax")` route) + the chat
-template / `apply_chat_template` rendering path + the multimodal image input path (wiring the V3a splice
-through `batched_runtime_m3`) + multi-stream. **Then** the **trained block-sparse attention** long-context
-compute lever (deferred — no M3 forward exists; only sparse==dense-at-short-ctx is bit-gateable, the
-exact selection formula leans on a heavy 397B long-context ppl arbiter; it is a speed optimization on
-an already-correct dense path).
+dispatcher routing). Manifest **114 model_free / 53 real_weight** (+1). **M3-7b is decomposed M3-style
+(M3-7b-1 the text engine route, M3-7b-2 the multimodal image input path, …).**
+**M3-7b-1 / oMLX shim — text engine route ✅ (this commit)** — `minimax_m3_vl` is now a served
+`model_type` in `quanta.shim.omlx` (single-stream + batched + paged + chunked, text-only). The
+**routing hazard** this milestone closes: `"minimax_m3_vl".startswith("minimax")` is True, so without an
+M3-first branch the M2.7 `mt.startswith("minimax")` route would silently build the WRONG runtime/cache
+(a different architecture + bos/eos set — rule 6). Added a `mt.startswith("minimax_m3")` branch **before**
+the M2.7 `minimax` branch in all three dispatchers — `_default_runtime_loader` (→ `MiniMaxM3ResidentModel`
++ a new `MiniMaxTokenizer.from_pretrained_m3`, the M3-config tokenizer whose bos/eos set differs from
+M2.7's; the M2.7 `MiniMaxConfig` parse would mis-read the nested `minimax_m3_vl` config), `_make_stepper`
+(→ new **`_MiniMaxM3Stepper`**), `_make_batched_session` (→ new **`_MiniMaxM3BatchedSession`**). Two
+M3-specific decode shapes drove the bespoke adapters (the generic `_SingleTokenStepper` / sibling sessions
+don't fit): (a) `MiniMaxM3ResidentModel.__call__` reads the absolute position from each per-layer
+`KVCache.offset` — it has **NO `offset=` arg** (unlike GLM/M2.7/Qwen3.5), so `_MiniMaxM3Stepper` owns one
+per-layer cache *list* and threads it WITHOUT passing offset (prefill = one cached forward, bit-exact to
+the M3-1 reference; prompts `>= MINIMAX_M3_CHUNKED_PREFILL_FROM` route through `prefill_chunked`, the M3-5
+O(chunk) long-admit); (b) `make_caches()` returns a per-LAYER cache *list*, so `_MiniMaxM3BatchedSession`
+(the clean #152 paged case — dense GQA, int8 KV, no recurrent state, like InternLM2.5) holds `list[KVCache]`
+per slot and overrides `_step_offsets → [c[0].offset for c in caches]` (layer-0 offset is the stream's
+absolute position; the paged step supplies explicit offsets) + `_to_prefill_ids`/`_to_step_tokens` (plain
+ints). M3 registered in `BEST_BATCH` at **32** = the uniform `SERVING_BATCH_CAP` (a PROVISIONAL operating
+point — the measured throughput knee is a deferred SOLO bench, like every other keeper's — so M3 serving
+is capped at 32 from day one, user directive). The runtime self-resolves its M3-3 loop-kill per
+expert-width (AUTO-OFF at the served int4 ⇒ per-stream attention, keeping the M3-2 batched-MoE
+read-amortization) and honors `paged_kv` via `paged_kv_spec` (int8-g64 KV, bit-identical to the discrete
+cache — the M3-4 gate). Gates: model-free `parity/minimax_m3_omlx_engine_test.py` (22 checks, in the
+sweep — synthetic artifact + stub runtimes: loader-dispatch order [`minimax_m3_vl`→M3 NOT swallowed,
+`minimax_m2`→M2.7, disjoint both ways, monkeypatched stubs], stepper/batched-session dispatch,
+single-stream cache-offset threading [the fake `__call__` REJECTS `offset=` ⇒ a TypeError would surface]
++ raw markers + eos + chunked routing, batched==single-stream output-equivalence [rule 4] + continuous
+batching + the layer-0-offset/plain-int slot contract [the stub asserts `offsets[i]==caches[i][0].offset`],
+rule-6 empty-prompt/unknown-model_type) + `parity/omlx_best_batch_test.py` extended (M3 @ 32 = serving cap;
+5 declared points). Manifest **115 model_free / 53 real_weight** (+1). **Next (M3-7b-2) =** the multimodal
+image input path — wire the V3a splice (`splice_image_embeddings` / `multimodal_prefill`) through the oMLX
+request path (OpenAI image-content messages → native `image_m3` processor → ViT → splice → prefill) + the
+real-weight chat-template render re-gate (the M3 `chat_template.jinja` markup through `render_chat`; tokenizer
+only, no 233 GiB load). **Then** the **trained block-sparse attention** long-context compute lever (deferred
+— no M3 forward exists; only sparse==dense-at-short-ctx is bit-gateable, the exact selection formula leans
+on a heavy 397B long-context ppl arbiter; it is a speed optimization on an already-correct dense path).
 
 The rest of the served fleet is **complete, shipped, and parity-gated**. Per-model resident sizes are
 in the Serving throughput table below; the detailed milestone handovers live in the `PLAN_*.md` files

@@ -97,6 +97,11 @@ BEST_BATCH: tuple[tuple[str, int], ...] = (
     #                       on hand, so a lone request still decodes at B=1); B=4 caps concurrency low
     #                       to keep per-token latency down while still amortizing the routed-MoE read
     #                       across a few overlapping agent traces. Pin an explicit batch_size to sweep.
+    ("minimax_m3", 32),   # MiniMax-M3-VL (M3-7b): PROVISIONAL operating point = the uniform serving cap,
+    #                       NOT yet a measured knee. The throughput bench (a deferred SOLO re-gate, like
+    #                       every other keeper's) will confirm/replace it; 32 is chosen so M3 serving is
+    #                       capped at SERVING_BATCH_CAP from day one (user directive: serving never
+    #                       exceeds 32) and defaults to a fleet-typical B (the 306 GiB Ultra peaks @ 32).
 )
 DEFAULT_BATCH_CAPACITY = 8  # generic fallback for a model class with no measured operating point
 SERVING_BATCH_CAP = 32      # UNIFORM hard ceiling on concurrent decode slots for every throughput WORKER
@@ -299,6 +304,15 @@ def _default_runtime_loader(root: Path) -> tuple[RuntimeLike, TokenizerLike]:
         from quanta.glm.tokenizer import GLMTokenizer
 
         return GLMResidentModel(root), GLMTokenizer.from_pretrained(str(root))
+    if mt.startswith("minimax_m3"):  # MiniMax-M3-VL — checked BEFORE the M2.7 ``minimax`` prefix it would
+        # otherwise be swallowed by (``minimax_m3_vl``.startswith("minimax") is True). Different
+        # architecture (dense GQA + 128-expert sparse MoE + ViT) and a different bos/eos set than M2.7,
+        # so it gets its own resident runtime + an M3-config tokenizer (rule 6: never the M2.7 parse).
+        from quanta.minimax.runtime_m3 import MiniMaxM3ResidentModel
+        from quanta.minimax.tokenizer import MiniMaxTokenizer
+
+        return (MiniMaxM3ResidentModel(root),
+                _RenderChatAdapter(MiniMaxTokenizer.from_pretrained_m3(str(root))))
     if mt.startswith("minimax"):  # MiniMax-M2.7 (GQA); render_chat tokenizer needs the adapter
         from quanta.minimax.runtime import MiniMaxResidentModel
         from quanta.minimax.tokenizer import MiniMaxTokenizer
@@ -322,7 +336,8 @@ def _default_runtime_loader(root: Path) -> tuple[RuntimeLike, TokenizerLike]:
                 _RenderChatAdapter(InternLM2Tokenizer.from_pretrained(str(root))))
     raise OmlxShimError(
         f"no resident runtime for quanta artifact model_type={mt!r} "
-        "(supported: kimi, deepseek_v3, deepseek_v4, nemotron, glm, minimax, qwen2, qwen3_5, internlm2)"
+        "(supported: kimi, deepseek_v3, deepseek_v4, nemotron, glm, minimax_m3, minimax, qwen2, "
+        "qwen3_5, internlm2)"
     )
 
 
@@ -537,6 +552,40 @@ class _SingleTokenStepper:
         row = self._rt(mx.array([tok]), caches=self._cache, offset=self._offset)[0, -1]
         self._offset += 1
         return row
+
+
+class _MiniMaxM3Stepper:
+    """Single-token decode session for the MiniMax-M3-VL resident runtime.
+
+    Unlike GLM / M2.7 / Qwen3.5 (whose ``__call__`` takes an explicit ``offset=``),
+    :class:`quanta.minimax.runtime_m3.MiniMaxM3ResidentModel` reads the absolute position from each
+    per-layer :class:`~quanta.minimax.model_m3.KVCache`'s own ``offset`` (the cache is grown in place),
+    so this stepper owns ONE per-layer cache *list* and threads it across the request — it does NOT pass
+    ``offset``. ``prefill`` consumes the whole prompt in a single cached forward (bit-identical to the
+    ``caches=None`` reference — the M3-1 gate), routing prompts ``>= chunk_from`` through
+    :meth:`MiniMaxM3ResidentModel.prefill_chunked` (the O(chunk)-memory long-admit path — M3-5) so a
+    1M-token prompt never materializes the whole ``[1,T,vocab]``. Each ``step`` decodes one token at the
+    running offset. Returns the last-position logits row ``[vocab]``."""
+
+    def __init__(self, runtime: RuntimeLike, *, chunk_from: int | None = None) -> None:
+        self._rt = runtime
+        self._cache = runtime.make_caches()           # list[KVCache], one per layer (grown in place)
+        self._chunk_from = chunk_from                 # >= this many prompt tokens ⇒ chunked admit (M3-5)
+
+    def prefill(self, prompt_ids: list[int]) -> mx.array:
+        if not prompt_ids:
+            raise OmlxShimError("prefill got an empty prompt")
+        ids = mx.array([int(t) for t in prompt_ids], dtype=mx.int32)
+        if self._chunk_from is not None and len(prompt_ids) >= self._chunk_from:
+            row = self._rt.prefill_chunked(ids, caches=self._cache)[0, -1]   # O(chunk) memory (M3-5)
+        else:
+            row = self._rt(ids, caches=self._cache)[0, -1]                   # bit-exact single-shot (M3-1)
+        mx.eval(row)
+        return row
+
+    def step(self, tok: int) -> mx.array:
+        # No offset arg — the per-layer KVCache tracks its own grown offset (M3 decode convention).
+        return self._rt(mx.array([int(tok)], dtype=mx.int32), caches=self._cache)[0, -1]
 
 
 # --- Reasoning-parser contract ----------------------------------------------------------------------
@@ -930,6 +979,43 @@ class _InternLM2BatchedSession(_BaseBatchedSession):
 
     def _step_offsets(self, caches: list[Any]) -> list[int] | None:
         return None  # InternLM2Cache.offset is authoritative (paged step passes explicit offsets)
+
+
+class _MiniMaxM3BatchedSession(_BaseBatchedSession):
+    """MiniMax-M3-VL batched session — the clean #152 paged case (dense GQA on all 60 layers, int8 KV
+    by default, NO recurrent state, like InternLM2.5). Two M3-specific shapes drive the hook overrides:
+
+    * ``make_caches()`` returns a per-**layer** :class:`~quanta.minimax.model_m3.KVCache` *list* (not a
+      single object), so a slot's state is ``list[KVCache]`` and the step offset is read off layer 0
+      (``caches[0].offset``) — the discrete-cache equivalent of each view's offset on the paged path.
+    * ``step_batch(stream_token_ids, stream_caches, offsets)`` takes plain int token ids + explicit
+      per-stream offsets (no ``offset=None`` shortcut — M3 needs them; the paged step supplies them).
+
+    The runtime self-resolves its M3-3 GQA loop-kill per expert-width (AUTO-OFF at the served int4 ⇒
+    per-stream attention; the big M3-2 batched-MoE read-amortization stays on) and honors ``paged_kv``
+    via its ``paged_kv_spec`` (int8-g64 KV, bit-identical to the discrete cache — the M3-4 gate).
+    Lazy-imports the batched runtime so the shim still loads when that module is absent (loud on use,
+    rule 6)."""
+
+    def _make_runtime(self, root: str | Path, capacity: int) -> Any:
+        from quanta.minimax.batched_runtime_m3 import MiniMaxM3BatchedResidentModel  # lazy
+
+        return MiniMaxM3BatchedResidentModel(root, max_batch=capacity)
+
+    def _new_cache(self) -> Any:
+        return self._rt.make_caches()                  # list[KVCache], one per layer
+
+    def _to_prefill_ids(self, prompt_ids: list[int]) -> Any:
+        return list(prompt_ids)                        # M3 prefill takes a plain int iterable
+
+    def _to_step_tokens(self, tokens: list[int]) -> list[Any]:
+        return [int(t) for t in tokens]                # M3 step_batch takes plain int token ids
+
+    def _step_offsets(self, caches: list[Any]) -> list[int] | None:
+        # Each slot's unpaged state is a per-layer cache list; layer 0's grown offset is the stream's
+        # absolute position (every layer caches identically — uniform full-attention). The paged step
+        # supplies explicit offsets and never calls this.
+        return [c[0].offset for c in caches]
 
 
 class _Qwen35BatchedSession(_BaseBatchedSession):
@@ -1520,6 +1606,12 @@ class QuantaOmlxEngine(_OmlxBaseEngine):
             # int8 MLA latent by default — Kimi pattern (#47). Caller passes a bf16 cache directly
             # if they need it (e.g. tight parity testing); oMLX serving always wants int8.
             return _SingleTokenStepper(self._runtime, GLMCache(self._runtime.num_layers, quantized=True))
+        if mt.startswith("minimax_m3"):  # MiniMax-M3-VL — before the M2.7 ``minimax`` prefix; M3's
+            # __call__ reads the offset from each KVCache (no ``offset=`` arg), so it needs its own
+            # stepper, not the generic _SingleTokenStepper.
+            from quanta.minimax.batched_runtime_m3 import MINIMAX_M3_CHUNKED_PREFILL_FROM
+
+            return _MiniMaxM3Stepper(self._runtime, chunk_from=MINIMAX_M3_CHUNKED_PREFILL_FROM)
         if mt.startswith("minimax"):
             from quanta.minimax.decode import MiniMaxCache
 
@@ -1613,10 +1705,12 @@ class QuantaOmlxEngine(_OmlxBaseEngine):
             self._batched_session = _Qwen35BatchedSession(self._root, **{**kw, "paged_kv": False})
         elif mt == "internlm2" or mt.startswith("internlm2"):
             self._batched_session = _InternLM2BatchedSession(self._root, **kw)
+        elif mt.startswith("minimax_m3"):  # before any generic minimax (M2.7 has no batched runtime)
+            self._batched_session = _MiniMaxM3BatchedSession(self._root, **kw)
         else:
             raise OmlxShimError(
                 f"no batched runtime for quanta artifact model_type={mt!r} "
-                "(DSV4 / Nemotron / InternLM2.5 only)")
+                "(DSV4 / Nemotron / InternLM2.5 / MiniMax-M3 only)")
         return self._batched_session
 
     def _ensure_eagle(self) -> tuple[Any, mx.array, mx.array, tuple[int, ...], int | None]:

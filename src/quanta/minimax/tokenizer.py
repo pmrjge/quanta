@@ -160,6 +160,26 @@ class MiniMaxTokenizer:
         tok._chat_template = _load_chat_template(d)
         return tok
 
+    @classmethod
+    def from_pretrained_m3(cls, path: str) -> "MiniMaxTokenizer":
+        """Load for a **MiniMax-M3-VL** artifact (the oMLX serving path). Identical BPE machinery to
+        :meth:`from_pretrained`, but the token ids come from :class:`quanta.minimax.config_m3.\
+MiniMaxM3Config` — the M3 bos/eos set (200019/200020) differs from M2.7's, and the M2.7
+        :class:`MiniMaxConfig` parse would silently mis-read the nested ``minimax_m3_vl`` config
+        (rule 6: never derive the stop set from the wrong config). The chat template (the M3 markup —
+        ``]<]minimax[>[`` sections, ``<mm:think>`` reasoning) loads from ``tokenizer_config.json`` /
+        ``chat_template.jinja`` exactly as for M2.7."""
+        from quanta.minimax.config_m3 import MiniMaxM3Config  # noqa: PLC0415 — avoid an import cycle
+        if os.path.isdir(path):
+            d, json_path = path, os.path.join(path, "tokenizer.json")
+        else:
+            d, json_path = os.path.dirname(path), path
+        if not os.path.isfile(json_path):
+            raise FileNotFoundError(f"tokenizer.json not found at {json_path}")
+        tok = cls(json_path, MiniMaxM3Config.from_pretrained(d))
+        tok._chat_template = _load_chat_template(d)
+        return tok
+
     @property
     def vocab_size(self) -> int:
         return len(self.decoder)

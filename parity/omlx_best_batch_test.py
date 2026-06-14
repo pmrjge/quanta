@@ -68,6 +68,7 @@ def _run_resolver() -> bool:
         "internlm2": 32, "internlm2_5": 32,                    # worker knee (#21); canonical + suffix
         "qwen3_5": 4, "qwen3_5_moe": 4, "qwen3_5_moe_text": 4,  # orchestrator point (#26); canonical
         #                                                        model_type is the underscore form
+        "minimax_m3": 32, "minimax_m3_vl": 32,                 # M3-7b provisional point (= serving cap)
     }
     unmeasured = ("glm_moe_dsa", "minimax_m2", "qwen2", "deepseek", "kimi_k2", "", None)
     hit = all(_best_batch_for(mt) == b for mt, b in measured.items())
@@ -81,10 +82,11 @@ def _run_knee_values() -> bool:
     """The hardcoded constants are exactly the declared operating points (typo/accidental-edit guard)."""
     table = dict(BEST_BATCH)
     ok = (table.get("deepseek_v4") == 48 and table.get("nemotron") == 32
-          and table.get("internlm2") == 32 and table.get("qwen3_5") == 4 and len(BEST_BATCH) == 4
+          and table.get("internlm2") == 32 and table.get("qwen3_5") == 4
+          and table.get("minimax_m3") == 32 and len(BEST_BATCH) == 5
           and SERVING_BATCH_CAP == 32)
     print(f"  [{'OK' if ok else 'FAIL'}] operating values: deepseek_v4=48, nemotron=32, internlm2=32, "
-          f"qwen3_5=4, fallback={DEFAULT_BATCH_CAPACITY}, serving_cap={SERVING_BATCH_CAP}, "
+          f"qwen3_5=4, minimax_m3=32, fallback={DEFAULT_BATCH_CAPACITY}, serving_cap={SERVING_BATCH_CAP}, "
           f"n_declared={len(BEST_BATCH)}")
     return ok
 
@@ -99,6 +101,7 @@ def _run_engine_default_capacity() -> bool:
     eng_intern = QuantaOmlxEngine(_fake_artifact("internlm2", nested=False))
     eng_qwen = QuantaOmlxEngine(_fake_artifact("qwen3_5_moe_text", nested=True))
     eng_glm = QuantaOmlxEngine(_fake_artifact("glm_moe_dsa", nested=False))
+    eng_m3 = QuantaOmlxEngine(_fake_artifact("minimax_m3_vl", nested=False))
     checks = {
         "dsv4 @100→32 (serving cap; knee 48)": eng_dsv4._default_capacity(100) == 32,
         "dsv4 @4→4 (prompt clamp)": eng_dsv4._default_capacity(4) == 4,
@@ -108,11 +111,12 @@ def _run_engine_default_capacity() -> bool:
         "qwen3_5 @100→4 (orchestrator)": eng_qwen._default_capacity(100) == 4,
         "qwen3_5 @1→1 (single-stream clamp)": eng_qwen._default_capacity(1) == 1,
         "glm @100→8 (fallback)": eng_glm._default_capacity(100) == DEFAULT_BATCH_CAPACITY,
+        "minimax_m3 @100→32 (serving cap)": eng_m3._default_capacity(100) == 32,
     }
     ok = all(checks.values())
     bad = [k for k, v in checks.items() if not v]
     print(f"  [{'OK' if ok else 'FAIL'}] engine _default_capacity: " +
-          ("all 8 correct" if ok else f"WRONG: {bad}"))
+          ("all 9 correct" if ok else f"WRONG: {bad}"))
     return ok
 
 
@@ -126,6 +130,7 @@ def _run_hard_batch_cap() -> bool:
     eng_intern = QuantaOmlxEngine(_fake_artifact("internlm2", nested=False))
     eng_dsv4 = QuantaOmlxEngine(_fake_artifact("deepseek_v4", nested=False))
     eng_qwen = QuantaOmlxEngine(_fake_artifact("qwen3_5_moe_text", nested=True))
+    eng_m3 = QuantaOmlxEngine(_fake_artifact("minimax_m3_vl", nested=False))
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")             # the over-cap clamp warns by design (rule 6)
         checks = {
@@ -142,6 +147,9 @@ def _run_hard_batch_cap() -> bool:
             "dsv4 default(None) → 32 (capped from knee 48)": eng_dsv4._resolve_capacity(100, None) == 32,
             "qwen3_5 _hard_batch_cap is None (orchestrator pin)": eng_qwen._hard_batch_cap() is None,
             "qwen3_5 explicit 32 → 32 (NOT capped)": eng_qwen._resolve_capacity(100, 32) == 32,
+            "minimax_m3 _hard_batch_cap==32 (serving cap)": eng_m3._hard_batch_cap() == 32,
+            "minimax_m3 explicit 64 → 32 (HARD cap)": eng_m3._resolve_capacity(100, 64) == 32,
+            "minimax_m3 default(None) → 32": eng_m3._resolve_capacity(100, None) == 32,
         }
     ok = all(checks.values())
     bad = [k for k, v in checks.items() if not v]
@@ -153,9 +161,9 @@ def _run_hard_batch_cap() -> bool:
 
 def _run_no_orphan_knee() -> bool:
     """Every BEST_BATCH prefix is a model ``_make_batched_session`` dispatches to a batched session —
-    we never declare a knee for a model that cannot batch. (DSV4/Nemotron/InternLM2.5/Qwen3.5 are the
-    four batched classes; the measured knees must be a subset.)"""
-    batchable = ("deepseek_v4", "nemotron", "qwen3_5", "qwen3.5", "internlm2")
+    we never declare a knee for a model that cannot batch. (DSV4/Nemotron/InternLM2.5/Qwen3.5/MiniMax-M3
+    are the five batched classes; the measured/provisional points must be a subset.)"""
+    batchable = ("deepseek_v4", "nemotron", "qwen3_5", "qwen3.5", "internlm2", "minimax_m3")
     ok = all(any(prefix.startswith(b) or b.startswith(prefix) for b in batchable)
              for prefix, _ in BEST_BATCH)
     print(f"  [{'OK' if ok else 'FAIL'}] no orphan knee: every BEST_BATCH prefix has a batched runtime")
