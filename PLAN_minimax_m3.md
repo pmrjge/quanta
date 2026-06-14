@@ -168,12 +168,31 @@ source is gone from disk). So M3 is a **real build**, not validate-at-scale. The
     real int6 codes: **ppl 5.870 / Δppl +0.171% / top-1 agree 0.969**; ships the M2b int6 quality — the
     resident path actually dequantizes int6 at *higher* precision than the bf16-rounded reference, the few
     top-1 flips are bf16 near-ties). Manifest 104 model_free / 53 real_weight.
-  - **M3-2+ (next).** Batched serving (Design A: per-stream KV + ONE batched MoE call, B≈32 operating
-    point) + the **packed-int8 mixer**; **paged-KV + prefix caching** (GQA 4 kv heads ⇒ cheap KV; int8
-    KV); chunked prefill; the **trained block-sparse attention** long-context lever (parity: sparse==dense
-    at short ctx; xattention substrate); the **oMLX shim** (`QuantaOmlxEngine` route + chat template +
-    `<mm:think>` reasoning parser + MiniMax nested-XML tool parser + a **multimodal image input path**);
-    multi-stream.
+  - **M3-2 ✅ — batched serving (Design A) + the packed-int8 mixer (this milestone).** The int8 mixer
+    (GQA q/k/v/o on all 60 layers + the dense-FFN gate/up/down on layers 0–2) is held **packed
+    `nn.QuantizedLinear`** (`mx.quantized_matmul`) via `runtime_m3._packed_linear` + a new
+    `MiniMaxM3ResidentModel(packed=…)` flag (default `False` = the bf16-mixer parity reference; the
+    serving runtime sets `True`) — the ~6 GiB memory lever + the batch-M bit-exact substrate,
+    greedy-exact on the SAME int8 codes; the **shared expert stays bf16** (the qwen35 convention).
+    New `batched_runtime_m3.MiniMaxM3BatchedResidentModel` (default `packed=True` + `packed_experts=True`)
+    wraps the resident model — **Design A**: per-stream GQA `KVCache` lists, a bounded per-stream
+    attention step (M=1 ⇒ bit-exact), then ONE batched FFN over the stacked `[B,1,hidden]` (the
+    routed-expert `gather_qmm` reads each touched expert tile once for all B that route to it — the
+    bandwidth win); `step_batch` / `prefill` / `make_batch_caches`, ragged offsets, rule-6
+    desync/over-batch refusals. Gates: model-free `parity/minimax_m3_batched_test.py` (19 checks, in the
+    sweep — packed-mixer==bf16-mixer greedy-exact, batched==single-stream **bit-exact** on the synthetic
+    incl. ragged offsets + B=1, rule-6) + SOLO `parity/minimax_m3_batched_real.py` (non-`_test.py`,
+    excluded; the **397B re-gate** off ONE 325 GiB resident load — packed mixer+experts vs the streamed
+    bf16 reference **ppl 5.879 / Δppl +0.316% / agree 0.953**; batched B=8 ragged == single-stream
+    greedy-token-equivalent — at scale the F32 router GEMM at M=B flips a routing near-tie on 1/8 streams,
+    the documented batched boundary; decode **2.32× aggregate @ B=8**, climbing with B). Manifest 105
+    model_free / 53 real_weight.
+  - **M3-3+ (next).** The **GQA loop-kill** (ONE batched attention across streams via a ragged-offset
+    padded SDPA, on the packed-mixer substrate — the bigger B>1 lever now that the MoE read is already
+    amortized); **paged-KV + prefix caching** (GQA 4 kv heads ⇒ cheap KV; int8 KV); chunked prefill; the
+    **trained block-sparse attention** long-context lever (parity: sparse==dense at short ctx; xattention
+    substrate); the **oMLX shim** (`QuantaOmlxEngine` route + chat template + `<mm:think>` reasoning
+    parser + MiniMax nested-XML tool parser + a **multimodal image input path**); multi-stream.
 - **Vision track** (folded into M1/M3 since full-VL): CLIP ViT forward + 3D-RoPE + patch-merge
   compression + projector parity; image processor (dynamic-res tiling); multimodal prefill (splice
   image embeddings at `image_token_index` 200025).

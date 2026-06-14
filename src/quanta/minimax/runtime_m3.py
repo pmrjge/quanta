@@ -43,20 +43,67 @@ from __future__ import annotations
 from pathlib import Path
 
 import mlx.core as mx
+import mlx.nn as nn
 from mlx.utils import tree_flatten
 
 from quanta.minimax.artifact_m3 import MiniMaxM3Artifact
 from quanta.minimax.config_m3 import MiniMaxM3Config
+from quanta.minimax.loader_m3 import DENSE_MLP_PROJS
 from quanta.minimax.model_m3 import KVCache, MiniMaxM3Block, one_plus
+from quanta.minimax.quant_policy_m3 import LM_PREFIX
+
+_ATTN_PROJS = ("q_proj", "k_proj", "v_proj", "o_proj")
+
+
+def _load_quant_triplet(art: MiniMaxM3Artifact, base: str
+                        ) -> tuple[mx.array, mx.array, mx.array, int, int]:
+    """A packed affine weight's three siblings (``.weight_packed`` / ``.weight_scale`` /
+    ``.weight_bias`` — verbatim, no dequant) plus its ``(bits, group_size)`` from the manifest.
+
+    The decode width travels with the artifact (rule 6 — the baked manifest is the single source of
+    truth, never a hardcoded width that could silently mis-decode a differently-baked artifact).
+    Mirrors :func:`quanta.qwen35.runtime._load_quant_triplet`. Fail loud if ``base`` is not an
+    ``affine_packed`` weight (a dense projection has no packed codes to hold)."""
+    meta = art.manifest.get(base)
+    if meta is None or meta.get("format") != "affine_packed":
+        raise ValueError(f"{base}: not an affine_packed weight (format="
+                         f"{None if meta is None else meta.get('format')!r}); cannot pack (rule 6)")
+    return (art.raw(base),
+            art.get(base + ".weight_scale"),
+            art.get(base + ".weight_bias"),
+            int(meta["bits"]), int(meta["group_size"]))
+
+
+def _packed_linear(art: MiniMaxM3Artifact, base: str, ref: nn.Linear) -> nn.QuantizedLinear:
+    """Build a bias-free :class:`mlx.nn.QuantizedLinear` from the artifact's packed int8 triplet at
+    ``base``, sized to the freshly-built ``ref`` ``nn.Linear`` it replaces (its ``[out, in]`` shape).
+
+    ``nn.QuantizedLinear.__call__`` dispatches to ``mx.quantized_matmul(transpose=True)`` (rule 1 /
+    rule 2), so swapping it in for the ``nn.Linear`` leaves the mixer forward (``self.q_proj(x)`` /
+    ``self.gate_proj(x)`` …) UNCHANGED while holding the int8 weight PACKED (the ~6 GiB the
+    dequant-to-bf16 path doubled). The fused ``mx.quantized_matmul`` keeps the dequantized int8
+    weight at full precision (the bf16 path rounds it first), so it is the MORE precise sibling —
+    greedy-exact, and batch-M bit-exact for the M=1 per-stream decode (the substrate the batched
+    loop-kill will later chunk over; mirrors ``quanta.qwen35.runtime._packed_linear``)."""
+    out_dims, in_dims = int(ref.weight.shape[0]), int(ref.weight.shape[1])
+    packed, scale, wbias, bits, gs = _load_quant_triplet(art, base)
+    ql = nn.QuantizedLinear(in_dims, out_dims, bias=False, group_size=gs, bits=bits)
+    ql.weight, ql.scales, ql.biases = packed, scale, wbias
+    return ql
 
 
 def _load_block(art: MiniMaxM3Artifact, cfg: MiniMaxM3Config, i: int, *,
-                packed_experts: bool = True) -> MiniMaxM3Block:
+                packed: bool = False, packed_experts: bool = True) -> MiniMaxM3Block:
     """Build one runnable :class:`MiniMaxM3Block` for layer ``i`` from the artifact tensors.
 
-    Norms folded Gemma ``(1+w)`` (input/post + per-head q/k). GQA q/k/v/o + dense-FFN + shared expert
-    are dequantized to bf16 ``nn.Linear`` (the int8 mixer, the proven reference forward). Routed
-    experts: ``packed_experts=True`` (default) holds them as packed int6 triplets
+    Norms folded Gemma ``(1+w)`` (input/post + per-head q/k). The **int8 mixer** — GQA q/k/v/o (all
+    60 layers) and the dense-FFN gate/up/down (layers 0–2) — is held two ways (rule 4):
+    ``packed=False`` (the M1/M2 reference / fallback) dequantizes it to bf16 ``nn.Linear``;
+    ``packed=True`` holds each projection as a packed ``nn.QuantizedLinear`` (``mx.quantized_matmul``)
+    — the ~6 GiB memory lever + the batch-M bit-exact substrate, greedy-exact on the SAME int8 codes.
+    The **shared expert stays bf16** either way (it runs batched inside the one MoE call — exactly the
+    ``quanta.qwen35`` convention; packing it is a trivial later memory tweak under the huge headroom).
+    Routed experts: ``packed_experts=True`` (default) holds them as packed int6 triplets
     (``art.moe_packed`` → ``set_experts_packed`` → ``mx.gather_qmm``, the resident path);
     ``packed_experts=False`` dequantizes them to bf16 (``art.moe`` → ``gather_mm``, the parity
     reference). Router ``gate`` + ``e_score_correction_bias`` stay native F32 either way."""
@@ -65,13 +112,21 @@ def _load_block(art: MiniMaxM3Artifact, cfg: MiniMaxM3Config, i: int, *,
     blk.input_layernorm.weight = one_plus(nm["input_layernorm"])
     blk.post_attention_layernorm.weight = one_plus(nm["post_attention_layernorm"])
 
-    at = art.attention(i)
-    blk.self_attn.q_proj.weight = at["q_proj.weight"]
-    blk.self_attn.k_proj.weight = at["k_proj.weight"]
-    blk.self_attn.v_proj.weight = at["v_proj.weight"]
-    blk.self_attn.o_proj.weight = at["o_proj.weight"]
-    blk.self_attn.q_norm = one_plus(at["q_norm.weight"])           # per-head q/k norm (1+w)
-    blk.self_attn.k_norm = one_plus(at["k_norm.weight"])
+    ap = f"{LM_PREFIX}layers.{i}.self_attn."
+    if packed:
+        m = blk.self_attn
+        for proj in _ATTN_PROJS:                                   # int8 q/k/v/o → mx.quantized_matmul
+            setattr(m, proj, _packed_linear(art, ap + proj, getattr(m, proj)))
+        m.q_norm = one_plus(art.read(ap + "q_norm.weight"))        # per-head q/k norm (1+w), bf16
+        m.k_norm = one_plus(art.read(ap + "k_norm.weight"))
+    else:
+        at = art.attention(i)
+        blk.self_attn.q_proj.weight = at["q_proj.weight"]
+        blk.self_attn.k_proj.weight = at["k_proj.weight"]
+        blk.self_attn.v_proj.weight = at["v_proj.weight"]
+        blk.self_attn.o_proj.weight = at["o_proj.weight"]
+        blk.self_attn.q_norm = one_plus(at["q_norm.weight"])       # per-head q/k norm (1+w)
+        blk.self_attn.k_norm = one_plus(at["k_norm.weight"])
 
     if cfg.is_moe_layer(i):
         moe = art.moe_packed(i) if packed_experts else art.moe(i)
@@ -84,6 +139,10 @@ def _load_block(art: MiniMaxM3Artifact, cfg: MiniMaxM3Config, i: int, *,
         blk.mlp.shared_gate_proj = moe["shared_gate_proj"]         # shared expert bf16 (no scalar gate)
         blk.mlp.shared_up_proj = moe["shared_up_proj"]
         blk.mlp.shared_down_proj = moe["shared_down_proj"]
+    elif packed:
+        mp = f"{LM_PREFIX}layers.{i}.mlp."                         # int8 dense FFN → mx.quantized_matmul
+        for proj in DENSE_MLP_PROJS:
+            setattr(blk.mlp, proj, _packed_linear(art, mp + proj, getattr(blk.mlp, proj)))
     else:
         dm = art.dense_mlp(i)
         blk.mlp.gate_proj.weight = dm["gate_proj"]
@@ -120,18 +179,25 @@ class MiniMaxM3ResidentModel:
     load residency (rule 8). ``n_layers`` builds a prefix for validation. ``packed_experts=True``
     (default) holds the routed experts packed int6 (``gather_qmm``) — the resident-memory + bandwidth
     lever, greedy-exact on the SAME codes as the bf16 ``gather_mm`` reference; ``packed_experts=False``
-    dequantizes them to bf16 (the parity fallback). The int8 mixer (attention / dense-FFN / shared
-    expert) is dequantized to bf16 either way."""
+    dequantizes them to bf16 (the parity fallback).
+
+    ``packed`` (default ``False`` — this single-stream model is the bf16-mixer parity reference)
+    holds the int8 mixer (GQA q/k/v/o + dense-FFN) packed as ``nn.QuantizedLinear``
+    (``mx.quantized_matmul``) instead of dequantized to bf16 — the ~6 GiB memory lever + the batch-M
+    bit-exact substrate, greedy-exact on the SAME int8 codes. The serving entry point
+    (:class:`quanta.minimax.batched_runtime_m3.MiniMaxM3BatchedResidentModel`) constructs the inner
+    model with ``packed=True``; the shared expert stays bf16 either way."""
 
     def __init__(self, art_dir: str | Path, *, n_layers: int | None = None,
-                 packed_experts: bool = True) -> None:
+                 packed: bool = False, packed_experts: bool = True) -> None:
         self.art = MiniMaxM3Artifact(art_dir)
         self.cfg: MiniMaxM3Config = self.art.cfg
+        self.packed = bool(packed)
         self.packed_experts = bool(packed_experts)
         n = self.cfg.num_hidden_layers if n_layers is None else n_layers
         self.layers: list[MiniMaxM3Block] = []
         for i in range(n):  # rule 8: materialize one layer's params, eval, then drop source shards
-            blk = _load_block(self.art, self.cfg, i, packed_experts=packed_experts)
+            blk = _load_block(self.art, self.cfg, i, packed=packed, packed_experts=packed_experts)
             mx.eval(_block_arrays(blk))
             self.layers.append(blk)
             self.art.release()
@@ -152,7 +218,8 @@ class MiniMaxM3ResidentModel:
         """Construct from pre-built blocks + final-form weights (bypasses artifact load) so the
         model-free parity gate can drive the resident forward on a tiny synthetic model without a
         checkpoint. ``norm_w`` is the already-``(1+w)``-folded final norm; ``embed_w``/``lm_head_w``
-        verbatim. ``packed_experts`` is detected from the first MoE block's expert stack."""
+        verbatim. ``packed_experts`` is detected from the first MoE block's expert stack; ``packed``
+        (the int8 mixer) from whether ``self_attn.q_proj`` is an ``nn.QuantizedLinear``."""
         self = cls.__new__(cls)
         self.art = None
         self.cfg = cfg
@@ -163,6 +230,7 @@ class MiniMaxM3ResidentModel:
         self.lm_head_w = lm_head_w
         moe_blocks = [b for b in layers if b.is_moe]
         self.packed_experts = bool(moe_blocks) and isinstance(moe_blocks[0].mlp.experts_gate_up, dict)
+        self.packed = bool(layers) and isinstance(layers[0].self_attn.q_proj, nn.QuantizedLinear)
         return self
 
     # --- cache factory ---------------------------------------------------------

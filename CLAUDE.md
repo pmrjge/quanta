@@ -96,11 +96,32 @@ full-prefill **bit-exact**, rule-4 dense==sparse, rule-6 packed-refuses-`sparse=
 smoke) + SOLO `parity/minimax_m3_runtime_real.py` (non-`_test.py`, excluded; the **397B resident
 re-gate** — all 60 layers RAM-resident in **33s load**, packed `gather_qmm` vs the streamed `gather_mm`
 reference on the real int6 codes: **ppl 5.870 / Δppl +0.171% / top-1 agree 0.969**, ships the M2b int6
-quality). Manifest 104 model_free / 53 real_weight. **Next = M3-2** — batched serving (Design A,
-per-stream KV + one batched MoE call, B≈32) + the packed-int8 mixer; then paged-KV + prefix caching,
-chunked prefill, the trained block-sparse long-context lever, the oMLX shim (multimodal image input +
-`<mm:think>` reasoning + MiniMax nested-XML tool parser), and the vision track (CLIP-ViT forward +
-projector + image processor; the vision *weights* are already baked dense bf16).
+quality). Manifest 104 model_free / 53 real_weight. **M3-2 ✅ (this commit)** — batched serving
+(Design A) + the packed-int8 mixer. The int8 mixer (GQA q/k/v/o on all 60 layers + the dense-FFN
+gate/up/down on layers 0–2) is now held **packed `nn.QuantizedLinear`** (`mx.quantized_matmul`) via
+`runtime_m3._packed_linear` + a new `MiniMaxM3ResidentModel(packed=…)` flag (default `False` — the
+bf16-mixer M1/M2 parity reference; the serving runtime sets `True`) — the ~6 GiB memory lever + the
+batch-M bit-exact substrate, greedy-exact on the SAME int8 codes; the **shared expert stays bf16**
+(the qwen35 convention — it runs batched inside the one MoE call; packing it is a trivial later tweak
+under the huge headroom). New `batched_runtime_m3.MiniMaxM3BatchedResidentModel` (default
+`packed=True` + `packed_experts=True`) wraps the resident model for B>1 serving — **Design A**:
+per-stream GQA `KVCache` lists, a bounded per-stream attention step (M=1 ⇒ bit-exact vs single-stream),
+then ONE batched FFN over the stacked `[B,1,hidden]` (the routed-expert `gather_qmm` reads each
+touched expert tile ONCE for all B rows that route to it — the bandwidth win; the existing MoE is
+B-aware via its `[B,S,h]→[N,h]` reshape); `step_batch` / `prefill` / `make_batch_caches`, ragged
+per-stream offsets, rule-6 desync/over-batch refusals. Gates: model-free
+`parity/minimax_m3_batched_test.py` (19 checks, in the sweep — packed-mixer==bf16-mixer greedy-exact,
+batched==single-stream **bit-exact** on the synthetic incl. ragged offsets + B=1, rule-6) + SOLO
+`parity/minimax_m3_batched_real.py` (non-`_test.py`, excluded; the **397B re-gate** off ONE 325 GiB
+resident load: packed mixer+experts vs the streamed bf16 reference **ppl 5.879 / Δppl +0.316% / agree
+0.953**; batched B=8 ragged == single-stream greedy-token-equivalent — at scale the lone cross-stream
+op, the F32 router GEMM at M=B, flips a routing near-tie on 1/8 streams, the documented batched
+boundary; decode **2.32× aggregate @ B=8** — the batching lever, climbing with B). Manifest 105
+model_free / 53 real_weight. **Next = M3-3** — the GQA loop-kill (ONE batched attention across streams
+via a ragged-offset padded SDPA, on the packed-mixer substrate); then paged-KV + prefix caching (int8
+KV), chunked prefill, the trained block-sparse long-context lever, the oMLX shim (multimodal image
+input + `<mm:think>` reasoning + MiniMax nested-XML tool parser), and the vision track (CLIP-ViT
+forward + projector + image processor; the vision *weights* are already baked dense bf16).
 
 The rest of the served fleet is **complete, shipped, and parity-gated**. Per-model resident sizes are
 in the Serving throughput table below; the detailed milestone handovers live in the `PLAN_*.md` files
