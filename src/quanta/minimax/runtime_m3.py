@@ -188,10 +188,11 @@ def _live_kv_arrays(caches) -> list[mx.array]:
 
 
 def chunked_prefill(layers, embed_w: mx.array, norm_w: mx.array, lm_head_w: mx.array,
-                    cfg: MiniMaxM3Config, token_ids, caches, *, chunk_tokens: int = 4096,
-                    use_fast: bool = True, sparse: bool = True) -> mx.array:
-    """Long-context single-stream prefill: consume ``token_ids`` into ``caches`` in blocks of
-    ``chunk_tokens``; return the LAST position's logits ``[1,1,vocab]`` (same contract as a cached
+                    cfg: MiniMaxM3Config, token_ids, caches, *, inputs_embeds: mx.array | None = None,
+                    chunk_tokens: int = 4096, use_fast: bool = True, sparse: bool = True) -> mx.array:
+    """Long-context single-stream prefill: consume ``token_ids`` (or pre-spliced ``inputs_embeds``,
+    the multimodal path — exactly one of the two) into ``caches`` in blocks of ``chunk_tokens``;
+    return the LAST position's logits ``[1,1,vocab]`` (same contract as a cached
     :meth:`MiniMaxM3ResidentModel.__call__` over the last token / the batched ``prefill``).
 
     The feasibility substrate for the 1M window. The single-shot prefill holds the whole
@@ -218,10 +219,27 @@ def chunked_prefill(layers, embed_w: mx.array, norm_w: mx.array, lm_head_w: mx.a
     cross-token op changes, and the paged gather is bit-identical to the discrete cache); greedy-token-
     equivalent on the packed serving mixer (the projection ``mx.quantized_matmul`` runs at batch-M=chunk
     vs M=T — the documented #153 batch-M ULP). Gated in ``parity/minimax_m3_prefill_chunked_test.py``,
-    re-gated @ 397B in ``parity/minimax_m3_prefill_chunked_real.py``."""
-    ids = token_ids if isinstance(token_ids, mx.array) else mx.array(token_ids, dtype=mx.int32)
-    ids = ids.reshape(-1)
-    total = int(ids.shape[0])
+    re-gated @ 397B in ``parity/minimax_m3_prefill_chunked_real.py``. The ``inputs_embeds`` path (the
+    multimodal admit — the image-spliced stream from :func:`quanta.minimax.model_vision_m3.splice_image_embeddings`)
+    chunks the embedding rows directly instead of the embed lookup; everything downstream is identical."""
+    if (token_ids is None) == (inputs_embeds is None):
+        raise ValueError("chunked_prefill: pass exactly one of token_ids / inputs_embeds (rule 6)")
+    if inputs_embeds is not None:
+        emb = inputs_embeds[0] if inputs_embeds.ndim == 3 else inputs_embeds   # [T, hidden]
+        if emb.ndim != 2:
+            raise ValueError(f"inputs_embeds must be [T,hidden] or [1,T,hidden], got "
+                             f"{inputs_embeds.shape}")
+        total = int(emb.shape[0])
+
+        def chunk_hidden(lo: int, hi: int) -> mx.array:
+            return emb[lo:hi][None].astype(mx.bfloat16)
+    else:
+        ids = token_ids if isinstance(token_ids, mx.array) else mx.array(token_ids, dtype=mx.int32)
+        ids = ids.reshape(-1)
+        total = int(ids.shape[0])
+
+        def chunk_hidden(lo: int, hi: int) -> mx.array:
+            return embed_w[ids[lo:hi]][None].astype(mx.bfloat16)              # [1,tlen,hidden]
     if total < 1:
         raise ValueError("chunked_prefill needs >= 1 token")
     if chunk_tokens < 1:
@@ -231,8 +249,7 @@ def chunked_prefill(layers, embed_w: mx.array, norm_w: mx.array, lm_head_w: mx.a
                          f"(one KV cache per layer; refusing to mis-thread state — rule 6)")
     h_last = None
     for lo in range(0, total, chunk_tokens):           # bounded chunk loop (rule 3 — IO/admit boundary)
-        chunk = ids[lo:lo + chunk_tokens]
-        h = embed_w[chunk][None].astype(mx.bfloat16)               # [1,tlen,hidden]
+        h = chunk_hidden(lo, min(lo + chunk_tokens, total))
         for blk, cache in zip(layers, caches, strict=True):
             h = blk(h, cache=cache, use_fast=use_fast, sparse=sparse)
         h_last = h[:, -1:]
@@ -328,19 +345,44 @@ class MiniMaxM3ResidentModel:
         hh = mx.fast.rms_norm(h, self.norm_w.astype(h.dtype), self.cfg.norm_eps)
         return hh @ self.lm_head_w.T.astype(hh.dtype)
 
-    def __call__(self, token_ids, *, caches: list[KVCache] | None = None,
-                 use_fast: bool = True, sparse: bool = True) -> mx.array:
-        """Logits ``[1,T,vocab]``.
+    def embed_tokens(self, token_ids) -> mx.array:
+        """Token-id → embedding lookup ``[T, hidden]`` (bf16) — the input the multimodal splice
+        (:func:`quanta.minimax.model_vision_m3.splice_image_embeddings`) edits before it is fed back
+        as ``inputs_embeds``."""
+        ids = token_ids if isinstance(token_ids, mx.array) else mx.array(token_ids)
+        return self.embed_w[ids.reshape(-1)].astype(mx.bfloat16)   # [T, hidden]
+
+    def _initial_hidden(self, token_ids, inputs_embeds: mx.array | None) -> mx.array:
+        """Resolve the layer-0 input ``[1,T,hidden]`` from EXACTLY one of token_ids / inputs_embeds.
+
+        ``inputs_embeds`` (the multimodal path — the image-spliced stream) bypasses the embed lookup;
+        a ``[T,hidden]`` or ``[1,T,hidden]`` array is accepted. The token-id path is byte-for-byte the
+        original ``self.embed_w[ids][None]`` (so every existing text gate stays bit-exact)."""
+        if (token_ids is None) == (inputs_embeds is None):
+            raise ValueError("pass exactly one of token_ids / inputs_embeds (rule 6)")
+        if inputs_embeds is not None:
+            e = inputs_embeds[None] if inputs_embeds.ndim == 2 else inputs_embeds
+            if e.ndim != 3:
+                raise ValueError(f"inputs_embeds must be [T,hidden] or [1,T,hidden], got "
+                                 f"{inputs_embeds.shape}")
+            return e.astype(mx.bfloat16)
+        ids = token_ids if isinstance(token_ids, mx.array) else mx.array(token_ids)
+        return self.embed_w[ids.reshape(-1)][None].astype(mx.bfloat16)   # [1,T,hidden]
+
+    def __call__(self, token_ids=None, *, inputs_embeds: mx.array | None = None,
+                 caches: list[KVCache] | None = None, use_fast: bool = True,
+                 sparse: bool = True) -> mx.array:
+        """Logits ``[1,T,vocab]`` from ``token_ids`` OR pre-spliced ``inputs_embeds`` (exactly one —
+        the multimodal prefill feeds the image-spliced embedding stream).
 
         ``caches=None`` ⇒ prefill (run each reference ``MiniMaxM3Block`` with no cache — the M1/M2
         parity-correct path). ``caches`` given ⇒ a cached forward over ``T >= 1`` tokens: each block
         threads its per-layer :class:`KVCache` (grown in place; the attention reads ``cache.offset``
         for partial RoPE and applies a bottom-right causal mask). A ``T``-token cached forward over
         fresh caches is output-equivalent to the ``caches=None`` prefill; a continuation attends the
-        new tokens against the grown KV. Gated in ``parity/minimax_m3_runtime_test.py``."""
-        ids = token_ids if isinstance(token_ids, mx.array) else mx.array(token_ids)
-        ids = ids.reshape(-1)                                       # [T]
-        h = self.embed_w[ids][None].astype(mx.bfloat16)            # [1,T,hidden]
+        new tokens against the grown KV. Gated in ``parity/minimax_m3_runtime_test.py`` (text) and
+        ``parity/minimax_m3_splice_test.py`` (the ``inputs_embeds`` equivalence)."""
+        h = self._initial_hidden(token_ids, inputs_embeds)         # [1,T,hidden]
 
         if caches is None:
             for blk in self.layers:
@@ -357,20 +399,48 @@ class MiniMaxM3ResidentModel:
         return self._head(h)
 
     # --- long-context chunked prefill (the feasible admit path past chat lengths) -
-    def prefill_chunked(self, token_ids, caches: list[KVCache], *, chunk_tokens: int = 4096,
+    def prefill_chunked(self, token_ids=None, caches: list[KVCache] | None = None, *,
+                        inputs_embeds: mx.array | None = None, chunk_tokens: int = 4096,
                         use_fast: bool = True, sparse: bool = True) -> mx.array:
-        """Consume ``token_ids`` into ``caches`` in ``chunk_tokens`` blocks; return the last position's
-        logits ``[1,1,vocab]`` (same contract as a cached :meth:`__call__` over the last token). The
-        feasible path past chat lengths — the single-shot :meth:`__call__` holds the whole
-        ``[1,T,hidden]`` window resident, this bounds the per-chunk transient to O(chunk). See
-        :func:`chunked_prefill` (the shared driver; gated in
-        ``parity/minimax_m3_prefill_chunked_test.py``)."""
-        if len(caches) != self.num_layers:
-            raise ValueError(f"len(caches)={len(caches)} != num_layers={self.num_layers} "
-                             f"(one KV cache per layer; refusing to mis-thread state — rule 6)")
+        """Consume ``token_ids`` (or pre-spliced ``inputs_embeds`` — the multimodal admit) into
+        ``caches`` in ``chunk_tokens`` blocks; return the last position's logits ``[1,1,vocab]`` (same
+        contract as a cached :meth:`__call__` over the last token). The feasible path past chat lengths
+        — the single-shot :meth:`__call__` holds the whole ``[1,T,hidden]`` window resident, this
+        bounds the per-chunk transient to O(chunk). See :func:`chunked_prefill` (the shared driver;
+        gated in ``parity/minimax_m3_prefill_chunked_test.py``)."""
+        if caches is None or len(caches) != self.num_layers:
+            raise ValueError(f"len(caches)={None if caches is None else len(caches)} != "
+                             f"num_layers={self.num_layers} (one KV cache per layer; refusing to "
+                             f"mis-thread state — rule 6)")
         return chunked_prefill(self.layers, self.embed_w, self.norm_w, self.lm_head_w, self.cfg,
-                               token_ids, caches, chunk_tokens=chunk_tokens, use_fast=use_fast,
-                               sparse=sparse)
+                               token_ids, caches, inputs_embeds=inputs_embeds,
+                               chunk_tokens=chunk_tokens, use_fast=use_fast, sparse=sparse)
+
+    # --- multimodal prefill (text + image): embed → splice → forward ------------
+    def multimodal_prefill(self, token_ids, vision_tokens: mx.array, *,
+                           caches: list[KVCache] | None = None, chunk_tokens: int | None = None,
+                           use_fast: bool = True, sparse: bool = True) -> mx.array:
+        """One-call image+text prefill: embed ``token_ids``, splice the merged ViT ``vision_tokens``
+        into the ``image_token_index`` placeholder rows
+        (:func:`quanta.minimax.model_vision_m3.splice_image_embeddings`), then run the decoder over the
+        resulting ``inputs_embeds``. ``caches=None`` ⇒ single-shot prefill (logits ``[1,T,vocab]``);
+        ``caches`` given ⇒ a cached forward that seeds the KV (``chunk_tokens`` set ⇒ the O(chunk)
+        chunked admit, returning ``[1,1,vocab]``). ``vision_tokens`` is the tower output for all images
+        concatenated in prompt order (``M == #placeholders``); the splice fails loud on a mismatch
+        (rule 6). Gated model-free in ``parity/minimax_m3_splice_test.py`` and re-gated @ 397B in
+        ``parity/minimax_m3_multimodal_real.py``."""
+        from quanta.minimax.model_vision_m3 import splice_image_embeddings  # noqa: PLC0415
+
+        ids = token_ids if isinstance(token_ids, mx.array) else mx.array(token_ids, dtype=mx.int32)
+        ids = ids.reshape(-1)
+        text_embeds = self.embed_w[ids].astype(mx.bfloat16)        # [T, hidden]
+        spliced = splice_image_embeddings(text_embeds, ids, vision_tokens, self.cfg.image_token_index)
+        if chunk_tokens is not None:
+            if caches is None:
+                raise ValueError("chunked multimodal_prefill needs caches (rule 6)")
+            return self.prefill_chunked(caches=caches, inputs_embeds=spliced,
+                                        chunk_tokens=chunk_tokens, use_fast=use_fast, sparse=sparse)
+        return self(inputs_embeds=spliced, caches=caches, use_fast=use_fast, sparse=sparse)
 
     # --- minimal greedy generate (serving convenience; not the ppl arbiter) ----
     def generate(self, prompt_ids, *, max_new: int = 32, use_fast: bool = True,

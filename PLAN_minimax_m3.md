@@ -309,11 +309,28 @@ source is gone from disk). So M3 is a **real build**, not validate-at-scale. The
     2-D-degenerate t-section inert on real q; per-image isolation **bit-exact**). No numeric ViT reference
     exists; V2 validates **mechanics + invariants**, the `rope_section (8,16,16)` arbiter is the V3 e2e.
     Manifest **110 model_free / 53 real_weight** (+`minimax_m3_image_test`).
-  - **vision V3 (next).** The **multimodal prefill splice** (replace the `image_token_index` 200025
-    placeholders in the text embedding stream with the merged ViT tokens — the shipped `processing_minimax.py`
-    rule) + the **heavy 233 GiB e2e that settles `rope_section`** (image + prompt → teacher-forced ppl /
-    greedy caption, sweeping candidate sections — the only arbiter, the section is judged downstream by the
-    LLM).
+  - **M3-6c / vision V3a ✅ (this milestone).** The **multimodal prefill splice** + the runtime
+    `inputs_embeds` path. NEW `model_vision_m3.splice_image_embeddings(...)` replaces the `image_token_index`
+    200025 placeholder rows with the merged ViT tokens **in sequence order** (image-0's first; the shipped
+    `processing_minimax.py` rule — `]<]image[>[` → start(200029) + `num_tokens` placeholders(200025) +
+    end(200030)) via a vectorized cumsum-scatter (rule 3); fails loud on a count/hidden mismatch (rule 6),
+    bit-exact passthrough with no placeholders. `runtime_m3` gains the `inputs_embeds` path
+    (`__call__`/`chunked_prefill`/`prefill_chunked`, exactly one of token_ids/inputs_embeds; the token-id
+    path stays byte-for-byte) + `embed_tokens()` + `multimodal_prefill()` (embed → splice → forward). Gates:
+    model-free `parity/minimax_m3_splice_test.py` (19 checks, in the sweep — splice == nested-loop oracle
+    incl. multi-image order, rule-6 refusals, text-only passthrough, **inputs_embeds == token_ids BIT-EXACT**,
+    `multimodal_prefill` == manual, chunked-embeds == single-shot) + SOLO `parity/minimax_m3_multimodal_real.py`
+    (non-`_test.py`, excluded, **~235 GiB** — int4 text decoder (60L in 10s) + dense ViT; real 56×56 image →
+    4 merged tokens spliced into a real prompt: **image is SEEN** — prefix BIT-EXACT |Δ| 0, suffix max|Δ| 21.6;
+    finite/sane; inputs_embeds == token_ids BIT-EXACT @ scale). Validates the splice + ViT→text wiring e2e at
+    397B; does **NOT** settle `rope_section` (every section shows "image seen"). Manifest **111 model_free / 53
+    real_weight** (+`minimax_m3_splice_test`).
+  - **vision V3b (next) — settle `rope_section`.** The **heavy 233 GiB arbiter** (image + prompt →
+    teacher-forced ppl / greedy caption, sweeping candidate sections — the only arbiter, the section is judged
+    downstream by the LLM). **BLOCKED in-env:** needs a real **natural** image (shipped images are charts),
+    but **no image decoder ships** (PIL/torchvision/cv2/imageio/matplotlib absent) and the bicubic resize is
+    best-effort/unpinned off-grid — wants a decoder dep (e.g. `pillow` under `reference`) + a natural test
+    image + a discriminative/teacher-forced probe (a user-facing decision).
   - **M3-6+ (after vision).** The **oMLX shim** (the `_MiniMaxM3BatchedSession` engine route + chat
     template + `<mm:think>` reasoning parser + MiniMax nested-XML tool parser + the multimodal image input
     path) + multi-stream; the **trained block-sparse attention** long-context compute lever (deferred — no

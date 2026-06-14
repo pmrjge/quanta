@@ -41,7 +41,8 @@ on-disk input dims**, NOT a guess):
 
 So one image of ``grid=(t,h,w)`` patches → ``t·h·w`` ViT tokens → projector → ``(t·h·w)/4`` merged
 LLM tokens, matching the processor's ``num_tokens = grid.prod() // merge_size**2`` placeholder count
-(``image_token_index`` 200025). The splice into the text stream is the V2 milestone.
+(``image_token_index`` 200025). The splice into the text stream (V3) is :func:`splice_image_embeddings`
+below — it replaces the embedding rows at the placeholder positions with these merged tokens.
 """
 
 from __future__ import annotations
@@ -330,11 +331,67 @@ class MiniMaxM3VisionModel(nn.Module):
 
     def __call__(self, pixel_values: mx.array, grid_thw: list[tuple[int, int, int]], *,
                  use_fast: bool = True) -> mx.array:
-        """Full tower → merged LLM tokens ``[N/merge**2, projection_dim]`` (the embeddings spliced at
-        the ``image_token_index`` placeholders — the splice is the V3 milestone)."""
+        """Full tower → merged LLM tokens ``[N/merge**2, projection_dim]`` (spliced into the text stream
+        at the ``image_token_index`` placeholders by :func:`splice_image_embeddings`)."""
         feats = self.encode(pixel_values, grid_thw, use_fast=use_fast)   # [N, hidden]
         projected = self.projector(feats)                                # [N, projection_dim]
         return self.patch_merge(projected)                               # [N/merge**2, projection_dim]
+
+
+# ----------------------------------------------------------------------------- #
+# Multimodal prefill splice (V3): merged ViT tokens → the text embedding stream.
+# ----------------------------------------------------------------------------- #
+
+
+def splice_image_embeddings(text_embeds: mx.array, token_ids: mx.array, vision_tokens: mx.array,
+                            image_token_index: int) -> mx.array:
+    """Replace the embedding rows at the image-placeholder positions (token id ==
+    ``image_token_index``) with the merged ViT tokens, in sequence order — the multimodal prefill
+    splice.
+
+    The shipped ``processing_minimax.py`` expands each ``]<]image[>[`` to ``VISION_START`` +
+    ``num_tokens = grid.prod()//merge**2`` placeholder tokens (each re-encoded to ``image_token_index``,
+    200025) + ``VISION_END``. So in the tokenized stream the placeholders are exactly the
+    ``image_token_index`` positions; here they receive the tower's merged tokens — image-0's first,
+    then image-1's, … — matching :meth:`MiniMaxM3VisionModel.__call__`'s concatenation order across
+    images.
+
+    Vectorized scatter (rule 3): a running count over the placeholder mask gives, for each placeholder
+    position in sequence order, the index of the next vision row; ``mx.where`` leaves every
+    non-placeholder row untouched (no Python loop over tokens). Fails loud (rule 6) on a
+    placeholder-count vs vision-token-count mismatch or a hidden-dim mismatch — a wrong image grid or a
+    dropped token would otherwise silently corrupt the stream.
+
+    Args:
+        text_embeds: ``[T, hidden]`` (or ``[1, T, hidden]``) — the text-token embeddings.
+        token_ids:   ``[T]`` (or ``[1, T]``) int — the prompt token ids (with the placeholders).
+        vision_tokens: ``[M, hidden]`` — the merged ViT tokens, ``M == #placeholders``.
+        image_token_index: the placeholder token id (config ``image_token_index``, 200025).
+
+    Returns the spliced embeddings, same shape as ``text_embeds``."""
+    te = text_embeds[0] if text_embeds.ndim == 3 else text_embeds          # [T, hidden]
+    if te.ndim != 2:
+        raise ValueError(f"text_embeds must be [T,hidden] or [1,T,hidden], got {text_embeds.shape}")
+    ids = token_ids.reshape(-1)
+    if int(ids.shape[0]) != int(te.shape[0]):
+        raise ValueError(f"token_ids length {int(ids.shape[0])} != text_embeds rows {int(te.shape[0])} "
+                         f"(rule 6)")
+    mask = ids == image_token_index                                       # [T] bool
+    n_slots = int(mask.sum().item())
+    n_vis = int(vision_tokens.shape[0])
+    if n_slots != n_vis:
+        raise ValueError(f"image-placeholder/vision-token mismatch: {n_slots} placeholders "
+                         f"(id {image_token_index}) but {n_vis} merged vision tokens (rule 6)")
+    if n_slots == 0:                                                      # text-only: nothing to splice
+        return text_embeds
+    if int(vision_tokens.shape[1]) != int(te.shape[1]):
+        raise ValueError(f"vision-token hidden {int(vision_tokens.shape[1])} != text hidden "
+                         f"{int(te.shape[1])} (rule 6)")
+    sel = mx.cumsum(mask.astype(mx.int32)) - 1            # running 0..M-1 at placeholders (else junk)
+    sel = mx.clip(sel, 0, n_vis - 1)                      # bound the junk rows (masked out below)
+    gathered = vision_tokens[sel].astype(te.dtype)        # [T, hidden] — vision row per placeholder
+    out = mx.where(mask[:, None], gathered, te)           # placeholders ← vision; rest ← text
+    return out[None] if text_embeds.ndim == 3 else out
 
 
 # ----------------------------------------------------------------------------- #

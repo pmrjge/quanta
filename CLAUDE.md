@@ -275,15 +275,45 @@ rel 5.9e-3; the **2-D-degenerate property on real q** — the t-section [8 pairs
 `configuration_*.py`), so V2 validates **mechanics + structural invariants**; the decisive arbiter for
 the [PINNED-pending-e2e] `rope_section (8,16,16)` is the V3 multimodal e2e. Manifest **110 model_free / 53
 real_weight** (+`minimax_m3_image_test`; the `_real` gate is untracked, the established convention).
-**Next = vision V3** — the multimodal prefill splice (replace the `image_token_index` 200025
-placeholders in the text embedding stream with the merged ViT tokens — the shipped
-`processing_minimax.py` rule) + the **heavy 233 GiB e2e that settles `rope_section`** (image + prompt →
-teacher-forced ppl / greedy caption, sweeping candidate sections — the only arbiter, since the section
-is judged downstream by the LLM); **then** the oMLX shim (the `_MiniMaxM3BatchedSession` engine route +
-chat template + `<mm:think>` reasoning + MiniMax nested-XML tool parser + the multimodal image input
-path) and the **trained block-sparse attention** long-context compute lever (deferred — no M3 forward
-exists; only sparse==dense-at-short-ctx is bit-gateable, the exact selection formula leans on a heavy
-397B long-context ppl arbiter; it is a speed optimization on an already-correct dense path).
+**M3-6c / vision V3a ✅ (this commit)** — the multimodal prefill splice + the runtime `inputs_embeds`
+path. The shipped `processing_minimax.py` expands each `]<]image[>[` to `]<]start of image[>[`
+(200029) + `num_tokens = grid.prod()//merge²` placeholders (each re-encoded to **`image_token_index`
+200025**) + `]<]end of image[>[` (200030), so in the tokenized stream the placeholders ARE the 200025
+positions. New `model_vision_m3.splice_image_embeddings(text_embeds, token_ids, vision_tokens,
+image_token_index)` replaces those rows with the tower's merged tokens **in sequence order**
+(image-0's first, then image-1's — matching `MiniMaxM3VisionModel.__call__`'s concat) via a
+**vectorized cumsum-scatter** (`sel = cumsum(mask)-1`, `where(mask, vision[sel], text)` — no
+per-token loop, rule 3); fails loud on a placeholder/vision count or hidden-dim mismatch (rule 6),
+bit-exact passthrough when there are no placeholders. `runtime_m3` gains the `inputs_embeds` path
+(`MiniMaxM3ResidentModel.__call__` / `chunked_prefill` / `prefill_chunked` accept a pre-spliced stream
+— exactly one of token_ids/inputs_embeds, rule 6; the token-id path stays byte-for-byte the original
+`embed_w[ids]`) + `embed_tokens()` + a `multimodal_prefill(token_ids, vision_tokens, …)` convenience
+(embed → splice → forward). Gates: model-free `parity/minimax_m3_splice_test.py` (19 checks, in the
+sweep — splice == nested-loop numpy oracle incl. multi-image fill order, rule-6 count/hidden/length
+refusals, text-only passthrough `[T,h]`+`[1,T,h]`, **inputs_embeds == token_ids BIT-EXACT** prefill +
+cached on a tiny bf16 model, `multimodal_prefill` == manual embed+splice+forward, image-changes-logits,
+chunked-embeds == single-shot, rule-6 both/neither input) + SOLO `parity/minimax_m3_multimodal_real.py`
+(non-`_test.py`, excluded, **~235 GiB** — loads the int4 text decoder (packed mixer + int4 experts, 60L
+in **10s**) AND the dense ViT, processes a real 56×56 image → ViT → **4 merged tokens** spliced into a
+real prompt, runs the real multimodal prefill: the **image is SEEN** — prefix logits BIT-EXACT |Δ| 0
+(causal isolation: positions before the image never attend the spliced rows), suffix **max|Δ| 21.6**
+(the ViT tokens flow downstream); logits finite/sane; **inputs_embeds == token_ids BIT-EXACT @ scale**
+on plain text). V3a validates the splice + ViT→text wiring e2e at 397B; it does **NOT** settle the
+[PINNED-pending-e2e] vision `rope_section` (every candidate produces "an image is seen"; the section is
+judged downstream on real natural-image content). Manifest **111 model_free / 53 real_weight**
+(+`minimax_m3_splice_test`). **Next = vision V3b — settle `rope_section`** (the heavy 233 GiB arbiter:
+image + prompt → teacher-forced ppl / greedy caption, sweeping candidate sections — the only arbiter,
+since the section is judged downstream by the LLM). **V3b is currently BLOCKED in-env** — it needs a
+real **natural** image (the only shipped images are charts) decoded to RGB, but **no image decoder
+ships** (PIL/torchvision/cv2/imageio/matplotlib all absent), and the native processor's bicubic resize
+is best-effort/unpinned for an off-grid image; settling it cleanly wants a decoder dep (e.g. `pillow`
+under the `reference` extra) + a natural test image + a discriminative/teacher-forced probe — a
+user-facing decision. **Then** the oMLX shim (the `_MiniMaxM3BatchedSession` engine route + chat
+template + `<mm:think>` reasoning + MiniMax nested-XML tool parser + the multimodal image input path —
+wiring the splice through `batched_runtime_m3`) and the **trained block-sparse attention** long-context
+compute lever (deferred — no M3 forward exists; only sparse==dense-at-short-ctx is bit-gateable, the
+exact selection formula leans on a heavy 397B long-context ppl arbiter; it is a speed optimization on
+an already-correct dense path).
 
 The rest of the served fleet is **complete, shipped, and parity-gated**. Per-model resident sizes are
 in the Serving throughput table below; the detailed milestone handovers live in the `PLAN_*.md` files
