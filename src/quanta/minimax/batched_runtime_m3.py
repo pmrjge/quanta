@@ -47,9 +47,21 @@ Target operating point: B≈32 (the fleet cohort point), ~order-of-magnitude agg
   model-free in ``parity/minimax_m3_batched_test.py`` (per-stream loop, bit-exact dispatch) and
   ``parity/minimax_m3_loopkill_test.py`` (loop-kill == per-stream loop, greedy-token-equivalent).
 
-Out of scope here (later M3 sub-milestones): paged-KV + prefix caching (int8 KV) and chunked prefill.
-Prefill is single-stream (:meth:`prefill` consumes one prompt into one stream's cache via the proven
-cached forward); the win is in DECODE, where multi-stream serving spends ~all of its time.
+**M3-4 — paged-KV + prefix caching (int8 KV).** M3 is the clean dense-GQA paged case (all 60 layers
+attention, NO recurrent state — like InternLM2.5), so this model also exposes the #152 paged contract
+(``paged_kv_spec`` / ``make_paged_state`` / ``prefill_paged`` / ``has_recurrent_state=False``) the shared
+:class:`quanta.shim.omlx._BaseBatchedSession` drives: per-stream state becomes one
+:class:`quanta.paged.PagedKVCacheView` per layer over a shared :class:`quanta.paged.PagedKVCacheManager`,
+so concurrent / multi-turn requests that share a prompt prefix store its KV **once** (ref-counted blocks).
+The KV is **int8 g64** (``kv_quantized=True``; GQA 4 kv heads ⇒ the KV is already cheap, int8 halves it
+again) — quant groups on ``head_dim`` are orthogonal to the seq-axis blocks, so a paged gather is
+bit-identical to the discrete :class:`KVCache` (gated). The M3-3 loop-kill's KV step takes the paged
+loop-kill (``paged_batched`` → ONE ``write_batched`` + ONE ``gather_batched``) when serving paged views.
+
+Out of scope here (later M3 sub-milestones): chunked prefill (the per-token :meth:`prefill_paged` is the
+admit path for chat-length suffixes), the trained block-sparse long-context lever, and the oMLX shim
+(the ``_MiniMaxM3BatchedSession`` engine route that consumes this paged contract). The win is in DECODE,
+where multi-stream serving spends ~all of its time.
 """
 
 from __future__ import annotations
@@ -62,6 +74,7 @@ import mlx.core as mx
 from quanta.minimax.config_m3 import MiniMaxM3Config
 from quanta.minimax.model_m3 import KVCache, MiniMaxM3Block
 from quanta.minimax.runtime_m3 import MiniMaxM3ResidentModel
+from quanta.paged import MINIMAX_M3_PAGED_KV_BATCHED_DEFAULT, PagedKVCacheView
 
 # --- M3-3 GQA loop-kill default (the graduated serving path) ---------------------------------------
 # When ON, the serving decode step (:func:`batched_decode_step`) replaces the per-stream attention loop
@@ -110,6 +123,7 @@ def batched_decode_step(
     use_fast: bool = True,
     loopkill: bool = False,
     chunk: int = MINIMAX_M3_LOOPKILL_CHUNK,
+    paged_batched: bool = False,
 ) -> list[mx.array]:
     """One batched decode step over ``B = len(stream_token_ids)`` streams. Returns per-stream logits
     ``[1,1,vocab]`` — one per stream, in input order, so the caller can sample each independently.
@@ -124,6 +138,12 @@ def batched_decode_step(
       projections + per-stream RoPE + fused padded SDPA), greedy-token-equivalent to the loop. The
       caller MUST hold the mixer packed (enforced upstream — a dense-bf16 projection reorders across
       batch-M); ``chunk`` keeps each ``mx.quantized_matmul`` in the bit-exact gemv regime.
+
+    ``paged_batched`` (M3-4): when True AND ``stream_caches`` holds :class:`quanta.paged.PagedKVCacheView`
+    lists, the loop-kill's KV step does ONE ``write_batched`` + ONE ``gather_batched`` over the shared
+    manager instead of the per-stream ``.update()`` loop — bit-identical (both end in the same fused SDPA;
+    no-op for discrete caches or the per-stream-loop path). Threaded into :meth:`MiniMaxM3Attention.
+    decode_step_batched`.
 
     Per-stream output is greedy-token-equivalent (top-1 exact) to feeding the same token through
     :class:`quanta.minimax.runtime_m3.MiniMaxM3ResidentModel` at the same offset against the same
@@ -164,7 +184,8 @@ def batched_decode_step(
             h_norm = blk.input_layernorm(x_stacked)
             kv_for_layer = [stream_caches[s][layer_i] for s in range(b)]
             y = blk.self_attn.decode_step_batched(h_norm, kv_for_layer=kv_for_layer,
-                                                  offsets=list(offsets), chunk=chunk)  # [B,1,hidden]
+                                                  offsets=list(offsets), chunk=chunk,
+                                                  paged_batched=paged_batched)  # [B,1,hidden]
             stacked = x_stacked + y                                                 # [B,1,hidden]
         else:
             # per-stream attention step (proven M=1 path; bounded IO loop over the small batch, rule 3).
@@ -204,16 +225,27 @@ class MiniMaxM3BatchedResidentModel:
     Surface the orchestrator drives:
 
     * ``step_batch(stream_token_ids, stream_caches, offsets) -> list[mx.array]`` — one decode step for
-      each stream; returns per-stream logits ``[1,1,vocab]``.
+      each stream; returns per-stream logits ``[1,1,vocab]``. Accepts either per-stream discrete
+      :class:`KVCache` lists (unpaged) or :class:`quanta.paged.PagedKVCacheView` lists (paged).
     * ``prefill(prompt_ids, state) -> mx.array`` — single-stream prefill into one stream's cache.
-    * ``make_caches()`` / ``make_batch_caches(B)`` — per-stream KV cache factories.
+    * ``make_caches()`` / ``make_batch_caches(B)`` — per-stream KV cache factories (the configured mode).
+    * **#152 paged contract** (M3-4; consumed by :class:`quanta.shim.omlx._BaseBatchedSession`):
+      ``has_recurrent_state=False``, ``paged_kv_spec``, ``make_paged_state(mgr, seq)``,
+      ``prefill_paged(suffix_ids, state, *, offset, recurrent_in, block_size)``.
     * ``.cfg``, ``.num_layers``, ``.embed_w``, ``.norm_w``, ``.lm_head_w``, ``.layers`` — same handles
       as :class:`MiniMaxM3ResidentModel`.
     """
 
+    # #152 paged contract: M3 is PURE dense GQA attention — every layer's k/v pair is paged and there
+    # is NO recurrent/derived state to snapshot at block boundaries (unlike Nemotron's Mamba / DSV4's
+    # compressor). So has_recurrent_state is False and prefill_paged returns no boundary payloads; the
+    # base session's _admit_paged short-circuits the recurrent branch (recurrent_in is always None).
+    has_recurrent_state = False
+
     def __init__(self, art_dir: str | Path, *, max_batch: int = 32,
                  n_layers: int | None = None, packed: bool = True,
-                 packed_experts: bool = True, loopkill: bool | None = None) -> None:
+                 packed_experts: bool = True, loopkill: bool | None = None,
+                 kv_quantized: bool = True, kv_group_size: int = 64, kv_bits: int = 8) -> None:
         if max_batch < 1:
             raise ValueError(f"max_batch must be >= 1, got {max_batch}")
         self._inner = MiniMaxM3ResidentModel(art_dir, n_layers=n_layers, packed=packed,
@@ -227,15 +259,23 @@ class MiniMaxM3BatchedResidentModel:
         self.layers: list[MiniMaxM3Block] = self._inner.layers
         self.packed = bool(packed)                       # int8 mixer held packed (mx.quantized_matmul)
         self.packed_experts = bool(packed_experts)       # routed experts packed int6 (gather_qmm)
+        # KV storage mode for the per-stream / paged caches — int8 g64 the M3-4 serving default (GQA 4 kv
+        # heads ⇒ cheap KV; int8 halves it). Threaded to the paged spec so a PagedKVCacheManager is built
+        # bit-identical (rule 6, never hardcoded).
+        self._kv_quantized = bool(kv_quantized)
+        self._kv_group_size = int(kv_group_size)
+        self._kv_bits = int(kv_bits)
         self._loopkill = (bool(MINIMAX_M3_BATCHED_LOOPKILL_DEFAULT) if loopkill is None
                           else bool(loopkill))           # M3-3 GQA loop-kill (graduated ON; rule-4 flag)
+        self._paged_kv_batched = bool(MINIMAX_M3_PAGED_KV_BATCHED_DEFAULT)  # M3-4 paged KV loop-kill
         self._check_loopkill_requires_packed()
 
     @classmethod
     def from_inner(cls, layers: list[MiniMaxM3Block], embed_w: mx.array, norm_w: mx.array,
                    lm_head_w: mx.array, cfg: MiniMaxM3Config, *,
-                   max_batch: int = 32,
-                   loopkill: bool | None = None) -> MiniMaxM3BatchedResidentModel:
+                   max_batch: int = 32, loopkill: bool | None = None,
+                   kv_quantized: bool = False, kv_group_size: int = 64,
+                   kv_bits: int = 8) -> MiniMaxM3BatchedResidentModel:
         """Construct from pre-built layers / final-form weights (bypasses artifact load) so the
         model-free parity gate can drive ``step_batch`` / ``prefill`` against a tiny synthetic model
         without a checkpoint — same step machinery, model-free. ``norm_w`` is the already-``(1+w)``-
@@ -244,7 +284,11 @@ class MiniMaxM3BatchedResidentModel:
         ``loopkill`` overrides the per-instance loop-kill flag: ``None`` (default) inherits the
         graduated :data:`MINIMAX_M3_BATCHED_LOOPKILL_DEFAULT` (so the serving ``from_inner`` gets the
         loop-kill, paired with the layers' ``packed`` state); the M3-2 Design-A gate passes
-        ``loopkill=False`` to pin the bit-exact per-stream path it gates."""
+        ``loopkill=False`` to pin the bit-exact per-stream path it gates.
+
+        KV flags default **bf16** (unlike ``__init__``'s int8 serving default) so a tiny synthetic
+        config (``head_dim < 32`` cannot meet ``mx.quantize``'s min group_size) stays on the bf16 path;
+        the M3-4 paged gate passes ``kv_quantized=True`` with a ``head_dim>=32`` config to exercise int8."""
         self = cls.__new__(cls)
         self._inner = None
         self.max_batch = int(max_batch)
@@ -254,12 +298,16 @@ class MiniMaxM3BatchedResidentModel:
         self.norm_w = norm_w
         self.lm_head_w = lm_head_w
         self.layers = list(layers)
+        self._kv_quantized = bool(kv_quantized)
+        self._kv_group_size = int(kv_group_size)
+        self._kv_bits = int(kv_bits)
         moe = [b for b in layers if b.is_moe]
         self.packed_experts = bool(moe) and isinstance(moe[0].mlp.experts_gate_up, dict)
         import mlx.nn as nn
         self.packed = bool(layers) and isinstance(layers[0].self_attn.q_proj, nn.QuantizedLinear)
         self._loopkill = (bool(MINIMAX_M3_BATCHED_LOOPKILL_DEFAULT) if loopkill is None
                           else bool(loopkill))
+        self._paged_kv_batched = bool(MINIMAX_M3_PAGED_KV_BATCHED_DEFAULT)  # M3-4 paged KV loop-kill
         self._check_loopkill_requires_packed()
         return self
 
@@ -282,8 +330,10 @@ class MiniMaxM3BatchedResidentModel:
 
     # --- per-stream cache factory ---------------------------------------------
     def make_caches(self) -> list[KVCache]:
-        """One stream's fresh per-layer GQA KV cache list (bf16; int8/paged KV is a later lever)."""
-        return [KVCache() for _ in range(self.num_layers)]
+        """One stream's fresh per-layer GQA KV cache list in the configured KV mode (``_kv_quantized`` /
+        ``_kv_group_size`` / ``_kv_bits`` — int8 g64 the serving default, bf16 for the model-free gates)."""
+        return [KVCache(quantized=self._kv_quantized, group_size=self._kv_group_size,
+                        bits=self._kv_bits) for _ in range(self.num_layers)]
 
     def make_batch_caches(self, batch: int) -> list[list[KVCache]]:
         """A list of ``batch`` independent per-stream cache lists (one per concurrent stream)."""
@@ -332,11 +382,67 @@ class MiniMaxM3BatchedResidentModel:
         equivalent (top-1 exact) to the single-stream runtime at the same offset against the same
         cache — gated in ``parity/minimax_m3_batched_test.py`` (per-stream loop) and
         ``parity/minimax_m3_loopkill_test.py`` (loop-kill). The attention path is the GQA loop-kill
-        when ``self._loopkill`` (the graduated serving default), else the per-stream loop."""
+        when ``self._loopkill`` (the graduated serving default), else the per-stream loop.
+
+        ``stream_caches`` may hold per-stream discrete :class:`KVCache` lists (unpaged) or per-stream
+        :class:`quanta.paged.PagedKVCacheView` lists (paged, the omlx session path). For paged views the
+        loop-kill's KV step takes the paged loop-kill (``write_batched`` + ``gather_batched``) when
+        ``self._paged_kv_batched`` (M3-4); the per-stream loop path reads paged views directly via
+        ``view.update`` (no flag needed)."""
         if len(stream_token_ids) > self.max_batch:
             raise ValueError(f"batch {len(stream_token_ids)} exceeds max_batch {self.max_batch}")
         self._check_loopkill_requires_packed()   # rule 6: a runtime toggle cannot bypass loopkill⇒packed
+        # paged KV loop-kill engages only when (a) it's enabled, (b) the loop-kill attention is on (the
+        # per-stream loop reads paged views directly), and (c) the caches are actually paged views.
+        paged = (self._paged_kv_batched and self._loopkill and bool(stream_caches)
+                 and isinstance(stream_caches[0][0], PagedKVCacheView))
         return batched_decode_step(self.layers, self.embed_w, self.norm_w, self.lm_head_w,
                                    self.cfg, stream_token_ids, stream_caches, offsets,
                                    use_fast=use_fast, loopkill=self._loopkill,
-                                   chunk=MINIMAX_M3_LOOPKILL_CHUNK)
+                                   chunk=MINIMAX_M3_LOOPKILL_CHUNK, paged_batched=paged)
+
+    # --- #152 paged contract (M3-4) -------------------------------------------
+    @property
+    def paged_kv_spec(self) -> dict:
+        """Shape/codec the shared :class:`quanta.paged.PagedKVCacheManager` must use to be bit-exact with
+        the discrete :class:`KVCache` — threaded from this runtime's own KV flags, never hardcoded (rule
+        6: a wrong width silently mis-decodes). All 60 layers are paged (uniform dense GQA); k/v pair (no
+        ``single_stream``); no recurrent cache (``has_recurrent_state=False``)."""
+        return {"n_layers": self.num_layers,
+                "group_size": self._kv_group_size,
+                "bits": self._kv_bits,
+                "quantized": self._kv_quantized}
+
+    def make_paged_state(self, manager, seq) -> list:
+        """Per-stream paged state = one :class:`quanta.paged.PagedKVCacheView` per layer over the shared
+        ``manager`` (so the prefix blocks dedup across requests). The plain list is exactly what
+        :meth:`step_batch` / :meth:`prefill_paged` thread per layer (each view ducks the discrete
+        :class:`KVCache` ``offset`` / ``update`` surface, so the unchanged forward writes/reads KV
+        through it)."""
+        return [manager.view(seq, i) for i in range(self.num_layers)]
+
+    def prefill_paged(self, suffix_ids, state: list, *, offset: int,
+                      recurrent_in=None, block_size: int = 0) -> tuple[mx.array, list]:
+        """Prefill ONLY the uncached suffix into ``state`` (per-layer paged views over the resident prefix
+        blocks), with the suffix tokens at absolute positions ``[offset, offset + T)`` for RoPE — the
+        :meth:`quanta.shim.omlx._BaseBatchedSession._admit_paged` hook.
+
+        M3 is pure dense GQA ⇒ NO recurrent state to restore (``recurrent_in`` MUST be ``None`` — rule 6)
+        and NO boundary snapshot to produce (returns ``[]``); the engine's paged admit short-circuits the
+        recurrent branch (``has_recurrent_state=False``). Each layer's attention writes the suffix k/v
+        through its view and reads back the full (prefix + suffix) stream for the bottom-right-causal SDPA,
+        which is **bit-identical** to a discrete continue-from-prefix prefill of the same split (the paged
+        gather == discrete :class:`KVCache` foundation — gated in ``parity/minimax_m3_paged_test.py``).
+        ``block_size`` is unused (no boundary work)."""
+        del block_size  # no recurrent/derived boundary state for a dense model
+        if recurrent_in is not None:
+            raise ValueError("MiniMaxM3 prefill_paged: recurrent_in must be None (dense GQA has no "
+                             "recurrent state — rule 6)")
+        if len(state) != self.num_layers:
+            raise ValueError(f"len(state)={len(state)} != num_layers={self.num_layers} "
+                             f"(one paged view per layer; refusing to mis-thread state — rule 6)")
+        if int(state[0].offset) != int(offset):
+            raise ValueError(f"prefill_paged: view offset {int(state[0].offset)} != declared offset "
+                             f"{int(offset)} (the manager must have advanced the prefix first — rule 6)")
+        logits = self.prefill(suffix_ids, state)   # the unchanged cached forward over the paged views
+        return logits, []

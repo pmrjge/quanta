@@ -211,12 +211,34 @@ source is gone from disk). So M3 is a **real build**, not validate-at-scale. The
     Δppl +0.316% / agree 0.953); decode **1.19× over the per-stream loop @ B=8 / 2.83× aggregate
     B=1→B=8** — the mixer-read bandwidth win on top of M3-2's batched MoE). Manifest 106 model_free / 53
     real_weight.
-  - **M3-4+ (next).** **Paged-KV + prefix caching** (GQA 4 kv heads ⇒ cheap KV; int8 KV — the
-    `batched_decode_attention_kv` `paged_batched=True` path is already wired for the loop-kill substrate);
-    chunked prefill; the **trained block-sparse attention** long-context lever (parity: sparse==dense at
-    short ctx; xattention substrate); the **oMLX shim** (`QuantaOmlxEngine` route + chat template +
-    `<mm:think>` reasoning parser + MiniMax nested-XML tool parser + a **multimodal image input path**);
-    multi-stream.
+  - **M3-4 ✅ — paged-KV + prefix caching (int8 KV).** M3 is the clean dense-GQA paged case (all 60
+    layers attention, NO recurrent state — like InternLM2.5), so it exposes the #152 paged contract the
+    shared `quanta.shim.omlx._BaseBatchedSession` drives. `model_m3.KVCache` gains int8 modes
+    (`quantized`/`group_size`/`bits`, mirroring `quanta.internlm2` + `cache_quant`; default bf16 = the
+    M1/M2 reference, **int8-g64** the serving lever — quant groups on `head_dim` orthogonal to the
+    seq-axis blocks ⇒ a paged gather is **bit-identical** to the discrete cache). `decode_step_batched`
+    gains a `paged_batched` flag → the shared `batched_decode_attention_kv` does ONE `write_batched` +
+    ONE `gather_batched` over paged views (the paged KV loop-kill) vs the per-stream `.update()` loop —
+    bit-identical. `batched_runtime_m3` exposes `has_recurrent_state=False` + `paged_kv_spec` +
+    `make_paged_state` + `prefill_paged` (dense ⇒ no boundary payloads; `recurrent_in` must be None) +
+    `_paged_kv_batched` (`MINIMAX_M3_PAGED_KV_BATCHED_DEFAULT`, graduated ON); `step_batch` auto-detects
+    paged views; KV is int8-g64 on `__init__` (serving), bf16 on `from_inner` (model-free gates). Gates:
+    model-free `parity/minimax_m3_paged_test.py` (19 checks, in the sweep — paged prefix-reuse + suffix
+    == discrete continue-from-prefix **BIT-EXACT** for int8-g32 + bf16 KV, prefix blocks dedup, paged
+    loop-kill == per-stream paged loop **bit-exact**, dense emits no boundary payloads, rule-6) + SOLO
+    `parity/minimax_m3_paged_real.py` (the **397B re-gate**: paged == discrete **BIT-EXACT** (|Δ| 0), the
+    paged KV loop-kill == the per-stream paged loop **BIT-EXACT** (|Δ| 0 @ B=8 ragged), **int8 KV
+    near-lossless** (bf16 ppl 5.879 → int8-KV 5.927, **Δppl +0.823%** / top-1 agree 0.949), paged decode
+    == single-stream (top-1 1.000), reuse-after-free **bit-exact**). **Finding:** paged prefix reuse is
+    bit-exact when the committing prefill SHAPE matches; a re-admit committed at a *different* shape is
+    greedy-token-equivalent (the #153 batch-M tiling effect, now in prefill: same tokens prefilled in
+    different-length batches give quant-ULP-different KV codes, compounding over 60 layers). Manifest 107
+    model_free / 53 real_weight.
+  - **M3-5+ (next).** Chunked prefill (the per-token `prefill_paged` admit is fine for chat lengths;
+    chunked is the long-admit lever); the **trained block-sparse attention** long-context lever (parity:
+    sparse==dense at short ctx; xattention substrate); the **oMLX shim** (the `_MiniMaxM3BatchedSession`
+    engine route + chat template + `<mm:think>` reasoning parser + MiniMax nested-XML tool parser + a
+    **multimodal image input path**); multi-stream.
 - **Vision track** (folded into M1/M3 since full-VL): CLIP ViT forward + 3D-RoPE + patch-merge
   compression + projector parity; image processor (dynamic-res tiling); multimodal prefill (splice
   image embeddings at `image_token_index` 200025).

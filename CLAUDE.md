@@ -139,10 +139,37 @@ rel 0, 64/64 over 8 decode steps × B=8: same batched MoE, bit-exact chunked pro
 RoPE, SDPA reorder ~0 at these lengths) and == single-stream (top-1 1.000, no near-tie flip); ships the
 M2b int6 quality (ppl 5.879 / Δppl +0.316% / agree 0.953); decode **1.19× over the per-stream loop @
 B=8 / 2.83× aggregate B=1→B=8** — the mixer-read bandwidth win on top of M3-2's batched MoE). Manifest
-106 model_free / 53 real_weight. **Next = M3-4** — paged-KV + prefix caching (GQA 4 kv heads ⇒ cheap
-KV; int8 KV), chunked prefill, the trained block-sparse long-context lever, the oMLX shim (multimodal
-image input + `<mm:think>` reasoning + MiniMax nested-XML tool parser), and the vision track (CLIP-ViT
-forward + projector + image processor; the vision *weights* are already baked dense bf16).
+106 model_free / 53 real_weight. **M3-4 ✅ (this commit)** — paged-KV + prefix caching (int8 KV). M3 is
+the **clean dense-GQA paged case** (all 60 layers attention, NO recurrent state — like InternLM2.5), so
+it exposes the **#152 paged contract** the shared `quanta.shim.omlx._BaseBatchedSession` drives:
+`model_m3.KVCache` gains int8 modes (`quantized`/`group_size`/`bits`, mirroring `quanta.internlm2` +
+`cache_quant`; **default bf16** = the M1/M2 reference, **int8-g64** the serving lever — quant groups on
+`head_dim` are orthogonal to the seq-axis blocks ⇒ a paged gather is **bit-identical** to the discrete
+cache); `MiniMaxM3Attention.decode_step_batched` gains a `paged_batched` flag → the shared
+`batched_decode_attention_kv` does ONE `write_batched` + ONE `gather_batched` over paged views (the paged
+KV loop-kill) instead of the per-stream `.update()` loop — bit-identical (both end in the same fused
+SDPA). `batched_runtime_m3.MiniMaxM3BatchedResidentModel` exposes `has_recurrent_state=False` +
+`paged_kv_spec` + `make_paged_state` + `prefill_paged` (dense ⇒ no boundary payloads, `recurrent_in` must
+be None) + a `_paged_kv_batched` flag (`MINIMAX_M3_PAGED_KV_BATCHED_DEFAULT`, **graduated ON**);
+`step_batch` auto-detects paged views; KV mode is **int8-g64 on `__init__`** (the serving default), bf16
+on `from_inner` (model-free gates). Gates: model-free `parity/minimax_m3_paged_test.py` (19 checks, in
+the sweep — paged prefix-reuse + suffix == discrete continue-from-prefix **BIT-EXACT** for BOTH int8-g32
++ bf16 KV, prefix blocks dedup, paged loop-kill == per-stream paged loop **bit-exact**, dense emits no
+boundary payloads, rule-6 `recurrent_in`/offset refusals) + SOLO `parity/minimax_m3_paged_real.py`
+(non-`_test.py`, excluded; the **397B re-gate** off ONE int8-KV resident load: **paged == discrete
+BIT-EXACT** (|Δ| 0), the paged KV loop-kill == the per-stream paged loop **BIT-EXACT** (|Δ| 0 @ B=8
+ragged), **int8 KV near-lossless** (bf16 ppl 5.879 → int8-KV ppl 5.927, **Δppl +0.823%** / top-1 agree
+0.949), paged decode == single-stream (top-1 1.000), reuse-after-free **bit-exact** (|Δ| 0)). **Finding:**
+paged prefix reuse is **bit-exact when the committing prefill SHAPE matches** (the orthogonal-axes
+foundation); a re-admit whose prior commit used a *different* shape is **greedy-token-equivalent**, not
+bit-exact — a packed projection at batch-M=A tiles its K-reduction differently than at M=B (the #153
+finding, now surfacing in prefill: the same tokens prefilled in different-length batches give
+quant-ULP-different KV codes, compounding over 60 layers). Manifest 107 model_free / 53 real_weight.
+**Next = M3-5** — chunked prefill (the per-token `prefill_paged` admit is fine for chat lengths; chunked
+is the long-admit lever), the trained block-sparse long-context lever (sparse==dense at short ctx;
+xattention substrate), the oMLX shim (the `_MiniMaxM3BatchedSession` engine route + chat template +
+`<mm:think>` reasoning + MiniMax nested-XML tool parser + multimodal image input), and the vision track
+(CLIP-ViT forward + projector + image processor; the vision *weights* are already baked dense bf16).
 
 The rest of the served fleet is **complete, shipped, and parity-gated**. Per-model resident sizes are
 in the Serving throughput table below; the detailed milestone handovers live in the `PLAN_*.md` files

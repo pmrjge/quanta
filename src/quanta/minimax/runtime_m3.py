@@ -189,11 +189,18 @@ class MiniMaxM3ResidentModel:
     model with ``packed=True``; the shared expert stays bf16 either way."""
 
     def __init__(self, art_dir: str | Path, *, n_layers: int | None = None,
-                 packed: bool = False, packed_experts: bool = True) -> None:
+                 packed: bool = False, packed_experts: bool = True,
+                 kv_quantized: bool = False, kv_group_size: int = 64, kv_bits: int = 8) -> None:
         self.art = MiniMaxM3Artifact(art_dir)
         self.cfg: MiniMaxM3Config = self.art.cfg
         self.packed = bool(packed)
         self.packed_experts = bool(packed_experts)
+        # KV storage mode for make_caches (default bf16 — the M1/M2 parity reference; int8 g64 is the
+        # M3-4 serving lever, opt-in). Exposed as quantized_kv/kv_group_size/kv_bits so a paged session
+        # can build a bit-identical PagedKVCacheManager from these (never hardcoded — rule 6).
+        self.quantized_kv = bool(kv_quantized)
+        self.kv_group_size = int(kv_group_size)
+        self.kv_bits = int(kv_bits)
         n = self.cfg.num_hidden_layers if n_layers is None else n_layers
         self.layers: list[MiniMaxM3Block] = []
         for i in range(n):  # rule 8: materialize one layer's params, eval, then drop source shards
@@ -214,12 +221,14 @@ class MiniMaxM3ResidentModel:
 
     @classmethod
     def from_blocks(cls, layers: list[MiniMaxM3Block], embed_w: mx.array, norm_w: mx.array,
-                    lm_head_w: mx.array, cfg: MiniMaxM3Config) -> MiniMaxM3ResidentModel:
+                    lm_head_w: mx.array, cfg: MiniMaxM3Config, *, kv_quantized: bool = False,
+                    kv_group_size: int = 64, kv_bits: int = 8) -> MiniMaxM3ResidentModel:
         """Construct from pre-built blocks + final-form weights (bypasses artifact load) so the
         model-free parity gate can drive the resident forward on a tiny synthetic model without a
         checkpoint. ``norm_w`` is the already-``(1+w)``-folded final norm; ``embed_w``/``lm_head_w``
         verbatim. ``packed_experts`` is detected from the first MoE block's expert stack; ``packed``
-        (the int8 mixer) from whether ``self_attn.q_proj`` is an ``nn.QuantizedLinear``."""
+        (the int8 mixer) from whether ``self_attn.q_proj`` is an ``nn.QuantizedLinear``. KV flags
+        default bf16 (the parity reference); a paged/serving caller passes ``kv_quantized=True``."""
         self = cls.__new__(cls)
         self.art = None
         self.cfg = cfg
@@ -228,6 +237,9 @@ class MiniMaxM3ResidentModel:
         self.embed_w = embed_w
         self.norm_w = norm_w
         self.lm_head_w = lm_head_w
+        self.quantized_kv = bool(kv_quantized)
+        self.kv_group_size = int(kv_group_size)
+        self.kv_bits = int(kv_bits)
         moe_blocks = [b for b in layers if b.is_moe]
         self.packed_experts = bool(moe_blocks) and isinstance(moe_blocks[0].mlp.experts_gate_up, dict)
         self.packed = bool(layers) and isinstance(layers[0].self_attn.q_proj, nn.QuantizedLinear)
@@ -235,9 +247,11 @@ class MiniMaxM3ResidentModel:
 
     # --- cache factory ---------------------------------------------------------
     def make_caches(self) -> list[KVCache]:
-        """A fresh per-layer GQA KV cache (one :class:`KVCache` per decoder layer), bf16. int8 KV is
-        a later serving lever; M3 is uniform full-attention so every layer caches identically."""
-        return [KVCache() for _ in range(self.num_layers)]
+        """A fresh per-layer GQA KV cache (one :class:`KVCache` per decoder layer) in the configured KV
+        mode (``quantized_kv`` / ``kv_group_size`` / ``kv_bits`` — bf16 by default, int8 g64 the serving
+        lever). M3 is uniform full-attention so every layer caches identically."""
+        return [KVCache(quantized=self.quantized_kv, group_size=self.kv_group_size, bits=self.kv_bits)
+                for _ in range(self.num_layers)]
 
     def _head(self, h: mx.array) -> mx.array:
         """Final Gemma ``(1+w)`` RMSNorm → lm_head: residual ``[1,T,hidden] → [1,T,vocab]``."""

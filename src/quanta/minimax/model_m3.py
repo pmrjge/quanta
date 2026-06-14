@@ -41,6 +41,7 @@ from __future__ import annotations
 import mlx.core as mx
 import mlx.nn as nn
 
+from quanta.cache_quant import dequantize_last_axis, quantize_last_axis
 from quanta.minimax.config_m3 import MiniMaxM3Config
 
 # ----------------------------------------------------------------------------- #
@@ -157,24 +158,65 @@ def route_noaux(xf: mx.array, gate_w: mx.array, bias: mx.array, cfg: MiniMaxM3Co
 
 
 class KVCache:
-    """Plain GQA KV cache: ``[B, n_kv, S, head_dim]`` k/v, grown along the seq axis. bf16 (the M1
-    parity path); int8 KV is the M3 serving lever."""
+    """Plain GQA KV cache: ``[B, n_kv, S, head_dim]`` k/v, grown along the seq axis.
 
-    def __init__(self) -> None:
+    Two storage modes (mirrors :class:`quanta.internlm2.attention.KVCache`):
+
+    * ``quantized=False`` (default): bf16 verbatim — the M1/M2 parity path / short-context decode.
+    * ``quantized=True``: per-token, per-group affine int-``bits`` over ``head_dim`` (the last axis)
+      via :mod:`quanta.cache_quant`. ``update`` dequantizes the full cache to bf16 for the SDPA return,
+      so the attention path is unchanged. **int8 g64 is the M3-4 serving lever** (GQA 4 kv heads ⇒ the
+      KV is already cheap; int8 halves it again). The quant groups sit on ``head_dim`` while the paged
+      block-pool cuts the seq axis — orthogonal, so a paged gather is **bit-identical** to this discrete
+      cache fed the same tokens (the :class:`quanta.paged.PagedKVCacheManager` foundation), which is what
+      ``parity/minimax_m3_paged_test`` gates paged == discrete against."""
+
+    def __init__(self, *, quantized: bool = False, group_size: int = 64, bits: int = 8) -> None:
+        self.quantized = quantized
+        self.group_size = group_size
+        self.bits = bits
+        # bf16 mode
         self.k: mx.array | None = None
         self.v: mx.array | None = None
+        # int<bits> mode (codes + per-group scales/biases, concatenated along the seq axis)
+        self.k_q: mx.array | None = None
+        self.k_s: mx.array | None = None
+        self.k_b: mx.array | None = None
+        self.v_q: mx.array | None = None
+        self.v_s: mx.array | None = None
+        self.v_b: mx.array | None = None
 
     @property
     def offset(self) -> int:
+        if self.quantized:
+            return 0 if self.k_q is None else self.k_q.shape[2]
         return 0 if self.k is None else self.k.shape[2]
 
     def update(self, k: mx.array, v: mx.array) -> tuple[mx.array, mx.array]:
-        if self.k is None:
-            self.k, self.v = k, v
+        if not self.quantized:
+            if self.k is None:
+                self.k, self.v = k, v
+            else:
+                self.k = mx.concatenate([self.k, k], axis=2)
+                self.v = mx.concatenate([self.v, v], axis=2)
+            return self.k, self.v
+        k_qn, k_sn, k_bn = quantize_last_axis(k, self.group_size, bits=self.bits)
+        v_qn, v_sn, v_bn = quantize_last_axis(v, self.group_size, bits=self.bits)
+        if self.k_q is None:
+            self.k_q, self.k_s, self.k_b = k_qn, k_sn, k_bn
+            self.v_q, self.v_s, self.v_b = v_qn, v_sn, v_bn
         else:
-            self.k = mx.concatenate([self.k, k], axis=2)
-            self.v = mx.concatenate([self.v, v], axis=2)
-        return self.k, self.v
+            self.k_q = mx.concatenate([self.k_q, k_qn], axis=2)
+            self.k_s = mx.concatenate([self.k_s, k_sn], axis=2)
+            self.k_b = mx.concatenate([self.k_b, k_bn], axis=2)
+            self.v_q = mx.concatenate([self.v_q, v_qn], axis=2)
+            self.v_s = mx.concatenate([self.v_s, v_sn], axis=2)
+            self.v_b = mx.concatenate([self.v_b, v_bn], axis=2)
+        k_full = dequantize_last_axis(self.k_q, self.k_s, self.k_b, self.group_size,
+                                      dtype=k.dtype, bits=self.bits)
+        v_full = dequantize_last_axis(self.v_q, self.v_s, self.v_b, self.group_size,
+                                      dtype=v.dtype, bits=self.bits)
+        return k_full, v_full
 
 
 class MiniMaxM3Attention(nn.Module):
@@ -255,7 +297,8 @@ class MiniMaxM3Attention(nn.Module):
             vs.append(v_c)
         return (mx.concatenate(qs, axis=0), mx.concatenate(ks, axis=0), mx.concatenate(vs, axis=0))
 
-    def decode_step_batched(self, x, *, kv_for_layer, offsets, chunk: int) -> mx.array:
+    def decode_step_batched(self, x, *, kv_for_layer, offsets, chunk: int,
+                            paged_batched: bool = False) -> mx.array:
         """One batched ``B``-stream single-token decode through ``B`` *ragged* per-stream KV caches —
         the #153 GQA loop-kill (M3-3). M3 is all-GQA so this is the whole mixer (no GDN hybrid, no
         YaRN: one fixed ``inv_freq``, nothing length-dependent to thread).
@@ -278,9 +321,13 @@ class MiniMaxM3Attention(nn.Module):
           1M, no YaRN) so there is no per-stream frequency, only the per-stream offset. Bounded IO loop
           over the small batch (rule 3); RoPE is cheap vs the projections / SDPA / MoE.
         * **one fused KV-update + SDPA** via the shared
-          :func:`quanta.modeling.batched_attention.batched_decode_attention_kv` (unpaged discrete
-          caches ⇒ the bounded per-stream ``.update()`` then ONE padded SDPA over all ``B`` streams —
-          the same #153 primitive InternLM2.5 / Nemotron / qwen35 use; GQA repeat inside the helper).
+          :func:`quanta.modeling.batched_attention.batched_decode_attention_kv` (the same #153 primitive
+          InternLM2.5 / Nemotron / qwen35 use; GQA repeat inside the helper). When ``paged_batched`` is
+          True AND ``kv_for_layer`` holds :class:`quanta.paged.PagedKVCacheView` (M3-4 paged serving),
+          the per-stream ``.update()`` loop becomes ONE ``write_batched`` scatter + ONE ``gather_batched``
+          over the shared manager (the paged KV loop-kill); otherwise (discrete caches, or the flag off)
+          the bounded per-stream ``.update()`` then ONE padded SDPA. Both end in the same fused SDPA, so
+          the choice is bit-identical (gated in ``parity/minimax_m3_paged_test``).
 
         Row ``s`` equals :meth:`__call__` on stream ``s`` (at its own offset, ``use_fast=True``) against
         its own cache: the q/k/v/o projections are bit-exact once packed + chunked and the per-stream
@@ -305,10 +352,11 @@ class MiniMaxM3Attention(nn.Module):
             k_rows.append(rope_fast(k[s:s + 1], self._inv, self.rd, off_s))
         q = mx.concatenate(q_rows, axis=0) if b > 1 else q_rows[0]      # [B,nh,1,hd]
         k = mx.concatenate(k_rows, axis=0) if b > 1 else k_rows[0]      # [B,n_kv,1,hd]
-        # one fused KV-update (bounded per-stream .update() on the discrete unpaged caches) + ONE padded
-        # SDPA across all B streams (GQA repeat inside the shared helper).
-        out = batched_decode_attention_kv(q, k, v, list(kv_for_layer),
-                                          scale=self.scale, n_rep=self.rep, paged_batched=False)  # [B,nh,1,hd]
+        # one fused KV-update + ONE padded SDPA across all B streams (GQA repeat inside the shared
+        # helper). paged_batched=True over paged views ⇒ ONE write_batched + ONE gather_batched (the
+        # M3-4 paged KV loop-kill); else the bounded per-stream .update() loop — bit-identical (rule 4).
+        out = batched_decode_attention_kv(q, k, v, list(kv_for_layer), scale=self.scale,
+                                          n_rep=self.rep, paged_batched=paged_batched)  # [B,nh,1,hd]
         out = mx.transpose(out, (0, 2, 1, 3)).reshape(b, t, self.nh * self.hd)   # [B,1,nh*hd]
         # o-projection in the SAME <=chunk row-slices (bit-exact regime); the fused SDPA above is the
         # only op that spans all B (its softmax reorder is the lone greedy-token-equivalent ULP).

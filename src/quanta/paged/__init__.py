@@ -55,6 +55,17 @@ PAGED_KV_BATCHED_DEFAULT = True
 # own scoped ON default below).
 NEMOTRON_PAGED_KV_BATCHED_DEFAULT = True
 
+# MiniMax-M3-scoped (M3-4) batched-paged default: GRADUATED to ON. M3 is the clean dense-GQA paged case
+# (all 60 layers attention, NO recurrent state — like InternLM2.5), so the paged KV loop-kill replaces
+# the loop-kill attention's per-stream ``.update()`` with ONE ``write_batched`` scatter + ONE
+# ``gather_batched`` across all B streams, on top of M3-3's already-batched projections/SDPA + M3-2's
+# batched MoE. Parity-proven bit-exact: the M0 batched scatter/gather primitives are gated for the k/v
+# keepers and the M3 wiring (paged-batched == the per-stream paged loop, both ending in the same fused
+# padded SDPA) is gated model-free in ``parity/minimax_m3_paged_test.py`` and re-gated @ 397B in
+# ``parity/minimax_m3_paged_real.py``. Scoped (NOT the shared PAGED_KV_BATCHED_DEFAULT) so the DSV4
+# flag is untouched; rule 4 satisfied (parity proven ⇒ default ON, one flag to revert).
+MINIMAX_M3_PAGED_KV_BATCHED_DEFAULT = True
+
 # InternLM2.5-scoped #153 default: GRADUATED to ON. The loop-kill is parity-proven model-free (bit-exact,
 # ``parity/internlm2_batched_attention_test.py`` §C) AND on the real int8-g64 7B-Chat-1M bake —
 # greedy-exact vs the per-stream paged loop at B∈{1,32,48} with a measured **3.20x decode tok/s at B=32**
@@ -71,6 +82,7 @@ __all__ = [
     "PAGED_KV_BATCHED_DEFAULT",
     "NEMOTRON_PAGED_KV_BATCHED_DEFAULT",
     "INTERNLM2_PAGED_KV_BATCHED_DEFAULT",
+    "MINIMAX_M3_PAGED_KV_BATCHED_DEFAULT",
     "BlockAllocator",
     "CacheBlock",
     "compute_block_hash",
