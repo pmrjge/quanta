@@ -111,10 +111,35 @@ source is gone from disk). So M3 is a **real build**, not validate-at-scale. The
   coverage). 8 checks. Confirms the loader + real-shape/dtype wiring (hidden 6144, GQA 64q/4kv hd128,
   128 experts top-4 + shared, dense_inter 12288) + the per-expert→stacked pack. Peak ~29 GiB
   (one MoE block's fp32 expert stacks) « 490.
-- **M2 — bake int6-g64** (self-contained artifact: relative refs only, declares the 1M window,
-  synthesizes `generation_config.json` eos [200020], copies tokenizer; data-free RTN; one layer
-  resident at a time, rule 8). Teacher-forced **ppl arbiter** (the e2e arbiter, methodology #4) on
-  held-out prose: int6 vs bf16 → ship.
+- **M2a ✅ — int6-g64 bake + artifact reader (the artifact-producing path, proven on a real-weight
+  smoke).** New `src/quanta/minimax/bake_m3.py` (`bake_minimax_m3`): streamed one text layer resident
+  at a time (rule 8) over `loader_m3`, writing a self-contained int6/int8/bf16 bundle via the shared
+  `ArtifactWriter` — routed experts (pre-stacked `experts.{gate_up,down}_proj`) → **int6 affine g64**
+  (3-D one-shot, `gather_qmm`-ready, rule 3); GQA q/k/v/o + dense-FFN (L0–2) + shared expert → int8;
+  norms / router `gate`+`e_score_correction_bias` (**f32**) / trained indexer (bf16) / embed / head →
+  dense verbatim; **full VL** = the whole vision tower + projector + patch-merge (523 tensors) copied
+  dense bf16 (a shard-grouped pass — the text loader stays text-only). M3 is **natively 1M** (no
+  YaRN) → `_assert_native_1m_context` asserts + stamps a `quanta_long_context` marker; the source
+  `generation_config.json` (eos 200020) + tokenizer + the VL `preprocessor_config.json` are copied;
+  `_audit_self_contained` fails loud unless standalone. New `src/quanta/minimax/artifact_m3.py`
+  (`MiniMaxM3Artifact`): a dequant-on-read reader **duck-typing `loader_m3`** (same
+  `embed`/`block_norms`/`attention`/`sparse_index`/`dense_mlp`/`moe`/`moe_packed` surface + dicts), so
+  one forward serves both the bf16 source and the int6 artifact — **the router gate/bias are returned
+  at native F32 via `get()` (NOT bf16-downcast — a downcast could flip a top-k tie ⇒ a different
+  expert; confirmed only gate+bias are F32, the rest bf16).** Gates: model-free
+  `parity/minimax_m3_bake_test.py` (**12 checks**, in the sweep — a tiny synthetic M3 checkpoint
+  through the real `bake_minimax_m3` then back through BOTH readers: every quantized dequant ==
+  source-RTN bit-exact, F32 router preserved bit-exact, dense/vision verbatim, manifest schemes,
+  raw/refusals, native-1M + self-contained) + the real bake `parity/run_bake_minimax_m3_int6g64.py`
+  (SOLO; `--smoke` slice ran on real weights in 2.7s → a 6.1 GiB self-contained artifact, readback of
+  L0 int8 / L3 int6 stacks [128,6144,6144]·[…,3072] / F32 gate / bf16 indexer / packed-int6 triplet
+  all correct). Manifest 103 model_free / 53 real_weight.
+- **M2b — full int6 bake + teacher-forced ppl arbiter (next).** Run the real
+  `run_bake_minimax_m3_int6g64` SOLO (multi-hour, ~329.6 GiB out), then a new `parity/minimax_m3_ppl.py`
+  (the e2e arbiter, methodology #4): bf16 source vs int6 artifact, teacher-forced ppl + top-1 on
+  held-out prose via a streamed `MiniMaxM3Block` forward (one layer resident). **The decisive check
+  for the pinned Gemma `(1+w)` fold** — a wrong fold makes the absolute ppl garbage on both arms; a
+  coherent low ppl validates the whole forward. int6 vs bf16 Δppl → ship.
 - **M3 — serving.** Resident + batched re-gate (packed-int6 `gather_qmm` experts + int8 mixer);
   **oMLX shim** (`QuantaOmlxEngine` route + chat template + the `<mm:think>` reasoning parser + the
   MiniMax nested-XML tool parser + a **multimodal image input path** — the VL-specific work);

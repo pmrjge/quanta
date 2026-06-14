@@ -52,10 +52,25 @@ self-contained **numpy-fp64** oracle on identical real dequantized weights. Mach
 dense-L0 Δ 7.8e-7, MoE-L3 Δ 8.6e-7, fast==naive ~1e-7, sparse `gather_mm`==dense 4e-7, router
 (real F32 gate/bias) set-match + wΔ 6e-8, indexer shapes ✓ (8 checks). Validates loading +
 real-shape/dtype wiring (hidden 6144, GQA 64q/4kv, 128 experts top-4 + shared) + the
-per-expert→stacked pack at 397B-class scale. **Next = M2 int6-g64 bake + teacher-forced ppl
-arbiter** (the decisive arbiter for the pinned `(1+w)` fold), then M3 serving (resident batched
-re-gate, oMLX shim incl. multimodal image input + `<mm:think>` reasoning + MiniMax nested-XML tool
-parser, paged-KV + prefix caching, trained block-sparse long-context lever, chunked prefill,
+per-expert→stacked pack at 397B-class scale. **M2a ✅ (this commit)** — the int6-g64 bake +
+artifact-reader path: `bake_m3.bake_minimax_m3` (streamed one text layer resident, rule 8) writes a
+self-contained int6/int8/bf16 bundle — routed experts **int6-g64** (pre-stacked 3-D, `gather_qmm`-ready,
+rule 3), GQA q/k/v/o + dense-FFN + shared expert int8, norms / router `gate`+`bias` (**f32**) /
+trained indexer (bf16) / embed / head dense, **full VL** = the 523 vision tensors copied dense bf16; M3
+is **natively 1M** (no YaRN) so it asserts + declares the window; `generation_config.json` (eos
+200020) + tokenizer + VL `preprocessor_config.json` copied; self-contained audit fails loud.
+`artifact_m3.MiniMaxM3Artifact` **duck-types `loader_m3`** (one forward serves bf16 source + int6
+artifact) and returns the router **gate/bias at native F32 via `get()`** (NOT bf16-downcast — would flip
+top-k ties; only gate+bias are F32, rest bf16, confirmed on disk). Gates: model-free
+`parity/minimax_m3_bake_test.py` (12 checks, in the sweep — synthetic checkpoint through the real bake
+then back through both readers: every dequant == source-RTN bit-exact, F32 router preserved, manifest
+schemes, raw/refusals, native-1M, self-contained) + `parity/run_bake_minimax_m3_int6g64.py` (SOLO;
+`--smoke` ran on real weights in 2.7s → 6.1 GiB artifact, readback of int8/int6 stacks/F32 gate/bf16
+indexer/packed-int6 triplet all correct). Manifest 103 model_free / 53 real_weight. **Next = M2b** —
+run the full bake SOLO (multi-hour, ~329.6 GiB), then `parity/minimax_m3_ppl.py` teacher-forced ppl
+arbiter (bf16 vs int6; the decisive check for the pinned `(1+w)` fold), then M3 serving (resident
+batched re-gate, oMLX shim incl. multimodal image input + `<mm:think>` reasoning + MiniMax nested-XML
+tool parser, paged-KV + prefix caching, trained block-sparse long-context lever, chunked prefill,
 multi-stream) + the vision track.
 
 The rest of the served fleet is **complete, shipped, and parity-gated**. Per-model resident sizes are
