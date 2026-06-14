@@ -117,10 +117,31 @@ resident load: packed mixer+experts vs the streamed bf16 reference **ppl 5.879 /
 0.953**; batched B=8 ragged == single-stream greedy-token-equivalent — at scale the lone cross-stream
 op, the F32 router GEMM at M=B, flips a routing near-tie on 1/8 streams, the documented batched
 boundary; decode **2.32× aggregate @ B=8** — the batching lever, climbing with B). Manifest 105
-model_free / 53 real_weight. **Next = M3-3** — the GQA loop-kill (ONE batched attention across streams
-via a ragged-offset padded SDPA, on the packed-mixer substrate); then paged-KV + prefix caching (int8
-KV), chunked prefill, the trained block-sparse long-context lever, the oMLX shim (multimodal image
-input + `<mm:think>` reasoning + MiniMax nested-XML tool parser), and the vision track (CLIP-ViT
+model_free / 53 real_weight. **M3-3 ✅ (this commit)** — the GQA loop-kill: ONE batched attention
+across streams (the bigger B>1 lever now the MoE read is amortized). `model_m3.MiniMaxM3Attention`
+gains `decode_step_batched` (batched **chunked** q/k/v/o projections + a per-stream RoPE *kernel* loop
+— only the absolute offset differs, M3 has no YaRN — + the shared fused padded SDPA
+`quanta.modeling.batched_attention.batched_decode_attention_kv`, the #153 primitive InternLM2/Nemotron/
+qwen35 use) + `_project_chunked` (≤`chunk` row-slices keep each packed `mx.quantized_matmul` in the
+M=1-equivalent gemv regime ⇒ **bit-exact projections**; #153 option B). `batched_runtime_m3` gets a
+`loopkill` flag (**graduated ON** — `MINIMAX_M3_BATCHED_LOOPKILL_DEFAULT`, chunk
+`MINIMAX_M3_LOOPKILL_CHUNK=8`): the `if loopkill` branch in `batched_decode_step` runs the batched
+attention; the M3-2 per-stream loop stays the rule-4 reference (pinned `loopkill=False` in the M3-2
+gate). `_check_loopkill_requires_packed` enforces **loop-kill ⇒ packed** at construction AND every
+`step_batch` (a dense-bf16 projection reorders across batch-M — rule 4/6). Output-equivalent: only the
+fused padded-SDPA softmax reorders ⇒ greedy-token-equivalent. Gates: model-free
+`parity/minimax_m3_loopkill_test.py` (24 checks, in the sweep — **§M0** chunked-8 int8
+`quantized_matmul` bit-exact vs the M=1 loop at B∈{1,4,8,32} / full-batch reorders @ B≥12, loop-kill ==
+per-stream loop **and** == single-stream on the synthetic incl. ragged + B=1, loop-kill⇒packed refused
+at construction AND at step) + SOLO `parity/minimax_m3_loopkill_real.py` (non-`_test.py`, excluded; the
+**397B re-gate** off ONE resident load — loop-kill == the per-stream loop **BIT-EXACT** (top-1 1.0000 /
+rel 0, 64/64 over 8 decode steps × B=8: same batched MoE, bit-exact chunked projections, bit-identical
+RoPE, SDPA reorder ~0 at these lengths) and == single-stream (top-1 1.000, no near-tie flip); ships the
+M2b int6 quality (ppl 5.879 / Δppl +0.316% / agree 0.953); decode **1.19× over the per-stream loop @
+B=8 / 2.83× aggregate B=1→B=8** — the mixer-read bandwidth win on top of M3-2's batched MoE). Manifest
+106 model_free / 53 real_weight. **Next = M3-4** — paged-KV + prefix caching (GQA 4 kv heads ⇒ cheap
+KV; int8 KV), chunked prefill, the trained block-sparse long-context lever, the oMLX shim (multimodal
+image input + `<mm:think>` reasoning + MiniMax nested-XML tool parser), and the vision track (CLIP-ViT
 forward + projector + image processor; the vision *weights* are already baked dense bf16).
 
 The rest of the served fleet is **complete, shipped, and parity-gated**. Per-model resident sizes are

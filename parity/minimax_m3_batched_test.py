@@ -204,8 +204,11 @@ def _single(cfg, blocks, w) -> RT.MiniMaxM3ResidentModel:
 
 
 def _batched(cfg, blocks, w, *, max_batch=8) -> BR.MiniMaxM3BatchedResidentModel:
+    # pin loopkill=False: this gate is the Design-A per-stream path (bit-exact dispatch). The GQA
+    # loop-kill (the graduated default since M3-3) is gated separately in minimax_m3_loopkill_test.
     return BR.MiniMaxM3BatchedResidentModel.from_inner(
-        blocks, w["embed"], M.one_plus(w["final_norm"]), w["lm_head"], cfg, max_batch=max_batch)
+        blocks, w["embed"], M.one_plus(w["final_norm"]), w["lm_head"], cfg, max_batch=max_batch,
+        loopkill=False)
 
 
 def run() -> None:

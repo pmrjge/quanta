@@ -236,6 +236,86 @@ class MiniMaxM3Attention(nn.Module):
         out = mx.transpose(out, (0, 2, 1, 3)).reshape(b, t, self.nh * self.hd)
         return self.o_proj(out)
 
+    def _project_chunked(self, x, chunk: int):
+        """:meth:`_project` applied in ``<=chunk`` row-slices (concat over the batch axis 0) so each
+        packed q/k/v projection matmul stays in the batch-M bit-exact ``mx.quantized_matmul`` regime
+        (#153 option B / M0: ``mx.quantized_matmul`` is a per-row gemv — batch-M bit-exact — only for
+        ``M<=~10``, switching to a reordering tiled GEMM at ``M>=12``). :meth:`_project` is fully
+        per-row (projection + per-head RMSNorm + reshape + transpose — no cross-row op), so this
+        equals the full-batch :meth:`_project` bit-for-bit; chunking only bounds each matmul's M.
+        (``b <= chunk`` → a single call, no split.)"""
+        b = x.shape[0]
+        if b <= chunk:
+            return self._project(x)
+        qs, ks, vs = [], [], []
+        for lo in range(0, b, chunk):
+            q_c, k_c, v_c = self._project(x[lo:lo + chunk])
+            qs.append(q_c)
+            ks.append(k_c)
+            vs.append(v_c)
+        return (mx.concatenate(qs, axis=0), mx.concatenate(ks, axis=0), mx.concatenate(vs, axis=0))
+
+    def decode_step_batched(self, x, *, kv_for_layer, offsets, chunk: int) -> mx.array:
+        """One batched ``B``-stream single-token decode through ``B`` *ragged* per-stream KV caches —
+        the #153 GQA loop-kill (M3-3). M3 is all-GQA so this is the whole mixer (no GDN hybrid, no
+        YaRN: one fixed ``inv_freq``, nothing length-dependent to thread).
+
+        ``x`` ``[B,1,hidden]`` are the ``B`` streams' post-input-norm residuals (stacked).
+        ``kv_for_layer[s]`` is stream ``s``'s :class:`KVCache` for THIS layer (mutated in place by the
+        shared helper); ``offsets[s]`` is stream ``s``'s absolute decode position (== its cache offset
+        before the step). Returns the o-projected attention output ``[B,1,hidden]`` — the same
+        residual ``y`` the per-stream :meth:`__call__` (``use_fast=True``) returns for each stream.
+
+        Batches the four big projections (q/k/v/o) across the ``B`` streams in ``<=chunk`` row-slices
+        (#153 option B: each packed ``mx.quantized_matmul`` stays in the M=1-equivalent gemv regime,
+        so the chunked projection equals the per-stream loop bit-for-bit — the weights read
+        ``⌈B/chunk⌉×`` vs ``B×``, the bandwidth win), then:
+
+        * **per-stream RoPE** — looped, NOT a batched reimpl: each stream rotates with its OWN absolute
+          offset via the exact :func:`rope_fast` kernel the single-stream path runs, so it is
+          bit-identical per row (a hand-rolled batched RoPE drifts at bf16 on real values and compounds
+          across layers — the ``feedback_batched_rope_bf16`` memory). M3 has ONE ``inv_freq`` (native
+          1M, no YaRN) so there is no per-stream frequency, only the per-stream offset. Bounded IO loop
+          over the small batch (rule 3); RoPE is cheap vs the projections / SDPA / MoE.
+        * **one fused KV-update + SDPA** via the shared
+          :func:`quanta.modeling.batched_attention.batched_decode_attention_kv` (unpaged discrete
+          caches ⇒ the bounded per-stream ``.update()`` then ONE padded SDPA over all ``B`` streams —
+          the same #153 primitive InternLM2.5 / Nemotron / qwen35 use; GQA repeat inside the helper).
+
+        Row ``s`` equals :meth:`__call__` on stream ``s`` (at its own offset, ``use_fast=True``) against
+        its own cache: the q/k/v/o projections are bit-exact once packed + chunked and the per-stream
+        RoPE is bit-identical, so the ONLY divergence is the fused padded-SDPA reduction-order ULP — the
+        greedy-token-equivalent class the project accepts for batched/tiled paths. Gated in
+        ``parity/minimax_m3_loopkill_test.py``; re-gated @ 397B in ``parity/minimax_m3_loopkill_real.py``."""
+        from quanta.modeling.batched_attention import batched_decode_attention_kv
+
+        b, t, _ = x.shape
+        if t != 1:
+            raise ValueError(f"decode_step_batched is a single-token step; got T={t} (rule 6)")
+        if not len(kv_for_layer) == len(offsets) == b:
+            raise ValueError(
+                f"decode_step_batched: B mismatch x={b} kv={len(kv_for_layer)} offsets={len(offsets)}")
+        q, k, v = self._project_chunked(x, chunk)  # chunked: each packed proj M<=chunk (bit-exact, M0)
+        # per-stream RoPE: loop the exact mx.fast.rope kernel — only the absolute offset differs per
+        # stream (M3 has no YaRN). Bit-identical per row to __call__. Bounded IO loop (rule 3).
+        q_rows, k_rows = [], []
+        for s in range(b):
+            off_s = int(offsets[s])
+            q_rows.append(rope_fast(q[s:s + 1], self._inv, self.rd, off_s))
+            k_rows.append(rope_fast(k[s:s + 1], self._inv, self.rd, off_s))
+        q = mx.concatenate(q_rows, axis=0) if b > 1 else q_rows[0]      # [B,nh,1,hd]
+        k = mx.concatenate(k_rows, axis=0) if b > 1 else k_rows[0]      # [B,n_kv,1,hd]
+        # one fused KV-update (bounded per-stream .update() on the discrete unpaged caches) + ONE padded
+        # SDPA across all B streams (GQA repeat inside the shared helper).
+        out = batched_decode_attention_kv(q, k, v, list(kv_for_layer),
+                                          scale=self.scale, n_rep=self.rep, paged_batched=False)  # [B,nh,1,hd]
+        out = mx.transpose(out, (0, 2, 1, 3)).reshape(b, t, self.nh * self.hd)   # [B,1,nh*hd]
+        # o-projection in the SAME <=chunk row-slices (bit-exact regime); the fused SDPA above is the
+        # only op that spans all B (its softmax reorder is the lone greedy-token-equivalent ULP).
+        if b <= chunk:
+            return self.o_proj(out)
+        return mx.concatenate([self.o_proj(out[lo:lo + chunk]) for lo in range(0, b, chunk)], axis=0)
+
 
 # ----------------------------------------------------------------------------- #
 # Dense FFN (layers 0-2) — clamped SwiGLU.

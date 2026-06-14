@@ -15,12 +15,26 @@ Target operating point: B≈32 (the fleet cohort point), ~order-of-magnitude agg
 * Each stream keeps its OWN per-layer GQA :class:`quanta.minimax.model_m3.KVCache` list (one per
   decoder layer). Per-stream KV is unavoidable: each stream's k/v rows are its own positions.
 * Per-layer decode step (one token per stream, ``B`` streams):
-    1. **per-stream attention step** — iterate streams, run the same ``MiniMaxM3Block`` attention
-       half (``x + attn(in_norm(x))``) through each stream's per-layer cache exactly as the
-       single-stream runtime does. This loop is a bounded IO loop over the small batch (rule 3 —
-       NOT a hot per-token loop), and the GQA work inside each call is fully vectorized over
-       heads/dims; each call is M=1 so the packed q/k/v/o ``mx.quantized_matmul`` is bit-exact vs
-       the single-stream decode. Each stream's cache mutates in place.
+    1. **attention step** — TWO output-equivalent paths (rule-4 flag ``loopkill``):
+
+       * *per-stream loop* (``loopkill=False`` — the M3-2 reference): iterate streams, run the same
+         ``MiniMaxM3Block`` attention half (``x + attn(in_norm(x))``) through each stream's per-layer
+         cache exactly as the single-stream runtime does. Bounded IO loop over the small batch (rule
+         3); each call is M=1 so the packed q/k/v/o ``mx.quantized_matmul`` is bit-exact vs the
+         single-stream decode.
+       * *GQA loop-kill* (``loopkill=True`` — M3-3, the graduated serving default): ONE batched
+         attention across all ``B`` streams via
+         :meth:`quanta.minimax.model_m3.MiniMaxM3Attention.decode_step_batched` — batched q/k/v/o
+         projections (each weight read ``⌈B/chunk⌉×`` instead of ``B×``: the mixer-read bandwidth win,
+         mirroring the MoE expert-read amortization), a per-stream RoPE *kernel* loop (only the
+         absolute offset differs — M3 has no YaRN), and the shared fused padded SDPA across all ``B``
+         (:func:`quanta.modeling.batched_attention.batched_decode_attention_kv`). The projections are
+         applied in ``<=chunk`` row-slices so each ``mx.quantized_matmul`` stays in the M=1-equivalent
+         gemv regime (#153 option B) ⇒ bit-exact projections; only the fused padded SDPA softmax
+         reorders ⇒ greedy-token-equivalent (top-1 exact). Requires ``packed`` (a dense-bf16 projection
+         reorders across batch-M — enforced, rule 4/6).
+
+       Each stream's cache mutates in place.
     2. **stack** the ``B`` post-attention residuals ``[1,1,hidden]`` → ``[B,1,hidden]``.
     3. **batched MoE / dense-FFN sub-block** — feed ``[B,1,hidden]`` through the **same** block FFN.
        For MoE layers (3–59) the existing ``MiniMaxM3MoE`` routes ``[B,1,h] → [N=B,h]``: top-4
@@ -30,12 +44,10 @@ Target operating point: B≈32 (the fleet cohort point), ~order-of-magnitude agg
     4. **split** ``[B,1,hidden]`` back into per-stream ``[1,1,hidden]`` residuals.
 * Every token completes ALL layers (advancing its per-stream KV) before the next begins, so
   per-stream output is causally identical to a single-stream decode at the same offset — gated
-  model-free in ``parity/minimax_m3_batched_test.py`` (the routed ``gather_qmm`` slots are the
-  per-(token,slot) M=1 matvec, batch-invariant; only the batched router/shared GEMM can ULP-reorder
-  ⇒ greedy-token-equivalent, top-1 exact).
+  model-free in ``parity/minimax_m3_batched_test.py`` (per-stream loop, bit-exact dispatch) and
+  ``parity/minimax_m3_loopkill_test.py`` (loop-kill == per-stream loop, greedy-token-equivalent).
 
-Out of scope here (later M3 sub-milestones): the GQA loop-kill (ONE batched attention across streams
-— needs ragged-offset padded SDPA; M3-3), paged-KV + prefix caching (int8 KV), and chunked prefill.
+Out of scope here (later M3 sub-milestones): paged-KV + prefix caching (int8 KV) and chunked prefill.
 Prefill is single-stream (:meth:`prefill` consumes one prompt into one stream's cache via the proven
 cached forward); the win is in DECODE, where multi-stream serving spends ~all of its time.
 """
@@ -50,6 +62,28 @@ import mlx.core as mx
 from quanta.minimax.config_m3 import MiniMaxM3Config
 from quanta.minimax.model_m3 import KVCache, MiniMaxM3Block
 from quanta.minimax.runtime_m3 import MiniMaxM3ResidentModel
+
+# --- M3-3 GQA loop-kill default (the graduated serving path) ---------------------------------------
+# When ON, the serving decode step (:func:`batched_decode_step`) replaces the per-stream attention loop
+# with ONE batched attention across all B streams (M3 is all-GQA, so the whole mixer): batched q/k/v/o
+# projections (each mixer weight read ONCE for all B — the bandwidth win, mirroring the MoE expert-read
+# amortization) + per-stream RoPE kernel loop + the shared fused padded SDPA. **GRADUATED ON (M3-3)**
+# after the real-model B=8 re-gate (``parity/minimax_m3_loopkill_real.py`` on the 397B int6-g64 bake):
+# with the option-B packed+chunked projections it is greedy-token-equivalent to the per-stream loop at
+# every B AND a decode win on top of M3-2's batched MoE. The loop-kill REQUIRES packed (a dense-bf16
+# projection reorders across batch-M), enforced by ``_check_loopkill_requires_packed``. Gated vs the
+# per-stream loop in ``parity/minimax_m3_loopkill_test.py``.
+MINIMAX_M3_BATCHED_LOOPKILL_DEFAULT = True
+
+# --- M3-3 option-B loop-kill chunk size (the batch-M bit-exact regime) -----------------------------
+# The loop-kill batches the mixer projections across all B streams. Under the packed runtime those are
+# ``mx.quantized_matmul``, which is batch-M BIT-EXACT only for M<=~10 (a per-row gemv kernel); at M>=12
+# it switches to a tiled GEMM that REORDERS the K-reduction (bf16). So the batched projections are
+# applied in row-chunks of <= this, keeping every matmul in the bit-exact regime — equalling the
+# per-stream M=1 loop BIT-FOR-BIT at any B (only the fused padded SDPA spans all B). Proven model-free
+# in ``parity/minimax_m3_loopkill_test.py`` §M0 (== the qwen35 #153 option-B finding); if a future MLX
+# drops the gemv→GEMM threshold below 8, §M0 fails loudly (the signal to lower this).
+MINIMAX_M3_LOOPKILL_CHUNK = 8
 
 
 def _attn_step(blk: MiniMaxM3Block, kv: KVCache, x_t: mx.array, *, use_fast: bool = True) -> mx.array:
@@ -74,17 +108,26 @@ def batched_decode_step(
     offsets: Sequence[int],
     *,
     use_fast: bool = True,
+    loopkill: bool = False,
+    chunk: int = MINIMAX_M3_LOOPKILL_CHUNK,
 ) -> list[mx.array]:
     """One batched decode step over ``B = len(stream_token_ids)`` streams. Returns per-stream logits
     ``[1,1,vocab]`` — one per stream, in input order, so the caller can sample each independently.
 
     Pure function — no model state outside the per-stream caches (which mutate in place) and the
-    passed weights / layers. The Design-A per-stream attention step iterates streams; the FFN
-    sub-block runs ONCE on the stacked ``[B,1,hidden]`` (the routed-expert read amortizes across all
-    ``B``). Per-stream output is greedy-token-equivalent (top-1 exact) to feeding the same token
-    through :class:`quanta.minimax.runtime_m3.MiniMaxM3ResidentModel` at the same offset against the
-    same cache (the per-stream attention + per-slot ``gather_qmm`` are M=1 ⇒ bit-exact; only the
-    batched router/shared GEMM ULP-reorders). Drives the resident runtime AND the model-free gate.
+    passed weights / layers. The FFN sub-block always runs ONCE on the stacked ``[B,1,hidden]`` (the
+    routed-expert read amortizes across all ``B``). The attention half has two output-equivalent paths:
+
+    * ``loopkill=False`` (the M3-2 reference, the free-function default — rule 4): a per-stream
+      attention loop (each call M=1 ⇒ bit-exact vs the single-stream decode).
+    * ``loopkill=True`` (M3-3): ONE batched attention across all ``B`` streams (batched chunked
+      projections + per-stream RoPE + fused padded SDPA), greedy-token-equivalent to the loop. The
+      caller MUST hold the mixer packed (enforced upstream — a dense-bf16 projection reorders across
+      batch-M); ``chunk`` keeps each ``mx.quantized_matmul`` in the bit-exact gemv regime.
+
+    Per-stream output is greedy-token-equivalent (top-1 exact) to feeding the same token through
+    :class:`quanta.minimax.runtime_m3.MiniMaxM3ResidentModel` at the same offset against the same
+    cache. Drives the resident runtime AND the model-free gates.
     """
     b = len(stream_token_ids)
     if b < 1:
@@ -110,18 +153,31 @@ def batched_decode_step(
     hs: list[mx.array] = [h_b[i:i + 1] for i in range(b)]                           # B × [1,1,hidden]
 
     for layer_i, blk in enumerate(layers):
-        # 1) per-stream attention step (proven M=1 path; bounded IO loop over the small batch, rule 3).
-        after_attn = [_attn_step(blk, stream_caches[s][layer_i], hs[s], use_fast=use_fast)
-                      for s in range(b)]
-        # 2) stack the B post-attention residuals -> [B,1,hidden] for the FFN sub-block
-        stacked = mx.concatenate(after_attn, axis=0) if b > 1 else after_attn[0]    # [B,1,hidden]
-        # 3) ONE batched FFN over all B tokens — MoE gather_qmm reads each touched routed-expert tile
+        # 1) attention step -> stacked [B,1,hidden] post-attention residuals.
+        if loopkill:
+            # M3-3 GQA loop-kill: ONE batched attention across all B streams (chunked projections +
+            # per-stream RoPE + fused padded SDPA), reading each mixer weight ⌈B/chunk⌉× for all B (the
+            # bandwidth win). Batched input-norm (RMSNorm is row-wise → per-row identical to the
+            # per-stream norm), then the batched mixer, then the batched residual — greedy-token-
+            # equivalent to the per-stream loop (rule-4 flag; gated in minimax_m3_loopkill_test.py).
+            x_stacked = mx.concatenate(hs, axis=0) if b > 1 else hs[0]              # [B,1,hidden]
+            h_norm = blk.input_layernorm(x_stacked)
+            kv_for_layer = [stream_caches[s][layer_i] for s in range(b)]
+            y = blk.self_attn.decode_step_batched(h_norm, kv_for_layer=kv_for_layer,
+                                                  offsets=list(offsets), chunk=chunk)  # [B,1,hidden]
+            stacked = x_stacked + y                                                 # [B,1,hidden]
+        else:
+            # per-stream attention step (proven M=1 path; bounded IO loop over the small batch, rule 3).
+            after_attn = [_attn_step(blk, stream_caches[s][layer_i], hs[s], use_fast=use_fast)
+                          for s in range(b)]
+            stacked = mx.concatenate(after_attn, axis=0) if b > 1 else after_attn[0]  # [B,1,hidden]
+        # 2) ONE batched FFN over all B tokens — MoE gather_qmm reads each touched routed-expert tile
         # once for all B rows that route to it (the bandwidth win); the shared expert + dense FFN run
         # once over [B,h]. The module's [B,S,h] -> [N=B,h] reshape is B-aware.
         h_post = blk.post_attention_layernorm(stacked)
         y = blk.mlp(h_post, sparse=True) if blk.is_moe else blk.mlp(h_post)         # [B,1,hidden]
         stacked = stacked + y
-        # 4) split back to per-stream views for the next layer
+        # 3) split back to per-stream views for the next layer
         hs = [stacked[i:i + 1] for i in range(b)]
         mx.eval(stacked)                                                            # bound the per-layer graph
 
@@ -157,7 +213,7 @@ class MiniMaxM3BatchedResidentModel:
 
     def __init__(self, art_dir: str | Path, *, max_batch: int = 32,
                  n_layers: int | None = None, packed: bool = True,
-                 packed_experts: bool = True) -> None:
+                 packed_experts: bool = True, loopkill: bool | None = None) -> None:
         if max_batch < 1:
             raise ValueError(f"max_batch must be >= 1, got {max_batch}")
         self._inner = MiniMaxM3ResidentModel(art_dir, n_layers=n_layers, packed=packed,
@@ -171,15 +227,24 @@ class MiniMaxM3BatchedResidentModel:
         self.layers: list[MiniMaxM3Block] = self._inner.layers
         self.packed = bool(packed)                       # int8 mixer held packed (mx.quantized_matmul)
         self.packed_experts = bool(packed_experts)       # routed experts packed int6 (gather_qmm)
+        self._loopkill = (bool(MINIMAX_M3_BATCHED_LOOPKILL_DEFAULT) if loopkill is None
+                          else bool(loopkill))           # M3-3 GQA loop-kill (graduated ON; rule-4 flag)
+        self._check_loopkill_requires_packed()
 
     @classmethod
     def from_inner(cls, layers: list[MiniMaxM3Block], embed_w: mx.array, norm_w: mx.array,
                    lm_head_w: mx.array, cfg: MiniMaxM3Config, *,
-                   max_batch: int = 32) -> MiniMaxM3BatchedResidentModel:
+                   max_batch: int = 32,
+                   loopkill: bool | None = None) -> MiniMaxM3BatchedResidentModel:
         """Construct from pre-built layers / final-form weights (bypasses artifact load) so the
         model-free parity gate can drive ``step_batch`` / ``prefill`` against a tiny synthetic model
         without a checkpoint — same step machinery, model-free. ``norm_w`` is the already-``(1+w)``-
-        folded final norm. ``packed`` / ``packed_experts`` are detected from the passed layers."""
+        folded final norm. ``packed`` / ``packed_experts`` are detected from the passed layers.
+
+        ``loopkill`` overrides the per-instance loop-kill flag: ``None`` (default) inherits the
+        graduated :data:`MINIMAX_M3_BATCHED_LOOPKILL_DEFAULT` (so the serving ``from_inner`` gets the
+        loop-kill, paired with the layers' ``packed`` state); the M3-2 Design-A gate passes
+        ``loopkill=False`` to pin the bit-exact per-stream path it gates."""
         self = cls.__new__(cls)
         self._inner = None
         self.max_batch = int(max_batch)
@@ -193,7 +258,27 @@ class MiniMaxM3BatchedResidentModel:
         self.packed_experts = bool(moe) and isinstance(moe[0].mlp.experts_gate_up, dict)
         import mlx.nn as nn
         self.packed = bool(layers) and isinstance(layers[0].self_attn.q_proj, nn.QuantizedLinear)
+        self._loopkill = (bool(MINIMAX_M3_BATCHED_LOOPKILL_DEFAULT) if loopkill is None
+                          else bool(loopkill))
+        self._check_loopkill_requires_packed()
         return self
+
+    # --- loop-kill ⇒ packed enforcement (rule 4/6) ----------------------------
+    def _check_loopkill_requires_packed(self) -> None:
+        """Fail loud if the M3-3 GQA loop-kill is enabled on a non-packed (dense-bf16) runtime.
+
+        The loop-kill batches the mixer projections across all ``B`` streams; a dense-bf16 GEMM
+        reorders its accumulation across batch-M (the ``feedback_batched_rope_bf16`` finding). Only the
+        packed runtime (``mx.quantized_matmul``, chunked ``<=`` :data:`MINIMAX_M3_LOOPKILL_CHUNK`) is
+        batch-M bit-exact, so the loop-kill REQUIRES packed. Checked at construction AND on every
+        :meth:`step_batch` (so a runtime ``self._loopkill`` toggle cannot bypass it — rule 6: refuse to
+        silently emit batch-M-reordered logits)."""
+        if self._loopkill and not self.packed:
+            raise ValueError(
+                "M3-3 GQA loop-kill requires the packed runtime (packed=True): dense-bf16 mixer "
+                "projections reorder their accumulation across batch-M. Construct the batched runtime "
+                "with packed=True, or disable the loop-kill (MINIMAX_M3_BATCHED_LOOPKILL_DEFAULT / "
+                "loopkill=False).")
 
     # --- per-stream cache factory ---------------------------------------------
     def make_caches(self) -> list[KVCache]:
@@ -245,9 +330,13 @@ class MiniMaxM3BatchedResidentModel:
         the new token in stream ``b`` (== ``stream_caches[b][0].offset`` before the step). Returns the
         per-stream logits as a list of ``[1,1,vocab]`` arrays. Per-stream output is greedy-token-
         equivalent (top-1 exact) to the single-stream runtime at the same offset against the same
-        cache — gated in ``parity/minimax_m3_batched_test.py``."""
+        cache — gated in ``parity/minimax_m3_batched_test.py`` (per-stream loop) and
+        ``parity/minimax_m3_loopkill_test.py`` (loop-kill). The attention path is the GQA loop-kill
+        when ``self._loopkill`` (the graduated serving default), else the per-stream loop."""
         if len(stream_token_ids) > self.max_batch:
             raise ValueError(f"batch {len(stream_token_ids)} exceeds max_batch {self.max_batch}")
+        self._check_loopkill_requires_packed()   # rule 6: a runtime toggle cannot bypass loopkill⇒packed
         return batched_decode_step(self.layers, self.embed_w, self.norm_w, self.lm_head_w,
                                    self.cfg, stream_token_ids, stream_caches, offsets,
-                                   use_fast=use_fast)
+                                   use_fast=use_fast, loopkill=self._loopkill,
+                                   chunk=MINIMAX_M3_LOOPKILL_CHUNK)
