@@ -78,11 +78,29 @@ raw): **637 tok, all 60 layers — bf16 ppl 4.96 / acc 0.591** ⇒ the pinned Ge
 **CONFIRMED e2e** (the decisive check: no HF/sglang M3 forward exists to diff against; a wrong fold
 degrades ppl uniformly to the hundreds — 4.96 is a healthy 397B value), **int6-g64 ppl 5.00 / Δppl
 +0.82% / acc 0.591 / top-1 agree 0.943** ⇒ ~lossless, **SHIP int6-g64** (the user's int6-margin choice
-over int4 validated e2e). **Next = M3 serving** — resident batched re-gate (packed-int6 `gather_qmm`
-experts via `artifact_m3.moe_packed` + int8 mixer), oMLX shim incl. multimodal image input +
-`<mm:think>` reasoning + MiniMax nested-XML tool parser, paged-KV + prefix caching, trained
-block-sparse long-context lever, chunked prefill, multi-stream — plus the vision track (CLIP-ViT
-forward + projector + image processor; the vision *weights* are already baked dense bf16).
+over int4 validated e2e). **M3 serving is now decomposed into sub-milestones (Nex-style: M3-1,
+M3-2, …).** **M3-1 ✅ (this commit)** — the resident single-stream serving runtime. `model_m3` gains
+the **packed-int6 `gather_qmm`** routed path (`_routed_sparse_packed` + `MiniMaxM3MoE.set_experts_packed`
++ auto-detect: a triplet dict ⇒ `gather_qmm`, a bf16 stack ⇒ `gather_mm`; `sparse=False` on packed
+refuses, rule 6) — output-equivalent to the bf16 reference on the SAME codes, and the resident path
+actually dequantizes int6 at *higher* precision than the bf16-rounded reference. New
+`runtime_m3.MiniMaxM3ResidentModel` loads the int6 artifact **one text layer resident at a time**
+(rule 8), routed experts held **packed int6** (`artifact_m3.moe_packed` → `set_experts_packed`, the
+~300 GiB resident lever) over the **int8 mixer dequantized to bf16** (q/k/v/o + dense-FFN + shared
+expert; the proven M1/M2 forward — a packed-int8 mixer that saves ~10 GiB is a later memory milestone,
+far under the 160 GiB headroom); router gate/bias native **F32**; prefill (`caches=None`) == the M1/M2
+streamed reference, decode threads per-layer GQA `KVCache` (`make_caches`), plus a minimal greedy
+`generate`. Gates: model-free `parity/minimax_m3_runtime_test.py` (9 checks, in the sweep — tiny
+synthetic, packed==bf16 top-1-exact + logit-rel, cached==prefill **bit-exact**, incremental-decode==
+full-prefill **bit-exact**, rule-4 dense==sparse, rule-6 packed-refuses-`sparse=False`, `generate`
+smoke) + SOLO `parity/minimax_m3_runtime_real.py` (non-`_test.py`, excluded; the **397B resident
+re-gate** — all 60 layers RAM-resident in **33s load**, packed `gather_qmm` vs the streamed `gather_mm`
+reference on the real int6 codes: **ppl 5.870 / Δppl +0.171% / top-1 agree 0.969**, ships the M2b int6
+quality). Manifest 104 model_free / 53 real_weight. **Next = M3-2** — batched serving (Design A,
+per-stream KV + one batched MoE call, B≈32) + the packed-int8 mixer; then paged-KV + prefix caching,
+chunked prefill, the trained block-sparse long-context lever, the oMLX shim (multimodal image input +
+`<mm:think>` reasoning + MiniMax nested-XML tool parser), and the vision track (CLIP-ViT forward +
+projector + image processor; the vision *weights* are already baked dense bf16).
 
 The rest of the served fleet is **complete, shipped, and parity-gated**. Per-model resident sizes are
 in the Serving throughput table below; the detailed milestone handovers live in the `PLAN_*.md` files

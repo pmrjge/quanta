@@ -283,6 +283,46 @@ def _routed_sparse(xf: mx.array, idx: mx.array, gate_up: mx.array, down: mx.arra
     return d.reshape(n, topk, hidden)
 
 
+def _routed_sparse_packed(xf: mx.array, idx: mx.array, gate_up: dict, down: dict,
+                          inter: int, alpha: float, limit: float) -> mx.array:
+    """Sparse routed clamped-SwiGLU via ``mx.gather_qmm`` over the **packed int6** expert stacks —
+    the memory-lean serving sibling of :func:`_routed_sparse` (rule 7, the M3 resident path).
+
+    ``gate_up`` / ``down`` are packed affine triplets ``{"packed","scale","bias","group_size","bits"}``
+    (the ``[E,2*inter,hidden]`` / ``[E,hidden,inter]`` int6 codestream held verbatim — NEVER a bf16
+    ``[E,*,*]`` array), from :meth:`quanta.minimax.artifact_m3.MiniMaxM3Artifact.moe_packed`, so the
+    routed experts stay int6-resident (the ~300 GiB serving footprint). ``mx.gather_qmm`` dequantizes
+    each routed expert's codes inline — exactly **two** calls (fused ``gate_up``, then ``down``).
+
+    Output-equivalent to :func:`_routed_sparse` on the SAME codes (greedy-exact: ``gather_qmm`` fuses
+    the dequant that :meth:`MiniMaxM3Artifact._dequant` does separately before ``gather_mm``; only the
+    kernel differs, ~ULP). **Batch-invariant** — the same per-(token,slot) M=1 matvec structure as
+    ``gather_mm``, so it does not reorder accumulation across batch-M (the served B>1 path is safe).
+
+    ``gather_qmm`` arg order differs from ``gather_mm``: the **activation comes first** (``lhs_indices``
+    gathers its rows), the packed weight stack second (``rhs_indices`` gathers ``E``); ``transpose=True``
+    matches the ``[E,out,in]`` layout (``x[.,in] @ W[.,out,in].T``). The qmm output follows the baked
+    ``scale`` dtype (bf16); the swish branch upcasts to fp32 inside :func:`swigluoai` (clamp precision),
+    then the down activation is cast back to the down ``scale`` dtype — bit-matching the bf16 path's
+    ``.astype(down.dtype)`` so the two paths stay greedy-exact."""
+    n, hidden = xf.shape
+    topk = idx.shape[1]
+    mc = n * topk
+    exp = idx.reshape(-1)                                                 # [mc] expert id per slot
+    tok = mx.repeat(mx.arange(n, dtype=mx.int32), topk)                   # [mc] token per slot
+    rows = mx.arange(mc, dtype=mx.int32)                                  # identity lhs gather
+    x_in = xf[tok]                                                        # [mc, hidden] per-slot acts
+    gu = mx.gather_qmm(x_in[:, None, :], gate_up["packed"], gate_up["scale"], gate_up["bias"],
+                       lhs_indices=rows, rhs_indices=exp, transpose=True,
+                       group_size=int(gate_up["group_size"]), bits=int(gate_up["bits"]))[:, 0, :]
+    h = swigluoai(gu[:, :inter], gu[:, inter:], alpha, limit)             # [mc, inter] (fp32)
+    h = h.astype(down["scale"].dtype)                                     # match the bf16 path's down input
+    d = mx.gather_qmm(h[:, None, :], down["packed"], down["scale"], down["bias"],
+                      lhs_indices=rows, rhs_indices=exp, transpose=True,
+                      group_size=int(down["group_size"]), bits=int(down["bits"]))[:, 0, :]
+    return d.reshape(n, topk, hidden)
+
+
 def _routed_dense(xf: mx.array, idx: mx.array, w: mx.array, gate_up: mx.array, down: mx.array,
                   inter: int, alpha: float, limit: float) -> mx.array:
     """Dense oracle: run EVERY expert on every token, combine only the top-k. Parity reference for
@@ -324,6 +364,15 @@ class MiniMaxM3MoE(nn.Module):
     def set_experts(self, gate_up: mx.array, down: mx.array) -> None:
         self.experts_gate_up, self.experts_down = gate_up, down
 
+    def set_experts_packed(self, gate_up: dict, down: dict) -> None:
+        """Hold the routed experts as **packed int6 affine triplets** (NOT dequantized) for the
+        resident ``mx.gather_qmm`` serving path. ``gate_up`` / ``down`` are
+        ``{"packed","scale","bias","group_size","bits"}`` dicts (from
+        :meth:`quanta.minimax.artifact_m3.MiniMaxM3Artifact.moe_packed`). :meth:`__call__`
+        auto-detects the dict (→ :func:`_routed_sparse_packed`, ``gather_qmm``) vs a bf16 stack
+        (→ :func:`_routed_sparse`, ``gather_mm``) — same dispatch, greedy-exact on the same codes."""
+        self.experts_gate_up, self.experts_down = gate_up, down
+
     def _shared(self, xf: mx.array) -> mx.array:
         """Shared clamped-SwiGLU expert (no scalar gate). ``xf`` ``[N,hidden]`` -> ``[N,hidden]`` fp32."""
         xd = xf.astype(self.shared_gate_proj.dtype)
@@ -338,19 +387,26 @@ class MiniMaxM3MoE(nn.Module):
         alpha, limit = self.cfg.swiglu_alpha, self.cfg.swiglu_limit
         xf = x.reshape(n, hidden)
         idx, w = route_noaux(xf, self.gate, self.e_score_correction_bias, self.cfg)
+        # auto-detect: packed int6 triplets (a dict) → gather_qmm (resident); bf16 stacks → gather_mm
+        # (the parity reference). Same dispatch / same matvec, greedy-exact on the same codes (rule 4).
+        packed = isinstance(self.experts_gate_up, dict)
         if sparse:
+            routed_fn = _routed_sparse_packed if packed else _routed_sparse
             chunk = self.token_chunk if self.token_chunk and self.token_chunk > 0 else n
             multi = n > chunk
             parts = []
             for c0 in range(0, n, chunk):  # bounded chunked-prefill loop; experts stay vectorized
                 c1 = min(c0 + chunk, n)
-                slots = _routed_sparse(xf[c0:c1], idx[c0:c1], self.experts_gate_up,
-                                       self.experts_down, inter, alpha, limit)  # [nc, topk, hidden]
+                slots = routed_fn(xf[c0:c1], idx[c0:c1], self.experts_gate_up,
+                                  self.experts_down, inter, alpha, limit)  # [nc, topk, hidden]
                 rc = mx.sum(slots.astype(mx.float32) * w[c0:c1][:, :, None], axis=1)
                 parts.append(rc)
                 if multi:
                     mx.eval(rc)
             routed = parts[0] if not multi else mx.concatenate(parts, axis=0)
+        elif packed:  # rule 6: the dense oracle is bf16-einsum only — never a packed dict
+            raise ValueError("MiniMaxM3MoE(sparse=False) is the bf16 dense oracle; packed int6 "
+                             "experts require sparse=True (gather_qmm). Refusing to dequant silently.")
         else:
             routed = _routed_dense(xf, idx, w, self.experts_gate_up, self.experts_down,
                                    inter, alpha, limit)

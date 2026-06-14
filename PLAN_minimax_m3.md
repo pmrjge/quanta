@@ -150,12 +150,30 @@ source is gone from disk). So M3 is a **real build**, not validate-at-scale. The
   5.00 / Δppl +0.82% / acc 0.591 (identical) / top-1 agree 0.943** ⇒ ~lossless, the user's int6
   margin choice (over int4) is validated e2e. **SHIP int6-g64.** PARITY-CHECKS: 4 (bf16+int6 finite,
   bf16 ppl < 30 ceiling, int6 Δppl < 5% & agree > 0.90). Smoke (`8 160`) validated the code path first.
-- **M3 — serving.** Resident + batched re-gate (packed-int6 `gather_qmm` experts + int8 mixer);
-  **oMLX shim** (`QuantaOmlxEngine` route + chat template + the `<mm:think>` reasoning parser + the
-  MiniMax nested-XML tool parser + a **multimodal image input path** — the VL-specific work);
-  **paged-KV + prefix caching** (GQA 4 kv heads ⇒ cheap KV; int8 KV); **trained block-sparse
-  attention** as the long-context lever (parity: sparse==dense at short ctx; xattention substrate);
-  chunked prefill; multi-stream batched decode (B≈32 operating point).
+- **M3 — serving (decomposed into sub-milestones, Nex-style).**
+  - **M3-1 ✅ — resident single-stream serving runtime (this milestone).** `model_m3` gains the
+    **packed-int6 `gather_qmm`** routed path (`_routed_sparse_packed` + `MiniMaxM3MoE.set_experts_packed`;
+    `__call__` auto-detects a triplet dict ⇒ `gather_qmm` vs a bf16 stack ⇒ `gather_mm`, and refuses
+    `sparse=False` on packed — rule 6). New `runtime_m3.MiniMaxM3ResidentModel` loads the int6 artifact
+    **one text layer resident at a time** (rule 8): routed experts held **packed int6** (`artifact_m3.moe_packed`
+    → `set_experts_packed`, the ~300 GiB resident lever) over the **int8 mixer dequantized to bf16**
+    (q/k/v/o + dense-FFN + shared; the proven M1/M2 forward — a packed-int8 mixer saving ~10 GiB is a
+    later memory milestone, far under the 160 GiB headroom), router gate/bias native **F32**; prefill
+    (`caches=None`) == the streamed reference, decode threads a per-layer GQA `KVCache` (`make_caches`),
+    plus a greedy `generate`. Gates: model-free `parity/minimax_m3_runtime_test.py` (9 checks, in the
+    sweep — packed==bf16 top-1-exact, cached==prefill **bit-exact**, incremental-decode==full-prefill
+    **bit-exact**, rule-4 dense==sparse, rule-6 refusal, `generate` smoke) + SOLO
+    `parity/minimax_m3_runtime_real.py` (non-`_test.py`, excluded; the **397B resident re-gate** — all 60
+    layers RAM-resident in **33 s load**, packed `gather_qmm` vs the streamed `gather_mm` reference on the
+    real int6 codes: **ppl 5.870 / Δppl +0.171% / top-1 agree 0.969**; ships the M2b int6 quality — the
+    resident path actually dequantizes int6 at *higher* precision than the bf16-rounded reference, the few
+    top-1 flips are bf16 near-ties). Manifest 104 model_free / 53 real_weight.
+  - **M3-2+ (next).** Batched serving (Design A: per-stream KV + ONE batched MoE call, B≈32 operating
+    point) + the **packed-int8 mixer**; **paged-KV + prefix caching** (GQA 4 kv heads ⇒ cheap KV; int8
+    KV); chunked prefill; the **trained block-sparse attention** long-context lever (parity: sparse==dense
+    at short ctx; xattention substrate); the **oMLX shim** (`QuantaOmlxEngine` route + chat template +
+    `<mm:think>` reasoning parser + MiniMax nested-XML tool parser + a **multimodal image input path**);
+    multi-stream.
 - **Vision track** (folded into M1/M3 since full-VL): CLIP ViT forward + 3D-RoPE + patch-merge
   compression + projector parity; image processor (dynamic-res tiling); multimodal prefill (splice
   image embeddings at `image_token_index` 200025).

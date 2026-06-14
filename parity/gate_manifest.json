@@ -57,6 +57,7 @@
     "minimax_m3_bake_test",
     "minimax_m3_config_test",
     "minimax_m3_layer_test",
+    "minimax_m3_runtime_test",
     "mla_absorbed_sdpa_test",
     "mla_int8_test",
     "moe_chunk_test",
