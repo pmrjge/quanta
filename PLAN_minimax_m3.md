@@ -234,11 +234,36 @@ source is gone from disk). So M3 is a **real build**, not validate-at-scale. The
     greedy-token-equivalent (the #153 batch-M tiling effect, now in prefill: same tokens prefilled in
     different-length batches give quant-ULP-different KV codes, compounding over 60 layers). Manifest 107
     model_free / 53 real_weight.
-  - **M3-5+ (next).** Chunked prefill (the per-token `prefill_paged` admit is fine for chat lengths;
-    chunked is the long-admit lever); the **trained block-sparse attention** long-context lever (parity:
-    sparse==dense at short ctx; xattention substrate); the **oMLX shim** (the `_MiniMaxM3BatchedSession`
-    engine route + chat template + `<mm:think>` reasoning parser + MiniMax nested-XML tool parser + a
-    **multimodal image input path**); multi-stream.
+  - **M3-5 ✅ — long-context chunked prefill (this milestone).** The single-shot prefill holds the whole
+    `[1,T,hidden]` window resident; chunked prefill consumes the prompt in seq blocks, each chunk
+    extending every layer's GQA KV with a bottom-right causal mask (`mx.fast.scaled_dot_product_attention`
+    `mask="causal"` is bottom-right aligned — the M3-1 cached forward / qwen35 shipped-chunked path), so
+    the per-chunk transient is **O(chunk)** (the fused flash-attn kernel never materializes the
+    `[chunk, kv_len]` scores) and a 1M-token prompt admits in O(chunk) memory + the int8 KV. M3 is all
+    dense GQA (no GDN, no YaRN) so — unlike `quanta.qwen35.runtime.chunked_prefill` — there is no
+    per-request RoPE factor to pin and no recurrent continuation; each chunk reads its absolute position
+    from the cache offset. New `runtime_m3.chunked_prefill` (shared driver, one bounded `MiniMaxM3Block`
+    forward per chunk, per-chunk `mx.eval`+`mx.clear_cache`, rule 8) + `MiniMaxM3ResidentModel.prefill_chunked`;
+    `batched_runtime_m3` adds `MINIMAX_M3_PREFILL_CHUNK_TOKENS`=4096 + `MINIMAX_M3_CHUNKED_PREFILL_FROM`
+    (=chunk+1) and routes `prefill` (and thus the paged `prefill_paged` admit) through `prefill_chunked`
+    above the threshold; below it the bit-exact single-shot path is kept (M3-1/2/3/4 chat-length gates
+    untouched). Works over discrete `KVCache` OR `PagedKVCacheView` lists (the manager allows sub-range
+    writes from the open cursor). Bit-exact to single-shot on the bf16 mixer; greedy-token-equivalent on
+    the packed serving mixer (the projections run at batch-M=chunk vs M=T — the #153 batch-M ULP). Gates:
+    model-free `parity/minimax_m3_prefill_chunked_test.py` (41 checks, in the sweep — bf16 chunked ==
+    single-shot **BIT-EXACT** across chunk sizes incl. ragged + per-token; int8-KV bit-exact for chunk≥2,
+    ct=1 hits the decode `mask=None` kernel ⇒ greedy-equiv [the documented int8 decode-vs-prefill
+    boundary]; continue-from-non-empty-cache; chunked-over-paged == discrete == single-shot for both KV
+    modes; rule-6; threshold routing) + SOLO `parity/minimax_m3_prefill_chunked_real.py` (the **397B
+    re-gate**: chunked == single-shot **greedy-token-equivalent** [top-1 ==, rel 3.36e-2], chunked-over-
+    paged == discrete-chunked **BIT-EXACT** [|Δ| 0 — the M3-4 orthogonal-axes foundation holds under
+    chunked writes], chunked-seeded 6-step decode == single-shot-seeded **1.000**). Manifest 108
+    model_free / 53 real_weight.
+  - **M3-6+ (next).** The **trained block-sparse attention** long-context lever (the COMPUTE lever on top
+    of chunked prefill — dense chunked prefill is correct but O(T²) in compute; parity: sparse==dense at
+    short ctx; xattention substrate); the **oMLX shim** (the `_MiniMaxM3BatchedSession` engine route +
+    chat template + `<mm:think>` reasoning parser + MiniMax nested-XML tool parser + a **multimodal image
+    input path**); multi-stream.
 - **Vision track** (folded into M1/M3 since full-VL): CLIP ViT forward + 3D-RoPE + patch-merge
   compression + projector parity; image processor (dynamic-res tiling); multimodal prefill (splice
   image embeddings at `image_token_index` 200025).

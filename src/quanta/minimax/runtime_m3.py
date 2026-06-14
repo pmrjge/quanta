@@ -172,6 +172,76 @@ def _block_arrays(blk: MiniMaxM3Block) -> list[mx.array]:
     return arrs
 
 
+def _live_kv_arrays(caches) -> list[mx.array]:
+    """Every realized KV array across the per-layer caches — eval'd at each chunk boundary so the lazy
+    prefill graph does not pile up across chunks (rule 8). Collects a discrete :class:`KVCache`'s
+    storage (the bf16 ``k``/``v`` OR the int8 ``k_q``/``k_s``/… codes). A
+    :class:`quanta.paged.PagedKVCacheView` holds no arrays itself — its writes land in the manager's
+    pool, realized transitively when the chunk's last hidden is eval'd — so it contributes none."""
+    arrs: list[mx.array] = []
+    for c in caches:
+        for name in ("k", "v", "k_q", "k_s", "k_b", "v_q", "v_s", "v_b"):
+            a = getattr(c, name, None)
+            if isinstance(a, mx.array):
+                arrs.append(a)
+    return arrs
+
+
+def chunked_prefill(layers, embed_w: mx.array, norm_w: mx.array, lm_head_w: mx.array,
+                    cfg: MiniMaxM3Config, token_ids, caches, *, chunk_tokens: int = 4096,
+                    use_fast: bool = True, sparse: bool = True) -> mx.array:
+    """Long-context single-stream prefill: consume ``token_ids`` into ``caches`` in blocks of
+    ``chunk_tokens``; return the LAST position's logits ``[1,1,vocab]`` (same contract as a cached
+    :meth:`MiniMaxM3ResidentModel.__call__` over the last token / the batched ``prefill``).
+
+    The feasibility substrate for the 1M window. The single-shot prefill holds the whole
+    ``[1,T,hidden]`` window resident; this driver runs each :class:`quanta.minimax.model_m3.MiniMaxM3Block`
+    over ONE bounded chunk at a time — every layer extends its (int8/bf16) GQA
+    :class:`quanta.minimax.model_m3.KVCache` and a chunk's queries attend the grown KV with a
+    bottom-right causal mask (``mx.fast.scaled_dot_product_attention`` ``mask="causal"`` is bottom-right
+    aligned — the exact path the M3-1 cached forward and the qwen35 shipped chunked prefill both use).
+    The fused flash-attn kernel never materializes the ``[chunk, kv_len]`` score matrix, so the
+    per-chunk transient is O(chunk) and the whole prompt costs ONE forward per chunk.
+
+    M3 is **natively 1M** (no YaRN) and **all dense GQA** (no GDN recurrent state), so — unlike
+    :func:`quanta.qwen35.runtime.chunked_prefill` — there is no per-request RoPE factor to pin and no
+    recurrent continuation: each chunk just reads its absolute position from the cache offset (read
+    before the chunk's KV write). The trained block-sparse indexer (a later milestone) is the COMPUTE
+    lever on top of this — dense chunked prefill is correct (it attends every prior key) but O(T²) in
+    compute; it is feasible at 1M in MEMORY (O(chunk) transient + the int8 KV), and the indexer makes it
+    feasible in TIME.
+
+    A non-empty cache continues from its offset (multi-turn / paged-suffix prefix extension; each cache
+    may be a discrete :class:`quanta.minimax.model_m3.KVCache` OR a
+    :class:`quanta.paged.PagedKVCacheView`). Bit-identical to the single-shot prefill on the bf16 mixer
+    (the chunk boundaries only re-cut the same per-row causal attention + per-token KV quant — no
+    cross-token op changes, and the paged gather is bit-identical to the discrete cache); greedy-token-
+    equivalent on the packed serving mixer (the projection ``mx.quantized_matmul`` runs at batch-M=chunk
+    vs M=T — the documented #153 batch-M ULP). Gated in ``parity/minimax_m3_prefill_chunked_test.py``,
+    re-gated @ 397B in ``parity/minimax_m3_prefill_chunked_real.py``."""
+    ids = token_ids if isinstance(token_ids, mx.array) else mx.array(token_ids, dtype=mx.int32)
+    ids = ids.reshape(-1)
+    total = int(ids.shape[0])
+    if total < 1:
+        raise ValueError("chunked_prefill needs >= 1 token")
+    if chunk_tokens < 1:
+        raise ValueError(f"chunk_tokens must be >= 1 (got {chunk_tokens})")
+    if len(caches) != len(layers):
+        raise ValueError(f"len(caches)={len(caches)} != num_layers={len(layers)} "
+                         f"(one KV cache per layer; refusing to mis-thread state — rule 6)")
+    h_last = None
+    for lo in range(0, total, chunk_tokens):           # bounded chunk loop (rule 3 — IO/admit boundary)
+        chunk = ids[lo:lo + chunk_tokens]
+        h = embed_w[chunk][None].astype(mx.bfloat16)               # [1,tlen,hidden]
+        for blk, cache in zip(layers, caches, strict=True):
+            h = blk(h, cache=cache, use_fast=use_fast, sparse=sparse)
+        h_last = h[:, -1:]
+        mx.eval([h_last, *_live_kv_arrays(caches)])    # bound the lazy graph per chunk (rule 8)
+        mx.clear_cache()                               # chunk transients do not pool up
+    hh = mx.fast.rms_norm(h_last, norm_w.astype(h_last.dtype), cfg.norm_eps)
+    return hh @ lm_head_w.T.astype(hh.dtype)                       # [1,1,vocab]
+
+
 class MiniMaxM3ResidentModel:
     """RAM-resident MiniMax-M3 text decoder — prefill via the reference block, decode via cached KV.
 
@@ -285,6 +355,22 @@ class MiniMaxM3ResidentModel:
             h = blk(h, cache=cache, use_fast=use_fast, sparse=sparse)
         mx.eval(h)
         return self._head(h)
+
+    # --- long-context chunked prefill (the feasible admit path past chat lengths) -
+    def prefill_chunked(self, token_ids, caches: list[KVCache], *, chunk_tokens: int = 4096,
+                        use_fast: bool = True, sparse: bool = True) -> mx.array:
+        """Consume ``token_ids`` into ``caches`` in ``chunk_tokens`` blocks; return the last position's
+        logits ``[1,1,vocab]`` (same contract as a cached :meth:`__call__` over the last token). The
+        feasible path past chat lengths — the single-shot :meth:`__call__` holds the whole
+        ``[1,T,hidden]`` window resident, this bounds the per-chunk transient to O(chunk). See
+        :func:`chunked_prefill` (the shared driver; gated in
+        ``parity/minimax_m3_prefill_chunked_test.py``)."""
+        if len(caches) != self.num_layers:
+            raise ValueError(f"len(caches)={len(caches)} != num_layers={self.num_layers} "
+                             f"(one KV cache per layer; refusing to mis-thread state — rule 6)")
+        return chunked_prefill(self.layers, self.embed_w, self.norm_w, self.lm_head_w, self.cfg,
+                               token_ids, caches, chunk_tokens=chunk_tokens, use_fast=use_fast,
+                               sparse=sparse)
 
     # --- minimal greedy generate (serving convenience; not the ppl arbiter) ----
     def generate(self, prompt_ids, *, max_new: int = 32, use_fast: bool = True,

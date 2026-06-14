@@ -58,10 +58,20 @@ again) — quant groups on ``head_dim`` are orthogonal to the seq-axis blocks, s
 bit-identical to the discrete :class:`KVCache` (gated). The M3-3 loop-kill's KV step takes the paged
 loop-kill (``paged_batched`` → ONE ``write_batched`` + ONE ``gather_batched``) when serving paged views.
 
-Out of scope here (later M3 sub-milestones): chunked prefill (the per-token :meth:`prefill_paged` is the
-admit path for chat-length suffixes), the trained block-sparse long-context lever, and the oMLX shim
-(the ``_MiniMaxM3BatchedSession`` engine route that consumes this paged contract). The win is in DECODE,
-where multi-stream serving spends ~all of its time.
+**M3-5 — chunked prefill (the long-admit lever).** The single-shot prefill holds the whole
+``[1,T,hidden]`` window resident; past chat lengths that is the admit bottleneck. :meth:`prefill`
+(and thus the paged :meth:`prefill_paged`) routes prompts/suffixes of >= ``MINIMAX_M3_CHUNKED_PREFILL_FROM``
+tokens through :meth:`prefill_chunked` → :func:`quanta.minimax.runtime_m3.chunked_prefill`: one bounded
+``MiniMaxM3Block`` forward per chunk, every layer extending its GQA KV with a bottom-right causal mask,
+so a 1M-token prompt admits in O(chunk) memory (the fused flash-attn kernel never materializes the
+``[chunk, kv_len]`` scores). Works over discrete caches OR paged views (the manager allows sub-range
+writes from the open cursor). Bit-exact to single-shot on the bf16 mixer; greedy-token-equivalent on
+the packed serving mixer (the #153 batch-M ULP — the projections run at M=chunk vs M=T).
+
+Out of scope here (later M3 sub-milestones): the trained block-sparse long-context lever (the COMPUTE
+lever on top of chunked prefill — dense chunked prefill is O(T²) in compute, feasible at 1M in MEMORY),
+and the oMLX shim (the ``_MiniMaxM3BatchedSession`` engine route that consumes this paged contract).
+The win is in DECODE, where multi-stream serving spends ~all of its time.
 """
 
 from __future__ import annotations
@@ -97,6 +107,25 @@ MINIMAX_M3_BATCHED_LOOPKILL_DEFAULT = True
 # in ``parity/minimax_m3_loopkill_test.py`` §M0 (== the qwen35 #153 option-B finding); if a future MLX
 # drops the gemv→GEMM threshold below 8, §M0 fails loudly (the signal to lower this).
 MINIMAX_M3_LOOPKILL_CHUNK = 8
+
+# --- M3-5 chunked serving prefill (the long-admit lever) -------------------------------------------
+# The single-shot prefill holds the whole [1,T,hidden] window resident and runs one O(T²) attention;
+# past chat lengths that is the admit bottleneck. The chunked-prefill substrate
+# (:meth:`MiniMaxM3BatchedResidentModel.prefill_chunked` → :func:`quanta.minimax.runtime_m3.chunked_prefill`:
+# one bounded MiniMaxM3Block forward per chunk, every layer extending its GQA KV with a bottom-right
+# causal mask) bounds the per-chunk transient to O(chunk) (the fused flash-attn kernel never
+# materializes the [chunk, kv_len] score matrix), so a 1M-token prompt admits in O(chunk) memory. So
+# ``prefill`` — and thus the paged ``prefill_paged`` admit, which routes through it — sends prompts /
+# suffixes of >= ``MINIMAX_M3_CHUNKED_PREFILL_FROM`` tokens through the chunked driver; below that the
+# bit-exact single-shot path is kept (so the M3-1/2/3/4 chat-length gates are untouched — their
+# synthetic prompts are far under the threshold). The threshold is one chunk + 1 so chunking only
+# engages once there is genuinely more than one chunk. Bit-exact to single-shot on the bf16 mixer,
+# greedy-token-equivalent on the packed serving mixer (the projection mx.quantized_matmul runs at
+# batch-M=chunk vs M=T — the documented #153 batch-M ULP). Gated in
+# ``parity/minimax_m3_prefill_chunked_test.py``; re-gated @ 397B in
+# ``parity/minimax_m3_prefill_chunked_real.py``.
+MINIMAX_M3_PREFILL_CHUNK_TOKENS = 4096
+MINIMAX_M3_CHUNKED_PREFILL_FROM: int | None = MINIMAX_M3_PREFILL_CHUNK_TOKENS + 1
 
 
 def _attn_step(blk: MiniMaxM3Block, kv: KVCache, x_t: mx.array, *, use_fast: bool = True) -> mx.array:
@@ -355,19 +384,46 @@ class MiniMaxM3BatchedResidentModel:
         orchestrator calls this once per new stream's prompt; decoding then proceeds via
         :meth:`step_batch`. Runs the proven cached forward over the whole ``[1,T,hidden]`` window (the
         ``T``-token cached-over-fresh-caches path the M3-1 gate proves bit-identical to the
-        ``caches=None`` prefill), so the seeded state is bit-identical to a fresh single-stream run."""
+        ``caches=None`` prefill), so the seeded state is bit-identical to a fresh single-stream run.
+
+        Prompts of >= ``MINIMAX_M3_CHUNKED_PREFILL_FROM`` tokens route through :meth:`prefill_chunked`
+        (M3-5, the feasible long-admit path — the single-shot forward below holds the whole
+        ``[1,T,hidden]`` window resident); below the threshold the bit-exact single-shot path is kept
+        (the M3-1/2/3/4 chat-length gates are untouched)."""
         ids = mx.array([int(t) for t in prompt_ids], dtype=mx.int32)
         if int(ids.shape[0]) < 1:
             raise ValueError("prompt_ids is empty (prefill needs >= 1 token)")
         if len(state) != self.num_layers:
             raise ValueError(f"len(state)={len(state)} != num_layers={self.num_layers} "
                              f"(one KV cache per layer; refusing to mis-thread state — rule 6)")
+        thr = MINIMAX_M3_CHUNKED_PREFILL_FROM
+        if thr is not None and int(ids.shape[0]) >= thr:           # M3-5 long-admit lever
+            return self.prefill_chunked(ids, state, use_fast=use_fast, sparse=sparse)
         h = self.embed_w[ids][None].astype(mx.bfloat16)                            # [1,T,hidden]
         for blk, cache in zip(self.layers, state, strict=True):
             h = blk(h, cache=cache, use_fast=use_fast, sparse=sparse)
         mx.eval(h)
         hh = mx.fast.rms_norm(h[:, -1:], self.norm_w.astype(h.dtype), self.cfg.norm_eps)
         return hh @ self.lm_head_w.T.astype(hh.dtype)                              # [1,1,vocab]
+
+    def prefill_chunked(self, prompt_ids, state: Sequence[KVCache], *,
+                        chunk_tokens: int = MINIMAX_M3_PREFILL_CHUNK_TOKENS,
+                        use_fast: bool = True, sparse: bool = True) -> mx.array:
+        """Long-context single-stream prefill into ``state`` in ``chunk_tokens`` blocks — the feasible
+        admit path past chat lengths (the single-shot :meth:`prefill` holds the whole ``[1,T,hidden]``
+        window). Works over discrete :class:`KVCache` lists (unpaged) OR
+        :class:`quanta.paged.PagedKVCacheView` lists (the paged suffix admit — the manager allows
+        sub-range writes from the open cursor). Same contract: returns the last position's logits
+        ``[1,1,vocab]``; decoding then proceeds via :meth:`step_batch`. See
+        :func:`quanta.minimax.runtime_m3.chunked_prefill` (the shared driver; gated in
+        ``parity/minimax_m3_prefill_chunked_test.py``)."""
+        from quanta.minimax.runtime_m3 import chunked_prefill   # late: keep from_inner paths light
+        if len(state) != self.num_layers:
+            raise ValueError(f"len(state)={len(state)} != num_layers={self.num_layers} "
+                             f"(one KV cache per layer; refusing to mis-thread state — rule 6)")
+        return chunked_prefill(self.layers, self.embed_w, self.norm_w, self.lm_head_w, self.cfg,
+                               prompt_ids, state, chunk_tokens=chunk_tokens, use_fast=use_fast,
+                               sparse=sparse)
 
     # --- one-step batched decode ----------------------------------------------
     def step_batch(self, stream_token_ids: Sequence[int],
@@ -433,7 +489,13 @@ class MiniMaxM3BatchedResidentModel:
         through its view and reads back the full (prefix + suffix) stream for the bottom-right-causal SDPA,
         which is **bit-identical** to a discrete continue-from-prefix prefill of the same split (the paged
         gather == discrete :class:`KVCache` foundation — gated in ``parity/minimax_m3_paged_test.py``).
-        ``block_size`` is unused (no boundary work)."""
+        ``block_size`` is unused (no boundary work).
+
+        A long uncached suffix (>= ``MINIMAX_M3_CHUNKED_PREFILL_FROM``) is admitted **chunked** (M3-5):
+        :meth:`prefill` routes it through :meth:`prefill_chunked`, which writes each chunk through the
+        per-layer paged views (the manager allows sub-range writes from the open cursor), so a long
+        fresh prompt admits in O(chunk) memory — bit-identical to the single-shot paged prefill on the
+        bf16 mixer, greedy-token-equivalent on the packed serving mixer (the #153 batch-M ULP)."""
         del block_size  # no recurrent/derived boundary state for a dense model
         if recurrent_in is not None:
             raise ValueError("MiniMaxM3 prefill_paged: recurrent_in must be None (dense GQA has no "
