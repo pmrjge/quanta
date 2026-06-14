@@ -249,14 +249,41 @@ loadable standalone.] Gate: model-free `parity/minimax_m3_vision_test.py` (20 ch
 patch-embed / 3-D rope / projector / patch-merge / (t,h,w) position-ids (merge-block order) == a
 **numpy-fp64 oracle**; rule-4 fast==naive attention; rule-6 `rope_section`-sum + indivisible-merge
 refusals; the 2-D-degenerate property; per-image attention isolation). Manifest **109 model_free / 53
-real_weight**. **Next = vision V2** — the real-weight vision e2e (load the 1.6 GiB ViT from the int4
-artifact, run a real image, settle `rope_section`) + the image processor pinned to the shipped
-`image_processor.py` (smart-resize / CLIP-normalize / patchify / `grid_thw`) + the multimodal prefill
-splice; **then** the oMLX shim (the `_MiniMaxM3BatchedSession` engine route + chat template + `<mm:think>`
-reasoning + MiniMax nested-XML tool parser + the multimodal image input path) and the **trained
-block-sparse attention** long-context compute lever (deferred — no M3 forward exists; only
-sparse==dense-at-short-ctx is bit-gateable, the exact selection formula leans on a heavy 397B
-long-context ppl arbiter; it is a speed optimization on an already-correct dense path).
+real_weight**.
+**M3-6b / vision V2 ✅ (this commit)** — the native image processor + the real-weight standalone ViT
+forward. NEW additive `image_m3.py` (numpy-only, no torch/torchvision/PIL — rule 5): reproduces the
+shipped `image_processor.py` (`smart_resize` geometry verbatim → bicubic resize → rescale +
+CLIP-normalize → temporal-dup → patchify+`permute(0,1,4,7,5,8,3,2,6,9)`) → `pixel_values [N,1176]` +
+`grid_thw`; one image grid `(t,h,w)` → `t·h·w` patches → `(t·h·w)//merge²` LLM tokens (== the shipped
+`num_tokens = grid.prod()//merge²` placeholder count at `image_token_index` 200025). The **resize
+interpolation is best-effort** (no `torchvision` in-env to bit-pin it) but a **factor-aligned in-bounds
+image** (H,W multiples of 28, `min_pixels 3136 ≤ h·w ≤ max_pixels 451584`) makes resize the **identity**
+⇒ the whole processor is exactly pinnable — the path the gates and the V3 e2e use. New
+`artifact_m3.vision_state()` (the 523 dense vision tensors → bf16, the ViT loads as a unit — a
+justified 1.6 GiB rule-8 exception, a bidirectional encoder can't stream layer-by-layer) +
+`model_vision_m3.load_vision_model(art_dir, rope_section=None)` (Conv3d `[1280,3,2,14,14]→[1280,1176]`
+reshape; per-layer suffixes map 1:1; `multi_modal_projector`/`patch_merge_mlp` → `projector`/`patch_merge`;
+**two-way coverage assertions** — every model param assigned AND every source key consumed, rule 6).
+Gates: model-free `parity/minimax_m3_image_test.py` (23 checks, in the sweep — `smart_resize` geometry ==
+verbatim oracle over a size grid + factor-aligned identity; rescale/normalize/patchify == a slow
+nested-loop numpy-fp64 oracle; bicubic identity-on-same-size / constant-preservation / rows-sum-to-1;
+`num_tokens` rule; rule-6 extreme-ratio + non-RGB refusals) + SOLO `parity/minimax_m3_vision_real.py`
+(non-`_test.py`, excluded, ~1.6 GiB — loads the 523 dense ViT tensors from the int4 artifact, runs a
+real 56×56 image → **4 tokens, std 5.66 / max|x| 392, finite & sane**; **rule-4 fast==naive layer-0 op**
+rel 5.9e-3; the **2-D-degenerate property on real q** — the t-section [8 pairs] inert for an image;
+**per-image isolation BIT-EXACT** [rel 0]). No numeric ViT reference exists (the checkpoint ships only
+`configuration_*.py`), so V2 validates **mechanics + structural invariants**; the decisive arbiter for
+the [PINNED-pending-e2e] `rope_section (8,16,16)` is the V3 multimodal e2e. Manifest **110 model_free / 53
+real_weight** (+`minimax_m3_image_test`; the `_real` gate is untracked, the established convention).
+**Next = vision V3** — the multimodal prefill splice (replace the `image_token_index` 200025
+placeholders in the text embedding stream with the merged ViT tokens — the shipped
+`processing_minimax.py` rule) + the **heavy 233 GiB e2e that settles `rope_section`** (image + prompt →
+teacher-forced ppl / greedy caption, sweeping candidate sections — the only arbiter, since the section
+is judged downstream by the LLM); **then** the oMLX shim (the `_MiniMaxM3BatchedSession` engine route +
+chat template + `<mm:think>` reasoning + MiniMax nested-XML tool parser + the multimodal image input
+path) and the **trained block-sparse attention** long-context compute lever (deferred — no M3 forward
+exists; only sparse==dense-at-short-ctx is bit-gateable, the exact selection formula leans on a heavy
+397B long-context ppl arbiter; it is a speed optimization on an already-correct dense path).
 
 The rest of the served fleet is **complete, shipped, and parity-gated**. Per-model resident sizes are
 in the Serving throughput table below; the detailed milestone handovers live in the `PLAN_*.md` files

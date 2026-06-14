@@ -57,6 +57,7 @@
     "minimax_m3_bake_test",
     "minimax_m3_batched_test",
     "minimax_m3_config_test",
+    "minimax_m3_image_test",
     "minimax_m3_layer_test",
     "minimax_m3_loopkill_test",
     "minimax_m3_paged_test",

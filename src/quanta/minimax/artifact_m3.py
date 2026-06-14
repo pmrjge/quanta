@@ -93,6 +93,24 @@ class MiniMaxM3Artifact:
         """Drop cached shard handles so materialized tensors can be freed (rule 8)."""
         self._shards.clear()
 
+    # --- vision tower (full-VL) ------------------------------------------------
+    def vision_state(self) -> dict[str, mx.array]:
+        """The full vision-tower state dict (the 523 ``vision_tower.*`` / ``multi_modal_projector.*`` /
+        ``patch_merge_mlp.*`` tensors), each loaded verbatim and cast to **bf16** — the dense, never-
+        quantized ViT (baked dense in the int4 bundle). Keyed by the exact safetensors key; the patch-
+        embedding conv stays its on-disk ``[1280,3,2,14,14]`` shape (the builder reshapes it to the
+        ``[1280,1176]`` linear). The ViT (~1.6 GiB) loads as a unit — it is a bidirectional encoder
+        that cannot be streamed layer-by-layer during a forward, and at 1.6 GiB it is a justified
+        rule-8 exception (far under the 490 GiB ceiling). Fail loud if no vision tensors are present
+        (a text-only bundle reached through the VL path, rule 6)."""
+        keys = [k for k in self.weight_map if k.startswith(VISION_PREFIXES)]
+        if not keys:
+            raise KeyError(f"{self.dir}: no vision-tower tensors in the index "
+                           f"(not a full-VL artifact; cannot build the ViT)")
+        out = {k: self.get(k).astype(mx.bfloat16) for k in keys}
+        mx.eval(list(out.values()))
+        return out
+
     # --- manifest resolution ---------------------------------------------------
     def _meta(self, key: str) -> tuple[str, dict]:
         """Resolve a logical key to ``(base, meta)``: a dense entry at the full key, else the

@@ -331,7 +331,85 @@ class MiniMaxM3VisionModel(nn.Module):
     def __call__(self, pixel_values: mx.array, grid_thw: list[tuple[int, int, int]], *,
                  use_fast: bool = True) -> mx.array:
         """Full tower → merged LLM tokens ``[N/merge**2, projection_dim]`` (the embeddings spliced at
-        the ``image_token_index`` placeholders — the splice is the V2 milestone)."""
+        the ``image_token_index`` placeholders — the splice is the V3 milestone)."""
         feats = self.encode(pixel_values, grid_thw, use_fast=use_fast)   # [N, hidden]
         projected = self.projector(feats)                                # [N, projection_dim]
         return self.patch_merge(projected)                               # [N/merge**2, projection_dim]
+
+
+# ----------------------------------------------------------------------------- #
+# Real-weight loader (build the tower from a baked int4 artifact's dense ViT).
+# ----------------------------------------------------------------------------- #
+
+# per-layer source suffix == target suffix (the module's submodule names mirror the checkpoint's).
+_VISION_LAYER_SUFFIXES: tuple[str, ...] = (
+    "layer_norm1.weight", "layer_norm1.bias",
+    "layer_norm2.weight", "layer_norm2.bias",
+    "self_attn.q_proj.weight", "self_attn.q_proj.bias",
+    "self_attn.k_proj.weight", "self_attn.k_proj.bias",
+    "self_attn.v_proj.weight", "self_attn.v_proj.bias",
+    "self_attn.out_proj.weight", "self_attn.out_proj.bias",
+    "mlp.fc1.weight", "mlp.fc1.bias",
+    "mlp.fc2.weight", "mlp.fc2.bias",
+)
+_VISION_PREFIX = "vision_tower.vision_model."
+
+
+def load_vision_model(art_dir, *, rope_section: tuple[int, int, int] | None = None
+                      ) -> "MiniMaxM3VisionModel":
+    """Build a fully-weighted :class:`MiniMaxM3VisionModel` from a baked MiniMax-M3-VL int4 artifact.
+
+    Reads the dense ViT (the 523 vision tensors, ~1.6 GiB bf16) via
+    :meth:`quanta.minimax.artifact_m3.MiniMaxM3Artifact.vision_state`, reshapes the Conv3d patch-embed
+    ``[hidden,3,2,14,14] → [hidden,1176]`` (the linear layout), and maps every checkpoint key to a
+    module parameter (per-layer suffixes match 1:1; ``multi_modal_projector``/``patch_merge_mlp`` →
+    ``projector``/``patch_merge``). Asserts **exact coverage** both ways (rule 6): every model
+    parameter is assigned and every source vision key is consumed — no silently-unloaded weight, no
+    leftover key. ``rope_section`` overrides the [PINNED-pending-e2e] default (the V3 e2e settles it)."""
+    from mlx.utils import tree_flatten, tree_unflatten  # noqa: PLC0415
+
+    from quanta.minimax.artifact_m3 import MiniMaxM3Artifact  # noqa: PLC0415
+
+    art = MiniMaxM3Artifact(art_dir)
+    cfg = art.cfg.vision
+    if cfg is None:
+        raise ValueError(f"{art_dir}: config has no vision_config (not a full-VL build)")
+    model = MiniMaxM3VisionModel(cfg, rope_section=rope_section)
+    vs = art.vision_state()
+    consumed: set[str] = set()
+
+    def take(src_key: str) -> mx.array:
+        consumed.add(src_key)
+        return vs[src_key]
+
+    in_dim = cfg.num_channels * cfg.temporal_patch_size * cfg.patch_size * cfg.patch_size
+    pe = take(_VISION_PREFIX + "embeddings.patch_embedding.weight")
+    flat: list[tuple[str, mx.array]] = [
+        ("patch_embed.proj.weight", pe.reshape(cfg.hidden_size, in_dim)),
+        ("pre_layrnorm.weight", take(_VISION_PREFIX + "pre_layrnorm.weight")),
+        ("pre_layrnorm.bias", take(_VISION_PREFIX + "pre_layrnorm.bias")),
+    ]
+    for i in range(cfg.num_hidden_layers):
+        lp, mp = f"{_VISION_PREFIX}encoder.layers.{i}.", f"layers.{i}."
+        flat += [(mp + s, take(lp + s)) for s in _VISION_LAYER_SUFFIXES]
+    for src, dst in (("multi_modal_projector.linear_1", "projector.linear_1"),
+                     ("multi_modal_projector.linear_2", "projector.linear_2"),
+                     ("patch_merge_mlp.linear_1", "patch_merge.linear_1"),
+                     ("patch_merge_mlp.linear_2", "patch_merge.linear_2")):
+        flat += [(dst + ".weight", take(src + ".weight")), (dst + ".bias", take(src + ".bias"))]
+
+    # rule 6: exact two-way coverage — every source key consumed, every model param assigned.
+    leftover = set(vs) - consumed
+    if leftover:
+        raise ValueError(f"vision loader left {len(leftover)} source keys unconsumed (rule 6): "
+                         f"{sorted(leftover)[:4]}…")
+    model.update(tree_unflatten(flat))
+    assigned = {k for k, _ in flat}
+    params = {k for k, _ in tree_flatten(model.parameters())}
+    missing = params - assigned
+    if missing:
+        raise ValueError(f"vision loader left {len(missing)} model params unassigned (rule 6): "
+                         f"{sorted(missing)[:4]}…")
+    mx.eval(model.parameters())
+    art.release()
+    return model

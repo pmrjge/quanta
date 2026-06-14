@@ -295,10 +295,25 @@ source is gone from disk). So M3 is a **real build**, not validate-at-scale. The
     merge / (t,h,w) position-ids == a numpy-fp64 oracle; rule-4 fast==naive; rule-6 section-sum +
     indivisible-merge refusals; the 2-D-degenerate property; per-image attention isolation). Manifest
     **109 model_free / 53 real_weight**.
-  - **vision V2 (next).** Real-weight vision e2e (load the 1.6 GiB ViT from the int4 artifact, run a real
-    image, **settle `rope_section`**) + the image processor pinned to the shipped `image_processor.py`
-    (smart-resize → CLIP-normalize → patchify → `grid_thw`) + the **multimodal prefill splice** (replace
-    the `image_token_index` 200025 placeholders with the merged vision embeddings).
+  - **M3-6b / vision V2 ✅ (this milestone).** Native image processor + real-weight standalone ViT forward.
+    NEW `image_m3.py` (numpy-only, no torch/torchvision/PIL — rule 5): the shipped `image_processor.py`
+    reproduced (smart-resize geometry verbatim → bicubic → rescale + CLIP-normalize → temporal-dup →
+    patchify) → `pixel_values [N,1176]` + `grid_thw`; resize interpolation is best-effort (no torchvision
+    in-env), but a **factor-aligned in-bounds image makes resize the identity** ⇒ exactly pinnable (the
+    gate/e2e path). NEW `artifact_m3.vision_state()` (523 dense ViT tensors → bf16, loaded as a unit — a
+    1.6 GiB rule-8 exception) + `model_vision_m3.load_vision_model()` (Conv3d→linear reshape; 1:1 suffix
+    map; two-way coverage assertions, rule 6). Gates: model-free `parity/minimax_m3_image_test.py` (23
+    checks, in the sweep — smart_resize/normalize/patchify == oracles, factor-aligned identity, bicubic
+    well-formed, num_tokens rule, rule-6 refusals) + SOLO `parity/minimax_m3_vision_real.py` (non-`_test.py`,
+    excluded, ~1.6 GiB — real 56×56 image → 4 tokens finite/sane; rule-4 fast==naive layer-0 op rel 5.9e-3;
+    2-D-degenerate t-section inert on real q; per-image isolation **bit-exact**). No numeric ViT reference
+    exists; V2 validates **mechanics + invariants**, the `rope_section (8,16,16)` arbiter is the V3 e2e.
+    Manifest **110 model_free / 53 real_weight** (+`minimax_m3_image_test`).
+  - **vision V3 (next).** The **multimodal prefill splice** (replace the `image_token_index` 200025
+    placeholders in the text embedding stream with the merged ViT tokens — the shipped `processing_minimax.py`
+    rule) + the **heavy 233 GiB e2e that settles `rope_section`** (image + prompt → teacher-forced ppl /
+    greedy caption, sweeping candidate sections — the only arbiter, the section is judged downstream by the
+    LLM).
   - **M3-6+ (after vision).** The **oMLX shim** (the `_MiniMaxM3BatchedSession` engine route + chat
     template + `<mm:think>` reasoning parser + MiniMax nested-XML tool parser + the multimodal image input
     path) + multi-stream; the **trained block-sparse attention** long-context compute lever (deferred — no
