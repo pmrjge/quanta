@@ -326,9 +326,34 @@ maps `pillow`→`PIL`). Manifest **113 model_free / 53 real_weight** (+2). **Nex
 one command once the user supplies a real **natural** image + a true caption:
 `uv run python -m parity.minimax_m3_rope_section_real /path/to/photo.jpg "a true caption"` (an off-grid
 image goes through the best-effort/unpinned bicubic resize; a 28-multiple image hits the exact
-identity-resize path). **Then** the oMLX shim (the `_MiniMaxM3BatchedSession` engine route + chat
-template + `<mm:think>` reasoning + MiniMax nested-XML tool parser + the multimodal image input path —
-wiring the splice through `batched_runtime_m3`) and the **trained block-sparse attention** long-context
+identity-resize path). **The oMLX serving shim is decomposed M3-style (M3-7a, M3-7b, …); the
+output-parser layer (M3-7a) is done and is independent of the V3b verdict.**
+**M3-7a / oMLX shim — output parsers ✅ (this commit)** — the MiniMax-M3 reasoning + tool-call output
+parsers (the qwen35-N3-2 analog; pure-text, model-free, **no real weights** and independent of the V3b
+verdict, so it lands now). M3 emits markup the in-tree parsers don't cover: **reasoning** in
+`<mm:think>…</mm:think>` (vocab ids 200059/200060, NOT the bare `<think>` 200050/1 the vocab also
+carries) and **tool calls** as a *namespace-prefixed recursive nested XML* — the section is
+`]<]minimax[>[<tool_call>` … `]<]minimax[>[</tool_call>` (`]<]minimax[>[` = ns_token 200058), each call
+`ns<invoke name="NAME">` … `ns</invoke>`, and the args produced by the chat template's recursive `to_xml`
+macro (mapping → `ns<k>…ns</k>`, list → `ns<item>…ns</item>`, bool → `true`/`false`, scalar → raw text;
+arg names are the real keys, NOT M2.7's `<parameter name=>`). Because EVERY tag is ns-prefixed, splitting
+on the ns_token yields one segment per tag (`<TAG>INLINE` open / `</TAG>` close), a clean token stream a
+small **recursive descent** inverts back to the original typed args — robust to arbitrary scalar content
+(rule 3: no per-token loop on a hot path — this is offline parse-time). New in `quanta.shim.tool_parsers`:
+`parse_minimax_m3_tool_calls` + `_m3_{tokens,match_close,parse_element,parse_sequence,parse_args}`,
+`MiniMaxM3ReasoningParser` (`<mm:think>` shapes mirroring `Qwen3ReasoningParser`), `MiniMaxM3ToolParser`
+(`format_tool_response` → `<response>…</response>`, the template's `role=='tool'` body), registered in the
+legacy `_PARSERS` dispatcher (M3-specific begin marker ⇒ disjoint from M2.7/GLM/Hermes/Qwen3-Coder).
+Gate: model-free `parity/minimax_m3_tools_test.py` (53 checks, in the sweep — a **reference renderer**
+re-implements the jinja `to_xml`/invoke/section macros and the parser is asserted to **invert** it for
+flat/typed/nested-mapping/list-of-scalars/list-of-dicts[the template's own example]/None-skip/multi-section
+args [documenting the empty-container→`""` collapse, intrinsic to the markup], + `<mm:think>` reasoning
+shapes, `<response>` formatting, Protocol conformance, markup disjointness vs all four siblings + the
+dispatcher routing). Manifest **114 model_free / 53 real_weight** (+1). **Next (M3-7b) =** the
+`_MiniMaxM3BatchedSession` engine route (load-runtime + decode-stepper + batched-session dispatch on
+`model_type` `minimax_m3*` — currently swallowed by the M2.7 `mt.startswith("minimax")` route) + the chat
+template / `apply_chat_template` rendering path + the multimodal image input path (wiring the V3a splice
+through `batched_runtime_m3`) + multi-stream. **Then** the **trained block-sparse attention** long-context
 compute lever (deferred — no M3 forward exists; only sparse==dense-at-short-ctx is bit-gateable, the
 exact selection formula leans on a heavy 397B long-context ppl arbiter; it is a speed optimization on
 an already-correct dense path).

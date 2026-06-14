@@ -66,6 +66,7 @@
     "minimax_m3_rope_section_test",
     "minimax_m3_runtime_test",
     "minimax_m3_splice_test",
+    "minimax_m3_tools_test",
     "minimax_m3_vision_test",
     "mla_absorbed_sdpa_test",
     "mla_int8_test",

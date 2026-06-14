@@ -242,10 +242,127 @@ def parse_qwen3_coder_tool_calls(text: str) -> ParseResult | None:
     return cleaned.strip(), calls
 
 
+# --- MiniMax-M3-VL: ]<]minimax[>[<tool_call> … namespace-prefixed recursive nested XML --------------
+#
+# A DIFFERENT markup from MiniMax-M2.7's ``<minimax:tool_call>``/``<parameter name=>`` (above): the M3
+# chat_template.jinja wraps the whole section in ``toolcall_begin = ns_token ~ '<tool_call>'`` /
+# ``toolcall_end = ns_token ~ '</tool_call>'`` where ``ns_token = ']<]minimax[>['`` (vocab id 200058),
+# and renders each call as ``ns<invoke name="NAME">`` … ``ns</invoke>`` whose ARGS are produced by a
+# recursive ``to_xml`` macro: a mapping → ``ns<k>…ns</k>`` per key, a list → ``ns<item>…ns</item>`` per
+# element, a bool → ``true``/``false`` (tojson), any other scalar → its raw text. EVERY tag — open and
+# close — is prefixed by the ns_token, so a scalar param renders ``ns<key>value ns</key>`` and a nested
+# object/array recurses. The arg *names* are the real keys (NOT ``<parameter name="key">``).
+#
+# Because every tag is ns-prefixed, splitting the fragment on the ns_token yields exactly one segment
+# per tag (``<TAG>INLINE`` for an open carrying an optional inline scalar, or ``</TAG>`` for a close) —
+# a clean token stream a small recursive descent inverts back into the original typed args, robust to
+# arbitrary scalar content (a value may contain ``<``/``>``/newlines; only the ns_token delimits tags,
+# which the model never emits inside a value). This is the exact inverse of ``to_xml`` (gated by a
+# reference renderer round-trip in ``parity/minimax_m3_tools_test.py``).
+M3_NS = "]<]minimax[>["                                # ns_token, vocab id 200058
+M3_TOOLCALL_BEGIN = M3_NS + "<tool_call>"             # toolcall_begin_token
+M3_TOOLCALL_END = M3_NS + "</tool_call>"              # toolcall_end_token
+_M3_SECTION_RE = re.compile(
+    re.escape(M3_TOOLCALL_BEGIN) + r"(?P<body>.*?)" + re.escape(M3_TOOLCALL_END), re.DOTALL)
+_M3_INVOKE_RE = re.compile(
+    re.escape(M3_NS) + r'<invoke\s+name="(?P<name>[^"]+)">(?P<args>.*?)' + re.escape(M3_NS) + r"</invoke>",
+    re.DOTALL)
+
+
+def _m3_tokens(fragment: str) -> list[tuple[str, bool, str]]:
+    """Split an ns-prefixed M3 XML fragment into ``(tag_name, is_close, inline_text)`` tokens. Every
+    tag is prefixed by :data:`M3_NS`, so one ``split`` yields one segment per tag; an open segment is
+    ``<TAG ...>INLINE`` (INLINE = the scalar text after the tag, empty for a container) and a close is
+    ``</TAG>``. Leading/whitespace-only segments (the template's newlines between ns tokens) are
+    dropped. A segment that is not a tag is ignored (defensive)."""
+    toks: list[tuple[str, bool, str]] = []
+    for seg in fragment.split(M3_NS):
+        if not seg.startswith("<"):
+            continue                                   # leading '' / stray inter-tag whitespace
+        gt = seg.find(">")
+        if gt < 0:
+            continue                                   # malformed open with no '>' — skip (defensive)
+        tag = seg[1:gt]
+        if tag.startswith("/"):
+            toks.append((tag[1:].strip(), True, ""))
+        else:                                          # 'invoke name="x"' → name 'invoke'; keep inline
+            toks.append((tag.split()[0].strip(), False, seg[gt + 1:]))
+    return toks
+
+
+def _m3_match_close(toks: list[tuple[str, bool, str]], i: int) -> int:
+    """Index of the close matching the open at ``toks[i]`` (depth-balanced). Fails loud on an
+    unbalanced fragment (rule 6 — never silently truncate a tool call)."""
+    depth = 0
+    for j in range(i, len(toks)):
+        depth += -1 if toks[j][1] else 1
+        if depth == 0:
+            return j
+    raise ValueError(f"unbalanced MiniMax-M3 tool-call markup: no close for <{toks[i][0]}>")
+
+
+def _m3_parse_element(toks: list[tuple[str, bool, str]], i: int) -> tuple[str, object, int]:
+    """Parse one element whose open is ``toks[i]``; return ``(name, value, next_index)``. A leaf (no
+    child tags before its close) is the open's inline text type-recovered via :func:`_typed`; a node
+    whose children are all ``<item>`` is a list, otherwise a mapping of ``child_name -> value``."""
+    name, is_close, inline = toks[i]
+    if is_close:
+        raise ValueError(f"unexpected close </{name}> in MiniMax-M3 tool-call markup")  # rule 6
+    close = _m3_match_close(toks, i)
+    if i + 1 == close:                                 # leaf → scalar (the inline text)
+        return name, _typed(inline.strip()), close + 1
+    children = _m3_parse_sequence(toks, i + 1, close)
+    if children and all(cn == "item" for cn, _ in children):
+        value: object = [cv for _, cv in children]
+    else:
+        value = {cn: cv for cn, cv in children}
+    return name, value, close + 1
+
+
+def _m3_parse_sequence(toks: list[tuple[str, bool, str]], i: int, end: int) -> list[tuple[str, object]]:
+    """Parse the sibling elements in ``toks[i:end]`` into an ordered ``[(name, value), …]`` list."""
+    out: list[tuple[str, object]] = []
+    while i < end:
+        cn, cv, i = _m3_parse_element(toks, i)
+        out.append((cn, cv))
+    return out
+
+
+def _m3_parse_args(args_fragment: str) -> dict:
+    """Reconstruct one invoke's argument dict from its ns-prefixed XML body (inverse of ``to_xml``)."""
+    toks = _m3_tokens(args_fragment)
+    return {cn: cv for cn, cv in _m3_parse_sequence(toks, 0, len(toks))}
+
+
+def parse_minimax_m3_tool_calls(text: str) -> ParseResult | None:
+    """Parse MiniMax-M3 ``]<]minimax[>[<tool_call>`` sections (ns-prefixed recursive nested XML).
+
+    Returns ``(cleaned_text, calls)`` — ``calls`` a list of OpenAI-style ``{"id", "name", "arguments"}``
+    dicts (``arguments`` a JSON string), nested objects/arrays reconstructed from the ``to_xml`` markup —
+    or ``None`` when no M3 tool-call section is present (so the legacy dispatcher can try the next
+    parser). An unterminated (truncated) section is dropped from the cleaned text. Strict: keys off the
+    ns-prefixed begin marker, so M2.7 ``<minimax:tool_call>``, GLM/Hermes ``<tool_call>`` and
+    Qwen3-Coder ``<function=…>`` markup all fall through to ``None`` (they lack ``]<]minimax[>[``)."""
+    if M3_TOOLCALL_BEGIN not in text:
+        return None
+    calls: list[dict] = []
+    for sec in _M3_SECTION_RE.finditer(text):
+        for inv in _M3_INVOKE_RE.finditer(sec.group("body")):
+            name = inv.group("name").strip()
+            args = _m3_parse_args(inv.group("args"))
+            calls.append({"id": f"{name}:{len(calls)}", "name": name,
+                          "arguments": json.dumps(args, ensure_ascii=False)})
+    cleaned = _M3_SECTION_RE.sub("", text)
+    if M3_TOOLCALL_BEGIN in cleaned:                   # unterminated (truncated) section → drop the tail
+        cleaned = cleaned[: cleaned.index(M3_TOOLCALL_BEGIN)]
+    return cleaned.strip(), calls
+
+
 # --- unified dispatcher ----------------------------------------------------------------------------
 _PARSERS: tuple[Callable[[str], ParseResult | None], ...] = (
     parse_kimi_tool_calls,        # <|tool_calls_section_begin|> (special tokens)
-    parse_minimax_tool_calls,     # <minimax:tool_call> wrapper
+    parse_minimax_m3_tool_calls,  # ]<]minimax[>[<tool_call> ns-prefixed nested XML (M3-VL)
+    parse_minimax_tool_calls,     # <minimax:tool_call> wrapper (M2.7)
     parse_glm_tool_calls,         # <tool_call> + <arg_key>
     parse_qwen_tool_calls,        # <tool_call> + JSON body
 )
@@ -392,10 +509,84 @@ class KimiToolParser:
                 + "<|tool_response_end|>")
 
 
+# MiniMax-M3 reasoning block: ``<mm:think>…</mm:think>`` (vocab ids 200059/200060) — NOT the bare
+# ``<think>``/``</think>`` (200050/200051) the M3 vocab also carries. The chat template's generation
+# prompt injects ``<mm:think>`` (thinking enabled) or ``</mm:think>`` (disabled) or nothing (adaptive),
+# so the model's returned text takes one of the same shapes :class:`Qwen3ReasoningParser` handles — here
+# with the M3 markers.
+_MM3_THINK_FULL_RE = re.compile(r"<mm:think>(?P<body>.*?)</mm:think>", re.DOTALL)
+_MM3_THINK_TAIL_RE = re.compile(r"^(?P<body>.*?)</mm:think>", re.DOTALL)
+
+
+class MiniMaxM3ReasoningParser:
+    """Reasoning-span parser for MiniMax-M3-VL — splits ``<mm:think>…</mm:think>`` from the answer.
+
+    Conforms to :class:`ReasoningParser`. Handles the shapes the M3 chat template can produce:
+
+    * ``"… <mm:think>R</mm:think>A …"`` — explicit reasoning block (the all-turn-visible render, and the
+      adaptive-mode case where the model opens its own block);
+    * ``"R</mm:think>A"`` — the generation prompt's *bare* ``<mm:think>`` opener (thinking enabled) was
+      already consumed, so the returned text starts inside the reasoning span and closes it;
+    * ``"</mm:think>A"`` — thinking disabled: the prompt's ``</mm:think>`` prefix is echoed with an empty
+      reasoning span before the answer (reasoning is ``""``, NOT ``None`` — a boundary WAS emitted);
+    * ``"<mm:think>R"`` — model opened reasoning but never closed it (truncated); answer is empty.
+
+    When no ``<mm:think>``/``</mm:think>`` marker is present, ``reasoning=None`` (NOT ``""``) so a
+    consumer can distinguish "no reasoning emitted" from "reasoning emitted and empty". Stateless.
+    """
+
+    def parse(self, text: str) -> dict:
+        if not text:
+            return {"reasoning": None, "answer": ""}
+        parts: list[str] = []
+        remaining = text
+        while True:
+            m = _MM3_THINK_FULL_RE.search(remaining)
+            if not m:
+                break
+            parts.append(m.group("body"))
+            remaining = remaining[: m.start()] + remaining[m.end():]
+        if parts:
+            return {"reasoning": "\n".join(parts).strip(), "answer": remaining.strip()}
+        if "</mm:think>" in text and "<mm:think>" not in text:           # bare-opener / disabled prefix
+            m = _MM3_THINK_TAIL_RE.match(text)
+            if m:
+                return {"reasoning": m.group("body").strip(), "answer": text[m.end():].strip()}
+        if "<mm:think>" in text and "</mm:think>" not in text:           # truncated (opener, no closer)
+            idx = text.index("<mm:think>")
+            return {"reasoning": text[idx + len("<mm:think>"):].strip(), "answer": text[:idx].strip()}
+        return {"reasoning": None, "answer": text}
+
+
+class MiniMaxM3ToolParser:
+    """Tool-call parser for MiniMax-M3-VL (``]<]minimax[>[<tool_call>`` ns-prefixed nested XML).
+
+    Conforms to :class:`ToolParser`. Delegates the parse to :func:`parse_minimax_m3_tool_calls` (strict:
+    keys off the ns-prefixed begin marker, so it never swallows M2.7 ``<minimax:tool_call>``, GLM/Hermes
+    ``<tool_call>`` or Qwen3-Coder ``<function=…>`` markup). The response formatter renders the
+    ``<response>…</response>`` body the template's ``role == "tool"`` branch embeds (the bos/eos ``tool``
+    grouping is added by the chat template at the conversation level). Stateless — reuse one instance.
+    """
+
+    def parse_tool_calls(self, text: str) -> list[dict]:
+        result = parse_minimax_m3_tool_calls(text)
+        return list(result[1]) if result is not None else []
+
+    def format_tool_response(self, tool_call_id: str, content: str) -> str:
+        if not isinstance(tool_call_id, str) or not tool_call_id:
+            raise ValueError(f"tool_call_id must be a non-empty str (got {tool_call_id!r})")
+        return f"<response>{content}</response>"
+
+
 __all__ = [
     "KimiToolParser",
     "MM_SECTION_BEGIN",
     "MM_SECTION_END",
+    "M3_NS",
+    "M3_TOOLCALL_BEGIN",
+    "M3_TOOLCALL_END",
+    "MiniMaxM3ReasoningParser",
+    "MiniMaxM3ToolParser",
     "ParseResult",
     "Qwen3CoderToolParser",
     "Qwen3ReasoningParser",
@@ -404,6 +595,7 @@ __all__ = [
     "ToolParser",
     "parse_glm_tool_calls",
     "parse_kimi_tool_calls",
+    "parse_minimax_m3_tool_calls",
     "parse_minimax_tool_calls",
     "parse_quanta_tool_calls",
     "parse_qwen3_coder_tool_calls",
