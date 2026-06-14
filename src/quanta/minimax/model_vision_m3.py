@@ -113,6 +113,32 @@ def default_rope_section(head_dim: int) -> tuple[int, int, int]:
     return (st, sh, sw)
 
 
+def candidate_rope_sections(head_dim: int) -> list[tuple[int, int, int]]:
+    """The ``(t,h,w)`` freq-pair splits to SWEEP for the [PINNED-pending-e2e] vision ``rope_section``
+    (the V3b real-weight arbiter scores these by downstream teacher-forced ppl on a real image).
+
+    Each sums to ``head_dim//2`` and keeps **h == w** (spatial symmetry — natural images have no
+    intrinsic h/w asymmetry), varying only the **temporal share** ``st`` from 0 (all freq pairs spent
+    on h/w — the maximum spatial resolution, the strongest prior for *images*, whose t-axis is inert)
+    up to ``half//2`` (half the ladder spent on the inert-for-images t-axis — the wasteful extreme).
+    The on-disk :func:`default_rope_section` is always included so the sweep measures it head-on.
+
+    For ``head_dim=80`` ⇒ ``half=40`` ⇒ ``st`` stepping by 2 from 0 to 20 ⇒ the 11 splits
+    ``[(0,20,20),(2,19,19),(4,18,18),…,(20,10,10)]`` (the default ``(8,16,16)`` among them) — fine
+    enough to resolve which temporal share the ViT was actually trained for. Deterministic, deduped,
+    sorted by ``st``."""
+    half = head_dim // 2
+    cands: set[tuple[int, int, int]] = set()
+    st = 0
+    while st <= half // 2:
+        rem = half - st
+        if rem % 2 == 0:                                      # symmetric h==w needs an even remainder
+            cands.add((st, rem // 2, rem // 2))
+        st += 2
+    cands.add(default_rope_section(head_dim))                 # always measure the on-disk default
+    return sorted(cands)
+
+
 def vision_rope_3d(position_ids: mx.array, head_dim: int, theta: float,
                    section: tuple[int, int, int]) -> tuple[mx.array, mx.array]:
     """3-D vision RoPE ``(cos, sin)`` ``[N, head_dim]`` from per-patch ``(t,h,w)`` ``position_ids``

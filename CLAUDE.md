@@ -301,14 +301,32 @@ real prompt, runs the real multimodal prefill: the **image is SEEN** — prefix 
 on plain text). V3a validates the splice + ViT→text wiring e2e at 397B; it does **NOT** settle the
 [PINNED-pending-e2e] vision `rope_section` (every candidate produces "an image is seen"; the section is
 judged downstream on real natural-image content). Manifest **111 model_free / 53 real_weight**
-(+`minimax_m3_splice_test`). **Next = vision V3b — settle `rope_section`** (the heavy 233 GiB arbiter:
-image + prompt → teacher-forced ppl / greedy caption, sweeping candidate sections — the only arbiter,
-since the section is judged downstream by the LLM). **V3b is currently BLOCKED in-env** — it needs a
-real **natural** image (the only shipped images are charts) decoded to RGB, but **no image decoder
-ships** (PIL/torchvision/cv2/imageio/matplotlib all absent), and the native processor's bicubic resize
-is best-effort/unpinned for an off-grid image; settling it cleanly wants a decoder dep (e.g. `pillow`
-under the `reference` extra) + a natural test image + a discriminative/teacher-forced probe — a
-user-facing decision. **Then** the oMLX shim (the `_MiniMaxM3BatchedSession` engine route + chat
+(+`minimax_m3_splice_test`).
+**M3-6d / vision V3b-prep ✅ (this commit)** — the `rope_section` arbiter machinery (the verdict itself
+needs a user image, the one input not in-env). Decision (user): **add `pillow` + give an image** — so
+`pillow>=11.0.0` joins the **`reference`** extra (offline-only, rule 5; the runtime
+`quanta.minimax.image_m3` stays PIL-free — it takes already-decoded RGB), unblocking the decode path
+the env lacked (PIL/torchvision/cv2 all absent). New offline `parity/_image_decode.py` (file/bytes →
+`[H,W,3]` uint8 RGB via lazily-imported PIL; coerces L/RGBA → RGB; **not** on the hot path — lives in
+`parity/`, never imported by `src/`); `model_vision_m3.candidate_rope_sections(head_dim)` (the splits to
+sweep — symmetric h==w, temporal share `st` stepping 0→half//2; 11 splits for head_dim 80, the on-disk
+`default_rope_section` always among them). The heavy arbiter `parity/minimax_m3_rope_section_real.py`
+(SOLO, ~235 GiB, excluded; sentinel): image → ViT(section) → splice into `[instruction + image +
+caption]` → **teacher-forced ppl of the CAPTION span**, mutating `vis.rope_section` in place across all
+candidates (weights reused), + a **text-only baseline** (does the image help at all); the section
+minimizing caption ppl is the trained one (a wrong rope mis-rotates the patches ⇒ less-informative
+features ⇒ harder caption). **Smoke-validated** (`--layers 4`, synthetic gradient: full code path runs —
+decode→process→11-section ViT sweep→splice→ppl table→verdict; ppls/spread meaningless as documented).
+Gates: model-free `parity/minimax_m3_rope_section_test.py` (12 — the knob is **live** [distinct sections
+⇒ distinct merged tokens; same section bit-exact], `candidate_rope_sections` valid + includes default +
+== the head_dim-80 list, rule-6 bad-section refusal] — **no PIL**, always runs) + skip-eligible
+`parity/minimax_m3_image_decode_test.py` (14 — lossless PNG round-trip bytes+file, L/RGBA→RGB, decoded
+array flows through the native processor; imports PIL ⇒ SKIP on a base-deps env, now that `optional_deps`
+maps `pillow`→`PIL`). Manifest **113 model_free / 53 real_weight** (+2). **Next = RUN the V3b verdict** —
+one command once the user supplies a real **natural** image + a true caption:
+`uv run python -m parity.minimax_m3_rope_section_real /path/to/photo.jpg "a true caption"` (an off-grid
+image goes through the best-effort/unpinned bicubic resize; a 28-multiple image hits the exact
+identity-resize path). **Then** the oMLX shim (the `_MiniMaxM3BatchedSession` engine route + chat
 template + `<mm:think>` reasoning + MiniMax nested-XML tool parser + the multimodal image input path —
 wiring the splice through `batched_runtime_m3`) and the **trained block-sparse attention** long-context
 compute lever (deferred — no M3 forward exists; only sparse==dense-at-short-ctx is bit-gateable, the

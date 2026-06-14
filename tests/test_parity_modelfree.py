@@ -117,6 +117,7 @@ def test_optional_deps_from_pyproject() -> None:
     """The skip-eligible set is read from pyproject's extras (never drifts), unioned with baseline."""
     assert {"safetensors", "transformers", "sentencepiece"} <= _OPTIONAL   # baseline reference extra
     assert "omlx" in _OPTIONAL                                             # the omlx extra, derived
+    assert {"pillow", "PIL"} <= _OPTIONAL   # pillow dist + its PIL import-name alias (skip-eligible)
 
 
 def test_missing_optional_dep() -> None:

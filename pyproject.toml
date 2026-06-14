@@ -15,12 +15,14 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# Offline-only tooling: parity references (HF), tokenizers, and source-checkpoint
-# loading during bake/calibration. NEVER imported on the runtime hot path.
+# Offline-only tooling: parity references (HF), tokenizers, source-checkpoint
+# loading during bake/calibration, and image decoding for the vision-tower e2e
+# arbiter (PIL/pillow → RGB). NEVER imported on the runtime hot path (rule 5).
 reference = [
     "transformers>=5.9.0",
     "safetensors>=0.7.0",
     "sentencepiece>=0.2.1",
+    "pillow>=11.0.0",
 ]
 # oMLX integration (added later, mirrors the previous project's extra).
 omlx = [

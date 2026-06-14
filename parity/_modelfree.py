@@ -225,6 +225,11 @@ def stale_allowlist_entries() -> list[str]:
 # --- Gate execution --------------------------------------------------------------------------- #
 # Baseline optional (extra) deps; the live set is read from pyproject so it never drifts (#8).
 _OPTIONAL_DEP_BASELINE = ("safetensors", "transformers", "sentencepiece")
+# Distribution → import name for extras whose PyPI name differs from the module you `import` (the
+# crude `-`→`_` rule below is exact for our other extras but misses these). Without the alias a gate
+# importing the module would FAIL (not SKIP) on a base-deps env, since the failure prints the IMPORT
+# name (`No module named 'PIL'`) which would not be in the optional set. Keep in sync with the extras.
+_DIST_IMPORT_ALIASES = {"pillow": "PIL"}
 _REQ_NAME_RE = re.compile(r"^[A-Za-z0-9._-]+")
 _MISSING_DEP_RE = re.compile(r"No module named '([\w.]+)'")
 _TRACEBACK_SIG = "Traceback (most recent call last):"
@@ -254,6 +259,9 @@ def optional_deps() -> frozenset[str]:
                     dist = m.group(0)
                     names.add(dist)
                     names.add(dist.replace("-", "_"))  # crude dist→import (exact for our extras)
+                    alias = _DIST_IMPORT_ALIASES.get(dist.lower())
+                    if alias:                          # e.g. pillow → PIL (import name differs)
+                        names.add(alias)
     except (OSError, tomllib.TOMLDecodeError, ValueError):
         pass  # baseline still applies — documented fallback, not a silent wrong result
     return frozenset(names)

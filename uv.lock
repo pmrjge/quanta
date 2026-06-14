@@ -1748,6 +1748,7 @@ omlx = [
     { name = "omlx", extra = ["grammar"] },
 ]
 reference = [
+    { name = "pillow" },
     { name = "safetensors" },
     { name = "sentencepiece" },
     { name = "transformers" },
@@ -1758,6 +1759,7 @@ requires-dist = [
     { name = "mlx", specifier = ">=0.31.2" },
     { name = "numpy", specifier = ">=2.4.6" },
     { name = "omlx", extras = ["grammar"], marker = "extra == 'omlx'", git = "https://github.com/jundot/omlx.git" },
+    { name = "pillow", marker = "extra == 'reference'", specifier = ">=11.0.0" },
     { name = "regex", specifier = ">=2026.5.9" },
     { name = "safetensors", marker = "extra == 'reference'", specifier = ">=0.7.0" },
     { name = "sentencepiece", marker = "extra == 'reference'", specifier = ">=0.2.1" },
